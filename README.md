@@ -1,6 +1,6 @@
-# besser-nn-migration
+# BESSER-NN-Migration
 
-A tool for migrating neural network code between **TensorFlow** and **PyTorch** using AST and a BUML intermediate representation.
+This repository contains a [BESSER](https://github.com/BESSER-PEARL/BESSER)-based solution to migrate neural network code between **TensorFlow** and **PyTorch** using AST and a BUML intermediate representation.
 
 ![Migration overview](figs/overview_migration.png)
 
