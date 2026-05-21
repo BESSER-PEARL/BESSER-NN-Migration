@@ -63,6 +63,7 @@ class ASTParserTorch(ASTParser):
                     lyr_type, lyr_params = transform_layer(
                         lyr_type, lyr_params, module_name
                     )
+                    print("nadia lyr_params", lyr_params)
                     buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
                     self.buml_model.add_layer(buml_layer)
                 else:
@@ -129,26 +130,54 @@ class ASTParserTorch(ASTParser):
         self.buml_model.add_sub_nn(subnn)
 
 
+    def decompose_chained_call(self, node):
+        """Decompose chained calls into list of individual operations in execution order."""
+        chain = []
+        current = node.value
+        while isinstance(current, ast.Call) and hasattr(current.func, 'value'):
+            chain.append(current)
+            if isinstance(current.func.value, ast.Call):
+                current = current.func.value
+            else:
+                break
+        chain.reverse()
+        return chain
+
     def handle_forward_simple_call(self, node: ast.Assign):
         """
-        This method: 
-        - retrieves the input and output variables of modules 
-        and populates 'inputs_outputs' and 'layer_of_output' dictionaries.
-        - sets the activation function as attribute of its layer.
-        - adds permute_in attributes to cnn layers if they are preceeded by
-        permute tensorop (the permute op is sometimes used before a cnn layer
-        to make pytorch and tensorflow models equivalent as cnn in both 
-        frameworks receive data in a different order).
-        - sets the order of modules in buml model and processes tensorops.  
-
-        Parameters:
-            node (ast.Assign): The AST node representing an assignment
-                statement.
-
-        Returns:
-            None, but populates the BUML model. 
+        Processes forward method assignments including chained calls.
         """
-        if isinstance(node.value.func.value, ast.Name) and node.value.func.value.id == "self":
+        if isinstance(node.value, ast.Call) and hasattr(node.value.func, 'value'):
+            if isinstance(node.value.func.value, ast.Call):
+                chain = self.decompose_chained_call(node)
+                for i, call in enumerate(chain):
+                    is_last = (i == len(chain) - 1)
+                    if is_last:
+                        synthetic_node = ast.Assign(targets=node.targets, value=call)
+                    else:
+                        temp_name = f"_chain_temp_{self.tensor_op_counter}_{i}"
+                        temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+                        synthetic_node = ast.Assign(targets=[temp_target], value=call)
+                        if i + 1 < len(chain) and chain[i + 1].args:
+                            chain[i + 1].args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+                    synthetic_node.lineno = node.lineno
+                    synthetic_node.col_offset = node.col_offset
+                    self.process_single_call(synthetic_node)
+                    self.previous_assign = synthetic_node
+                return
+
+        self.process_single_call(node)
+        self.previous_assign = node
+
+    def process_single_call(self, node: ast.Assign):
+        """
+        Process a single (non-chained) call operation.
+        This contains the original logic from handle_forward_simple_call.
+        """
+        if (isinstance(node.value, ast.Call) and
+            hasattr(node.value.func, 'value') and
+            isinstance(node.value.func.value, ast.Name) and
+            node.value.func.value.id == "self"):
             # Populates inputs_outputs and layer_of_output from forward method
             module_name = node.value.func.attr
             self.inputs_outputs[module_name] = [node.value.args[0].id,
@@ -181,7 +210,6 @@ class ASTParserTorch(ASTParser):
         else:
             #tensorops
             self.extract_tensorop(node)
-        self.previous_assign = node
 
     def handle_forward_tuple_assignment(self, node: ast.Assign):
         """
@@ -312,7 +340,10 @@ class ASTParserTorch(ASTParser):
 
             if (isinstance(self.previous_assign.targets[0], ast.Name) and
                 isinstance(self.previous_assign.value, ast.Call)):
-                if self.previous_assign.value.func.value.id != "self":
+                # Safe check: ensure func.value exists and is a Name before accessing .id
+                if (hasattr(self.previous_assign.value.func, 'value') and
+                    isinstance(self.previous_assign.value.func.value, ast.Name) and
+                    self.previous_assign.value.func.value.id != "self"):
                     ops_name = self.previous_assign.value.func.attr
                     if ops_name == "permute":
                         lyrs = self.buml_model.layers
@@ -499,8 +530,10 @@ def transform_layer(lyr_type: str, lyr_params: dict,
         lyr_name (str | None): The name of the layer.
 
     Returns:
-        The type of the layer and its parameters in BUML. 
+        The type of the layer and its parameters in BUML.
     """
+
+    process_positional_params(lyr_type, lyr_params, pos_params)
 
     param_to_list(lyr_type, lyr_params, int2list_params,
                                lyrs_of_int2list_params)
@@ -527,8 +560,6 @@ def process_params(lyr_type: str, lyr_params: dict):
     """
 
     updated_lyr_params = {}
-
-    process_positional_params(lyr_type, lyr_params, pos_params)
 
     for param in lyr_params:
         if param in params_mapping:

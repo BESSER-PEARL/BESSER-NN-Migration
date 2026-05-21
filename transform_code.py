@@ -38,13 +38,21 @@ def parse_arguments_transform():
             default=True, const=True, nargs='?'
     )
     parser.add_argument(
-        "--datashape", type=parse_tuple, default=None, 
+        "--datashape", type=parse_tuple, default=None,
         help=(
             "The shape of the input data (optional)."
             "It is needed when transforming tf code to pytorch code"
             "It is used to recover some layer attributes dynamically"
             "If the migrated script defines a dataset, it can be skipped"
         ),
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default="output/migrated_nn",
+        help="The output directory where the migrated file will be saved"
+    )
+    parser.add_argument(
+        "--output-file", type=str, default=None,
+        help="The base name of the output file (e.g., 'my_model.py'). The generation type (subclassing/sequential) will be added as suffix (e.g., 'my_model_subclassing.py')"
     )
 
     return parser.parse_args()
@@ -170,7 +178,7 @@ def param_to_list(lyr_type: str, lyr_params: dict, params_to_convert: list,
                   layers_of_params: list):
     """
     It converts int parameters to list format for buml model
-    
+
     Parameters:
         lyr_type (str): The type of the layer.
         lyr_params (dict): A dictionnary of all the layer parameters and their
@@ -183,11 +191,25 @@ def param_to_list(lyr_type: str, lyr_params: dict, params_to_convert: list,
         None
     """
 
+    # DEBUG: Log when processing adaptive pooling layers
+    if "AdaptiveMaxPool" in lyr_type or "AdaptiveAvgPool" in lyr_type:
+        print(f"[DEBUG] param_to_list called for: {lyr_type}")
+        print(f"[DEBUG] lyr_params: {lyr_params}")
+        print(f"[DEBUG] params_to_convert: {params_to_convert}")
+        print(f"[DEBUG] lyr_type in layers_of_params: {lyr_type in layers_of_params}")
+
     if lyr_type in layers_of_params:
         for param in lyr_params:
-            if (param in params_to_convert and
-                isinstance(lyr_params[param], int)):
-                lyr_params[param] = [lyr_params[param]]
+            if lyr_type.endswith("2d") or lyr_type.endswith("3d"):
+                if (param in ["kernel_size", "stride", "output_size"] and
+                    isinstance(lyr_params[param], int)):
+                    dim = 2 if lyr_type.endswith("2d") else 3
+                    lyr_params[param] = [lyr_params[param]] * dim
+            else:
+                if (param in params_to_convert and
+                    isinstance(lyr_params[param], int)):
+                    print(f"[DEBUG] Converting {param}: {lyr_params[param]} -> [{lyr_params[param]}]")
+                    lyr_params[param] = [lyr_params[param]]
 
 
 def process_positional_params(lyr_type: str, lyr_params: dict,

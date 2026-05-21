@@ -128,19 +128,49 @@ class ASTParserTF(ASTParser):
         self.buml_model.add_sub_nn(subnn)
 
 
+    def decompose_chained_call(self, node):
+        """Decompose chained calls into list of individual operations in execution order."""
+        chain = []
+        current = node.value
+        while isinstance(current, ast.Call) and hasattr(current.func, 'value'):
+            chain.append(current)
+            if isinstance(current.func.value, ast.Call):
+                current = current.func.value
+            else:
+                break
+        chain.reverse()
+        return chain
+
     def handle_forward_simple_call(self, node: ast.Assign):
         """
-        This method: 
-        - retrieves the input and output variables of modules 
-        and populates 'inputs_outputs' and 'layer_of_output' dictionaries.
-        - sets the order of modules in buml model and processes tensorops.  
+        Processes forward method assignments including chained calls.
+        """
+        if isinstance(node.value, ast.Call) and hasattr(node.value.func, 'value'):
+            if isinstance(node.value.func.value, ast.Call):
+                chain = self.decompose_chained_call(node)
+                for i, call in enumerate(chain):
+                    is_last = (i == len(chain) - 1)
+                    if is_last:
+                        synthetic_node = ast.Assign(targets=node.targets, value=call)
+                    else:
+                        temp_name = f"_chain_temp_{self.tensor_op_counter}_{i}"
+                        temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+                        synthetic_node = ast.Assign(targets=[temp_target], value=call)
+                        if i + 1 < len(chain) and chain[i + 1].args:
+                            chain[i + 1].args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+                    synthetic_node.lineno = node.lineno
+                    synthetic_node.col_offset = node.col_offset
+                    self.process_single_call(synthetic_node)
+                    self.previous_assign = synthetic_node
+                return
 
-        Parameters:
-            node (ast.Assign): The AST node representing an assignment
-                statement.
+        self.process_single_call(node)
+        self.previous_assign = node
 
-        Returns:
-            None, but populates the BUML model. 
+    def process_single_call(self, node: ast.Assign):
+        """
+        Process a single (non-chained) call operation.
+        This contains the original logic from handle_forward_simple_call.
         """
         if isinstance(node.value.func.value, ast.Name):
             if node.value.func.value.id == "self":
@@ -163,7 +193,6 @@ class ASTParserTF(ASTParser):
         elif isinstance(node.value.func.value, ast.Attribute):
             if node.value.func.value.value.id == "tf":
                 self.extract_tensorop(node)
-        self.previous_assign = node
 
 
     def extract_tensorop(self, node: ast.Assign):
@@ -405,15 +434,17 @@ def transform_layer(lyr_type: str, lyr_params: dict,
         lyr_type (str): The type of the layer (TensorFlow).
         lyr_params (dict): A dictionnary storing the layer parameters and
             their values.
-        padding_amount (int | None): It  keeps track of padding in 
-            ZeroPadding layer. In TF, padding is added to conv layers 
+        padding_amount (int | None): It  keeps track of padding in
+            ZeroPadding layer. In TF, padding is added to conv layers
             using a separate layer, but in PyTorch and BUML it is defined
             as an attribute of the conv layer.
         lyr_name (str): The name of the layer.
 
     Returns:
-        The type of the layer and its parameters in BUML. 
+        The type of the layer and its parameters in BUML.
     """
+    process_positional_params(lyr_type, lyr_params, pos_params)
+
     param_to_list(lyr_type, lyr_params, int2list_params,
                   lyrs_of_int2list_params)
 
@@ -439,11 +470,10 @@ def process_params(lyr_type: str, lyr_params: dict):
             their values.
 
     Returns:
-        The parameters transformed into BUML. 
+        The parameters transformed into BUML.
     """
 
     updated_lyr_params = {}
-    process_positional_params(lyr_type, lyr_params, pos_params)
 
     lyrs_units = rnn_layers + ["Dense"]
     if lyr_type in lyrs_units and "units" in lyr_params:

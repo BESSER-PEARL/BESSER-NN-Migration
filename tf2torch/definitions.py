@@ -88,8 +88,11 @@ pos_params = {"Dense": ["units", "activation"],
 int2list_params = ["kernel_size", "strides", "pool_size",
                    "output_size", "axis"]
 
-lyrs_of_int2list_params = ["Conv1D", "MaxPool1D", "AveragePooling1D",
-                           "AdaptiveAveragePooling1D", "AdaptiveMaxPooling1D", 
+lyrs_of_int2list_params = ["Conv1D", "Conv2D", "Conv3D",
+                           "MaxPool1D", "MaxPool2D", "MaxPool3D",
+                           "AveragePooling1D", "AveragePooling2D", "AveragePooling3D",
+                           "AdaptiveAveragePooling1D", "AdaptiveAveragePooling2D", "AdaptiveAveragePooling3D",
+                           "AdaptiveMaxPooling1D", "AdaptiveMaxPooling2D", "AdaptiveMaxPooling3D",
                            "LayerNormalization"]
 
 layers_buml2tf = {"LinearLayer": "Dense", "SimpleRNNLayer": "RNN",

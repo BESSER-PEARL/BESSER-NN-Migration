@@ -85,5 +85,10 @@ pos_params = {"Linear": ["in_features", "out_features"],
 
 
 int2list_params = ["kernel_size", "stride", "output_size", "normalized_shape"]
-lyrs_of_int2list_params = ["Conv1d", "MaxPool1d", "AvgPool1d", "LayerNorm",
-                           "AdaptiveAvgPool1d", "AdaptiveMaxPool1d"]
+lyrs_of_int2list_params = ["Conv1d", "Conv2d", "Conv3d", "MaxPool1d",
+                           "AvgPool1d", "MaxPool2d", "AvgPool2d", 
+                           "MaxPool3d", "AvgPool3d", "LayerNorm",
+                           "AdaptiveAvgPool1d", "AdaptiveMaxPool1d",
+                           "AdaptiveAvgPool2d", "AdaptiveMaxPool2d",
+                           "AdaptiveAvgPool3d", "AdaptiveMaxPool3d"]
+

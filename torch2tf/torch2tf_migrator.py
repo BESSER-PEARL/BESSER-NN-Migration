@@ -25,7 +25,8 @@ def main():
     buml_model, output_nn_type = transform(args, "PyTorch", ASTParserTorch)
 
     tf_model = TFGenerator(
-        model=buml_model, output_dir="output/migrated_nn",
+        model=buml_model,
+        output_dir=args.output_dir,
         generation_type=output_nn_type
     )
     tf_model.generate()
