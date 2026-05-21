@@ -12,11 +12,13 @@ Argument:
         script defines a dataset, it can be skipped.
 """
 import sys
+import os
 sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from besser.generators.nn.pytorch.pytorch_code_generator import (
     PytorchGenerator
 )
-from tf2torch.ast_parser_tf import ASTParserTF
+from ast_parser_tf import ASTParserTF
 from transform_code import (
     parse_arguments_transform, transform
 )

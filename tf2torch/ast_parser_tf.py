@@ -11,13 +11,50 @@ sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 import besser.BUML.metamodel.nn as mm_classes
 from besser.BUML.metamodel.nn import NN, Layer
 from ast_parser_nn import ASTParser
-from tf2torch.definitions import (
+from definitions import (
     layers_mapping, params_mapping, static_params, rnn_layers,
     pos_params, int2list_params, lyrs_of_int2list_params, loss_func_mapping
 )
 from transform_code import (
     process_positional_params, param_to_list, set_static_params
 )
+
+def infer_batchnorm_params(buml_model):
+    """
+    Infer BatchNormalization dimension and num_features from previous layers.
+
+    Look backwards through layers to find the most recent CNN layer.
+    If found, use its dimension. Otherwise default to 1D.
+
+    Parameters:
+        buml_model: The BUML model with already added layers.
+
+    Returns:
+        dict with 'dimension' and 'num_features' params.
+    """
+    # Search backwards through layers for the most recent conv layer
+    for layer in reversed(buml_model.layers):
+        layer_class = layer.__class__.__name__
+
+        # Check if it's a conv layer
+        if layer_class in ["Conv1D", "Conv2D", "Conv3D"]:
+            # Extract dimension from class name (Conv1D -> 1D)
+            dim = layer_class[-2:]  # Gets "1D", "2D", or "3D"
+            num_features = layer.out_channels
+            return {"dimension": dim, "num_features": num_features}
+
+        # If we hit a Flatten or Dense, the data is now 1D
+        if layer_class in ["FlattenLayer", "LinearLayer"]:
+            # After flatten/dense, we're in 1D space
+            if layer_class == "LinearLayer":
+                num_features = layer.out_features
+            else:
+                num_features = 1  # Will need to infer dynamically
+            return {"dimension": "1D", "num_features": num_features}
+
+    # Default if no conv/dense found
+    return {"dimension": "1D", "num_features": 1}
+
 
 class ASTParserTF(ASTParser):
     """
@@ -76,6 +113,11 @@ class ASTParserTF(ASTParser):
 
             self.padding_amount = padding_amount
             if not lyr_type.startswith("ZeroPadding"):
+                # Infer BatchNorm params from previous layers if needed
+                if lyr_type == "BatchNormLayer":
+                    inferred_params = infer_batchnorm_params(self.buml_model)
+                    lyr_params.update(inferred_params)
+
                 buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
                 self.buml_model.add_layer(buml_layer)
 
@@ -118,6 +160,11 @@ class ASTParserTF(ASTParser):
                 if not lyr_type.startswith("ZeroPadding"):
                     lyr_params["name"] = f"layer_{layer_id}"
 
+                    # Infer BatchNorm params from previous layers if needed
+                    if lyr_type == "BatchNormLayer":
+                        inferred_params = infer_batchnorm_params(subnn)
+                        lyr_params.update(inferred_params)
+
                     subnn_layer = getattr(mm_classes, lyr_type)(**lyr_params)
                     subnn.add_layer(subnn_layer)
                     layer_id+=1
@@ -158,8 +205,19 @@ class ASTParserTF(ASTParser):
                         temp_name = f"_chain_temp_{self.tensor_op_counter}_{i}"
                         temp_target = ast.Name(id=temp_name, ctx=ast.Store())
                         synthetic_node = ast.Assign(targets=[temp_target], value=call)
-                        if i + 1 < len(chain) and chain[i + 1].args:
-                            chain[i + 1].args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+
+                        # Update next call based on whether it's functional or method call
+                        if i + 1 < len(chain):
+                            next_call = chain[i + 1]
+                            next_func_value = next_call.func.value
+
+                            if isinstance(next_func_value, ast.Name):
+                                # Functional call like layers.Activation(x) where x is in args[0]
+                                if next_call.args:
+                                    next_call.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+                            elif isinstance(next_func_value, ast.Call):
+                                # Method call like result.transpose(...) where result is func.value
+                                next_call.func.value = ast.Name(id=temp_name, ctx=ast.Load())
                     synthetic_node.lineno = node.lineno
                     synthetic_node.col_offset = node.col_offset
                     self.process_single_call(synthetic_node)

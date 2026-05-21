@@ -161,8 +161,21 @@ class ASTParserTorch(ASTParser):
                         temp_name = f"_chain_temp_{self.tensor_op_counter}_{i}"
                         temp_target = ast.Name(id=temp_name, ctx=ast.Store())
                         synthetic_node = ast.Assign(targets=[temp_target], value=call)
-                        if i + 1 < len(chain) and chain[i + 1].args:
-                            chain[i + 1].args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+
+                        # Link next call to this temp variable
+                        if i + 1 < len(chain):
+                            next_call = chain[i + 1]
+                            next_func_value = next_call.func.value
+
+                            # Check if next call is functional (F.xxx) or method (x.xxx)
+                            if isinstance(next_func_value, ast.Name):
+                                # Functional call like F.relu(x) where x is in args[0]
+                                if next_call.args:
+                                    next_call.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+                            elif isinstance(next_func_value, ast.Call):
+                                # Method call like result.permute(...) where result is func.value
+                                next_call.func.value = ast.Name(id=temp_name, ctx=ast.Load())
+
                     synthetic_node.lineno = node.lineno
                     synthetic_node.col_offset = node.col_offset
                     self.process_single_call(synthetic_node)
@@ -227,11 +240,12 @@ class ASTParserTorch(ASTParser):
                         output_var = node.targets[0].id
                         self.inputs_outputs[actv_lyr_name] = [input_var, output_var]
                         self.module_of_output[output_var] = actv_lyr_name
+                        print(f"[DEBUG] Created standalone activation: {actv_lyr_name}, input={input_var}, output={output_var}")
                     else:
                         # Attach activation to previous layer (original behavior)
                         if prev_lyr_obj:
                             prev_lyr_obj.actv_func = actv_fun_mapping[module_name]
-                        # Update module_of_output to point to the previous layer (activation is inline)
+                        # Update layer_of_output to point to the previous layer (activation is inline)
                         if input_var in self.module_of_output:
                             self.module_of_output[node.targets[0].id] = self.module_of_output[input_var]
                 else:
@@ -261,7 +275,7 @@ class ASTParserTorch(ASTParser):
 
         # Handle module API (self.layer)
         if caller_id == "self":
-            # Populates inputs_outputs and module_of_output from forward method
+            # Populates inputs_outputs and layer_of_output from forward method
             module_name = node.value.func.attr
             self.inputs_outputs[module_name] = [node.value.args[0].id,
                                                 node.targets[0].id]
@@ -440,7 +454,7 @@ class ASTParserTorch(ASTParser):
     def extract_tensorop(self, node: ast.Assign):
         """
         It extracts the tensorop name and its parameters.
-        
+
         Parameters:
             node (ast.Assign): The AST node representing an assignment
                 statement.
@@ -529,9 +543,23 @@ class ASTParserTorch(ASTParser):
             lyr_type = prev_module.__class__.__name__
             if lyr_type in cnn_layers:
                 prev_module.permute_out = True
+            else:
+                # Not a CNN layer, create tensorop
+                permute_dim = []
+                for arg in ops_args:
+                    if isinstance(arg, ast.Constant):
+                        permute_dim.append(arg.value)
+                    elif isinstance(arg, ast.Num):  # Python < 3.8
+                        permute_dim.append(arg.n)
+                tensorop_param = {"tns_type": "permute",
+                                  "permute_dim": permute_dim}
         else:
-            permute_dim=[ops_args[0].value, ops_args[1].value,
-                            ops_args[2].value]
+            permute_dim = []
+            for arg in ops_args:
+                if isinstance(arg, ast.Constant):
+                    permute_dim.append(arg.value)
+                elif isinstance(arg, ast.Num):  # Python < 3.8
+                    permute_dim.append(arg.n)
             tensorop_param = {"tns_type": "permute",
                               "permute_dim": permute_dim}
         return tensorop_param
