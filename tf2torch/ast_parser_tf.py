@@ -19,6 +19,18 @@ from transform_code import (
     process_positional_params, param_to_list, set_static_params
 )
 
+# TensorFlow activation function mapping (tf.nn.* to BUML)
+tf_actv_func_mapping = {
+    "relu": "relu",
+    "tanh": "tanh",
+    "sigmoid": "sigmoid",
+    "softmax": "softmax",
+    "leaky_relu": "leaky_relu",
+    "elu": "elu",
+    "selu": "selu",
+    "gelu": "gelu",
+}
+
 def infer_batchnorm_params(buml_model):
     """
     Infer BatchNormalization dimension and num_features from previous layers.
@@ -224,8 +236,36 @@ class ASTParserTF(ASTParser):
                     self.previous_assign = synthetic_node
                 return
 
+        # Handle nested calls
+        is_nested_call = False
+        if isinstance(node.value, ast.Call) and node.value.args:
+            if isinstance(node.value.args[0], ast.Call):
+                # Nested call detected: process inner call first
+                inner_call = node.value.args[0]
+                temp_name = f"_nested_temp_{self.tensor_op_counter}"
+                self.tensor_op_counter += 1
+                temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+
+                # Create synthetic node for inner call
+                inner_node = ast.Assign(targets=[temp_target], value=inner_call)
+                inner_node.lineno = node.lineno
+                inner_node.col_offset = node.col_offset
+                self.process_single_call(inner_node)
+                self.previous_assign = inner_node
+
+                # Replace inner call with temp variable in outer call
+                node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+                is_nested_call = True
+
+        # Mark if this is a nested call's outer part
+        if is_nested_call:
+            self.is_processing_nested_outer = True
+
         self.process_single_call(node)
         self.previous_assign = node
+
+        if is_nested_call:
+            self.is_processing_nested_outer = False
 
     def process_single_call(self, node: ast.Assign):
         """
@@ -248,12 +288,81 @@ class ASTParserTF(ASTParser):
 
                 self.buml_model.modules.append(module_obj)
             else:
-                #tensorops
-                self.extract_tensorop(node)
+                #tensorops or tf.nn.* activations
+                # Check if it's tf.nn.<activation>
+                if (isinstance(node.value.func.value, ast.Attribute) and
+                    node.value.func.value.attr == "nn" and
+                    isinstance(node.value.func.value.value, ast.Name) and
+                    node.value.func.value.value.id == "tf"):
+                    # This is tf.nn.* - check if activation
+                    func_name = node.value.func.attr
+                    if func_name in tf_actv_func_mapping:
+                        self.handle_tf_activation(node, func_name)
+                    else:
+                        # Not an activation, treat as tensorop
+                        self.extract_tensorop(node)
+                else:
+                    self.extract_tensorop(node)
         elif isinstance(node.value.func.value, ast.Attribute):
             if node.value.func.value.value.id == "tf":
-                self.extract_tensorop(node)
+                # Check if it's tf.nn.<activation>
+                if (node.value.func.value.attr == "nn" and
+                    node.value.func.attr in tf_actv_func_mapping):
+                    self.handle_tf_activation(node, node.value.func.attr)
+                else:
+                    self.extract_tensorop(node)
 
+
+    def handle_tf_activation(self, node: ast.Assign, func_name: str):
+        """
+        Handle tf.nn.* activation functions (like tf.nn.relu).
+
+        Parameters:
+            node (ast.Assign): The AST node representing the assignment.
+            func_name (str): The activation function name (e.g., 'relu').
+
+        Returns:
+            None, but attaches activation to previous layer or creates standalone.
+        """
+        input_var = node.value.args[0].id
+        prev_is_tensorop = False
+        prev_lyr_obj = None
+
+        # Check if previous module is a TensorOp
+        if input_var in self.module_of_output:
+            prev_lyr_name = self.module_of_output[input_var]
+            prev_lyr_obj = next((obj for obj in self.buml_model.modules if
+                               obj.name == prev_lyr_name), None)
+            prev_cls = prev_lyr_obj.__class__.__name__ if prev_lyr_obj else "None"
+            if prev_lyr_obj and prev_cls == "TensorOp":
+                prev_is_tensorop = True
+
+        if prev_is_tensorop:
+            # Create standalone activation layer
+            actv_lyr_name = f"activ_{func_name}_{self.tensor_op_counter}"
+            self.tensor_op_counter += 1
+            actv_lyr = mm_classes.GeneralLayer(
+                name=actv_lyr_name,
+                actv_func=tf_actv_func_mapping[func_name]
+            )
+            self.buml_model.add_layer(actv_lyr)
+            self.buml_model.modules.append(actv_lyr)
+
+            # Track inputs/outputs
+            output_var = node.targets[0].id
+            self.inputs_outputs[actv_lyr_name] = [input_var, output_var]
+            self.module_of_output[output_var] = actv_lyr_name
+        else:
+            # Attach activation to previous layer
+            if prev_lyr_obj:
+                prev_lyr_obj.actv_func = tf_actv_func_mapping[func_name]
+                # Update layer output for nested calls
+                if hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer:
+                    if prev_lyr_name in self.inputs_outputs:
+                        self.inputs_outputs[prev_lyr_name][1] = node.targets[0].id
+            # Update module_of_output
+            if input_var in self.module_of_output:
+                self.module_of_output[node.targets[0].id] = self.module_of_output[input_var]
 
     def extract_tensorop(self, node: ast.Assign):
         """

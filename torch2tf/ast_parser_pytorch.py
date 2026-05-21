@@ -148,8 +148,9 @@ class ASTParserTorch(ASTParser):
 
     def handle_forward_simple_call(self, node: ast.Assign):
         """
-        Processes forward method assignments including chained calls.
+        Processes forward method assignments including chained and nested calls.
         """
+        # Handle chained calls (x.method1().method2())
         if isinstance(node.value, ast.Call) and hasattr(node.value.func, 'value'):
             if isinstance(node.value.func.value, ast.Call):
                 chain = self.decompose_chained_call(node)
@@ -176,14 +177,71 @@ class ASTParserTorch(ASTParser):
                                 # Method call like result.permute(...) where result is func.value
                                 next_call.func.value = ast.Name(id=temp_name, ctx=ast.Load())
 
+                    # Check if this call in the chain is nested
+                    if isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Call):
+                        # Nested call within chain: decompose it first
+                        inner_call = call.args[0]
+                        inner_temp = f"_nested_in_chain_{self.tensor_op_counter}"
+                        self.tensor_op_counter += 1
+                        inner_target = ast.Name(id=inner_temp, ctx=ast.Store())
+                        inner_node = ast.Assign(targets=[inner_target], value=inner_call)
+                        inner_node.lineno = node.lineno
+                        inner_node.col_offset = node.col_offset
+
+                        # Process inner call without nested flag (it's just a layer)
+                        self.process_single_call(inner_node)
+                        self.previous_assign = inner_node
+
+                        # Replace nested call with temp variable
+                        call.args[0] = ast.Name(id=inner_temp, ctx=ast.Load())
+
                     synthetic_node.lineno = node.lineno
                     synthetic_node.col_offset = node.col_offset
+
+                    # Mark as nested outer part if this is activation on the inner temp
+                    is_nested_activation = False
+                    if isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Name):
+                        if call.args[0].id.startswith('_nested_in_chain_'):
+                            self.is_processing_nested_outer = True
+                            is_nested_activation = True
+
                     self.process_single_call(synthetic_node)
                     self.previous_assign = synthetic_node
+
+                    if is_nested_activation:
+                        self.is_processing_nested_outer = False
                 return
+
+        # Handle nested calls (F.relu(self.conv(x)))
+        is_nested_call = False
+        if isinstance(node.value, ast.Call) and node.value.args:
+            if isinstance(node.value.args[0], ast.Call):
+                # Nested call detected: process inner call first
+                inner_call = node.value.args[0]
+                temp_name = f"_nested_temp_{self.tensor_op_counter}"
+                self.tensor_op_counter += 1
+                temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+
+                # Create synthetic node for inner call
+                inner_node = ast.Assign(targets=[temp_target], value=inner_call)
+                inner_node.lineno = node.lineno
+                inner_node.col_offset = node.col_offset
+                self.process_single_call(inner_node)
+                self.previous_assign = inner_node
+
+                # Replace inner call with temp variable in outer call
+                node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+                is_nested_call = True
+
+        # Mark if this is a nested call's outer part (activation wrapping layer)
+        if is_nested_call:
+            self.is_processing_nested_outer = True
 
         self.process_single_call(node)
         self.previous_assign = node
+
+        if is_nested_call:
+            self.is_processing_nested_outer = False
 
     def process_single_call(self, node: ast.Assign):
         """
@@ -240,11 +298,14 @@ class ASTParserTorch(ASTParser):
                         output_var = node.targets[0].id
                         self.inputs_outputs[actv_lyr_name] = [input_var, output_var]
                         self.module_of_output[output_var] = actv_lyr_name
-                        print(f"[DEBUG] Created standalone activation: {actv_lyr_name}, input={input_var}, output={output_var}")
                     else:
                         # Attach activation to previous layer (original behavior)
                         if prev_lyr_obj:
                             prev_lyr_obj.actv_func = actv_fun_mapping[module_name]
+                            # Update the layer's output to reflect final output (only for nested calls)
+                            if hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer:
+                                if prev_lyr_name in self.inputs_outputs:
+                                    self.inputs_outputs[prev_lyr_name][1] = node.targets[0].id
                         # Update layer_of_output to point to the previous layer (activation is inline)
                         if input_var in self.module_of_output:
                             self.module_of_output[node.targets[0].id] = self.module_of_output[input_var]

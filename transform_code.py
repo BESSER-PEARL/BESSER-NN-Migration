@@ -266,17 +266,20 @@ def set_static_params(lyr_type: str, lyr_params: dict,
 
 
 def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
-                         module_of_output: dict):
+                         module_of_output: dict, modules_list: list = None,
+                         current_index: int = None):
     """
     It sets the 'input_reused' and 'name_module_input' layer parameters.
 
     Parameters:
         lyr_obj (Layer): The buml layer object.
-        inputs_outputs (dict): It stores input and output variables 
+        inputs_outputs (dict): It stores input and output variables
             of layers.
         module_of_output (dict): It stores name of layers given their
             output var.
-    
+        modules_list (list): The list of all modules in execution order.
+        current_index (int): The index of the current layer in modules_list.
+
     Returns:
         None
     """
@@ -284,6 +287,20 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
     layer_name = lyr_obj.name
     if (not isinstance(inputs_outputs[layer_name][1], list) and
         inputs_outputs[layer_name][0] != inputs_outputs[layer_name][1]):
-        lyr_in_out = module_of_output[inputs_outputs[layer_name][0]]
-        lyr_obj.input_reused = True
-        lyr_obj.name_module_input = lyr_in_out
+        input_var = inputs_outputs[layer_name][0]
+        if input_var in module_of_output:
+            lyr_in_out = module_of_output[input_var]
+
+            # Check temporal ordering: the referenced module must come before this one
+            if modules_list is not None and current_index is not None:
+                referenced_module = next((m for m in modules_list if m.name == lyr_in_out), None)
+                if referenced_module:
+                    referenced_index = modules_list.index(referenced_module)
+                    # Only set name_module_input if the referenced module comes before
+                    if referenced_index < current_index:
+                        lyr_obj.input_reused = True
+                        lyr_obj.name_module_input = lyr_in_out
+            else:
+                # Fallback to old behavior if indices not provided
+                lyr_obj.input_reused = True
+                lyr_obj.name_module_input = lyr_in_out

@@ -96,10 +96,11 @@ class ASTParser(ast.NodeVisitor):
         It iterates through the layers to set their 'input_reused'
         and 'name_module_input' parameters.
         """
-        for module in self.buml_model.modules:
+        for i, module in enumerate(self.buml_model.modules):
             if isinstance(module, Layer):
                 set_remaining_params(
-                    module, self.inputs_outputs, self.module_of_output
+                    module, self.inputs_outputs, self.module_of_output,
+                    self.buml_model.modules, i
                 )
 
 
