@@ -1,5 +1,5 @@
 """
-Extracts input_shape from tensorflow conv and dense layers dynamically. 
+Extracts input_shape from tensorflow conv and dense layers dynamically.
 This is specific to conv and dense layers.
 These layer attributes are needed when transforming tensorflow
 code to pytorch code.
@@ -7,6 +7,7 @@ code to pytorch code.
 import subprocess
 import re
 import sys
+sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 import os
 import ast
 from ast import literal_eval

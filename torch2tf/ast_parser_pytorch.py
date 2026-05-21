@@ -1,16 +1,19 @@
 """
 Module to extract information from the AST of a neural network
-written in PyTorch and transforms it to a BUML model. 
-It also extracts data and model configuration attributes. 
+written in PyTorch and transforms it to a BUML model.
+It also extracts data and model configuration attributes.
 """
 import ast
+import sys
+sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 from besser.BUML.metamodel.nn import NN, Layer
 import besser.BUML.metamodel.nn as mm_classes
 
 from torch2tf.definitions import (
     layers_mapping, params_mapping, static_params,
     pos_params, int2list_params, lyrs_of_int2list_params,
-    actv_fun_mapping, cnn_layers, loss_func_mapping
+    actv_fun_mapping, cnn_layers, loss_func_mapping,
+    functional_to_module_mapping
 )
 from ast_parser_nn import ASTParser
 from transform_code import (
@@ -172,17 +175,97 @@ class ASTParserTorch(ASTParser):
     def process_single_call(self, node: ast.Assign):
         """
         Process a single (non-chained) call operation.
-        This contains the original logic from handle_forward_simple_call.
+        Handles both module API (self.layer) and functional API (F.layer).
         """
-        if (isinstance(node.value, ast.Call) and
-            hasattr(node.value.func, 'value') and
-            isinstance(node.value.func.value, ast.Name) and
-            node.value.func.value.id == "self"):
-            # Populates inputs_outputs and layer_of_output from forward method
+        if not (isinstance(node.value, ast.Call) and
+                hasattr(node.value.func, 'value') and
+                isinstance(node.value.func.value, ast.Name)):
+            self.extract_tensorop(node)
+            return
+
+        caller_id = node.value.func.value.id
+
+        # Handle functional API (F.layer or torch.nn.functional.layer)
+        if caller_id == "F" or caller_id == "functional":
+            func_name = node.value.func.attr
+
+            # Check if it maps to a known module
+            if func_name in functional_to_module_mapping:
+                module_name = functional_to_module_mapping[func_name]
+
+                # Generate synthetic layer name
+                synthetic_name = f"f_{func_name}_{self.tensor_op_counter}"
+                self.tensor_op_counter += 1
+
+                # Check if it's an activation function
+                if module_name in actv_fun_mapping:
+                    input_var = node.value.args[0].id
+                    prev_is_tensorop = False
+                    prev_lyr_obj = None
+
+                    # Check if previous module is a TensorOp
+                    if input_var in self.module_of_output:
+                        prev_lyr_name = self.module_of_output[input_var]
+                        prev_lyr_obj = next((obj for obj in self.buml_model.modules if
+                                           obj.name == prev_lyr_name), None)
+                        prev_cls = prev_lyr_obj.__class__.__name__ if prev_lyr_obj else "None"
+                        if prev_lyr_obj and prev_cls == "TensorOp":
+                            prev_is_tensorop = True
+
+                    if prev_is_tensorop:
+                        # Create standalone activation layer using GeneralLayer
+                        actv_lyr_name = f"activ_{module_name}_{self.tensor_op_counter}"
+                        self.tensor_op_counter += 1
+                        actv_lyr = mm_classes.GeneralLayer(
+                            name=actv_lyr_name,
+                            actv_func=actv_fun_mapping[module_name]
+                        )
+                        self.buml_model.add_layer(actv_lyr)
+                        self.buml_model.modules.append(actv_lyr)
+
+                        # Track inputs/outputs
+                        output_var = node.targets[0].id
+                        self.inputs_outputs[actv_lyr_name] = [input_var, output_var]
+                        self.module_of_output[output_var] = actv_lyr_name
+                    else:
+                        # Attach activation to previous layer (original behavior)
+                        if prev_lyr_obj:
+                            prev_lyr_obj.actv_func = actv_fun_mapping[module_name]
+                        # Update module_of_output to point to the previous layer (activation is inline)
+                        if input_var in self.module_of_output:
+                            self.module_of_output[node.targets[0].id] = self.module_of_output[input_var]
+                else:
+                    # Handle as regular layer
+                    lyr_params = {'positional_params': []}
+                    for arg in node.value.args[1:]:  # Skip first arg (input tensor)
+                        lyr_params['positional_params'].append(self.param_value(arg))
+
+                    for kw in node.value.keywords:
+                        lyr_params[kw.arg] = self.param_value(kw.value)
+
+                    # Transform using existing logic
+                    lyr_type, lyr_params = transform_layer(module_name, lyr_params, synthetic_name)
+
+                    # Create and add layer
+                    lyr_obj = getattr(mm_classes, lyr_type)(**lyr_params)
+                    self.buml_model.add_layer(lyr_obj)
+
+                    # Track inputs/outputs
+                    self.inputs_outputs[synthetic_name] = [node.value.args[0].id, node.targets[0].id]
+                    self.module_of_output[node.targets[0].id] = synthetic_name
+                    self.buml_model.modules.append(lyr_obj)
+            else:
+                # Unknown functional - treat as tensor op
+                self.extract_tensorop(node)
+            return
+
+        # Handle module API (self.layer)
+        if caller_id == "self":
+            # Populates inputs_outputs and module_of_output from forward method
             module_name = node.value.func.attr
             self.inputs_outputs[module_name] = [node.value.args[0].id,
                                                 node.targets[0].id]
-            self.layer_of_output[node.targets[0].id] = module_name
+            self.module_of_output[node.targets[0].id] = module_name
 
             is_subnn_obj = next((obj for obj in self.buml_model.sub_nns if
                                  obj.name == module_name), None)
@@ -239,7 +322,7 @@ class ASTParserTorch(ASTParser):
 
         rnn_in = node.value.args[0].id
         self.inputs_outputs[module_name] = [rnn_in, rnn_out]
-        self.layer_of_output[rnn_out] = module_name
+        self.module_of_output[rnn_out] = module_name
         module_obj = next((obj for obj in self.buml_model.layers if
                            obj.name == module_name), None)
         if not module_obj:
@@ -373,8 +456,8 @@ class ASTParserTorch(ASTParser):
         elif op_type == "cat":
             tensorop_param = self.extract_tensorop_concatenate(node)
         elif op_type == "mul" or op_type == "matmul":
-            layers_of_tensors = [self.layer_of_output[op_args[0].id],
-                                 self.layer_of_output[op_args[1].id]]
+            layers_of_tensors = [self.module_of_output[op_args[0].id],
+                                 self.module_of_output[op_args[1].id]]
             tensorop_param = {"tns_type": op_type+"tiply",
                               "layers_of_tensors": layers_of_tensors}
         elif op_type == "transpose":
@@ -396,6 +479,11 @@ class ASTParserTorch(ASTParser):
             self.buml_model.add_tensor_op(tns_obj)
             self.tensor_op_counter+=1
 
+            # Track tensorop output so activations can detect it
+            output_var = node.targets[0].id
+            self.module_of_output[output_var] = op_name
+            # Note: inputs_outputs for tensorops handled differently - they use layers_of_tensors
+
 
     def extract_tensorop_concatenate(self, node):
         """
@@ -416,8 +504,8 @@ class ASTParserTorch(ASTParser):
                             obj.name == prev_lyr_name), None)
             lyr_obj.return_type =  "hidden"
         else:
-            layers_of_tensors = [self.layer_of_output[ops_args[0].id],
-                                 self.layer_of_output[ops_args[1].id]]
+            layers_of_tensors = [self.module_of_output[ops_args[0].id],
+                                 self.module_of_output[ops_args[1].id]]
             cat_dim = self.param_value(node.value.keywords[0].value)
 
             tensorop_param = {"tns_type": "concatenate",

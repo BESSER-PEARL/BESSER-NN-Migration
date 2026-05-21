@@ -1,11 +1,13 @@
 """
 Module to extract information from the AST of a neural network
-written in TensorFlow and transforms it to a BUML model. 
-It also extracts data and model configuration attributes. 
+written in TensorFlow and transforms it to a BUML model.
+It also extracts data and model configuration attributes.
 """
 
 
 import ast
+import sys
+sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 import besser.BUML.metamodel.nn as mm_classes
 from besser.BUML.metamodel.nn import NN, Layer
 from ast_parser_nn import ASTParser
@@ -175,10 +177,10 @@ class ASTParserTF(ASTParser):
         if isinstance(node.value.func.value, ast.Name):
             if node.value.func.value.id == "self":
                 module_name = node.value.func.attr
-                #populate inputs_outputs and layer_of_output
+                #populate inputs_outputs and module_of_output
                 self.inputs_outputs[module_name] = [node.value.args[0].id,
                                                     node.targets[0].id]
-                self.layer_of_output[node.targets[0].id] = module_name
+                self.module_of_output[node.targets[0].id] = module_name
                 module_obj = next((obj for obj in self.buml_model.layers if
                                    obj.name == module_name), None)
                 if not module_obj:
@@ -211,10 +213,10 @@ class ASTParserTF(ASTParser):
         tensorop_param = None
         if op_type == "concat":
             op_args = node.value.args[0].elts
-            if (op_args[0].id in self.layer_of_output and
-                op_args[1].id in self.layer_of_output):
-                lyr1 = self.layer_of_output[op_args[0].id]
-                lyr2 = self.layer_of_output[op_args[1].id]
+            if (op_args[0].id in self.module_of_output and
+                op_args[1].id in self.module_of_output):
+                lyr1 = self.module_of_output[op_args[0].id]
+                lyr2 = self.module_of_output[op_args[1].id]
                 if lyr1 != lyr2:
                     layers_of_tensors = [lyr1, lyr2]
                     cat_dim = self.param_value(node.value.keywords[0].value)
@@ -223,8 +225,8 @@ class ASTParserTF(ASTParser):
                                       "concatenate_dim": cat_dim}
         elif op_type == "matmul" or op_type == "multiply":
             op_type = "matmultiply" if op_type == "matmul" else "multiply"
-            layers_of_tensors = [self.layer_of_output[op_args[0].id],
-                                 self.layer_of_output[op_args[1].id]]
+            layers_of_tensors = [self.module_of_output[op_args[0].id],
+                                 self.module_of_output[op_args[1].id]]
             tensorop_param = {"tns_type": op_type,
                               "layers_of_tensors": layers_of_tensors}
         elif op_type == "transpose":

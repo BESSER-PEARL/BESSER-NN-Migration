@@ -6,6 +6,8 @@ It also extracts data and model configuration attributes.
 """
 
 import ast
+import sys
+sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 from abc import abstractmethod
 from besser.BUML.metamodel.nn import NN, Layer
 from transform_code import set_remaining_params
@@ -26,7 +28,7 @@ class ASTParser(ast.NodeVisitor):
             data attributes.
         inputs_outputs (dict): It keeps track of input and output variables 
             of layers.
-        layer_of_output (dict): It keeps track of name of layers given their
+        module_of_output (dict): It keeps track of name of layers given their
             output var.
         tensor_op_counter (int): Counter used to assign names of tensorops.
         in_class (bool): It tracks the processing of NN architecture class.
@@ -45,7 +47,7 @@ class ASTParser(ast.NodeVisitor):
         self.data_config: dict = {"config": {}, "train_data": {},
                                   "test_data": {}}
         self.inputs_outputs: dict = {}
-        self.layer_of_output: dict = {}
+        self.module_of_output: dict = {}
         self.tensor_op_counter: int = 1
         self.in_class: bool = False
         self.unprocessed_nodes: list = []
@@ -97,7 +99,7 @@ class ASTParser(ast.NodeVisitor):
         for module in self.buml_model.modules:
             if isinstance(module, Layer):
                 set_remaining_params(
-                    module, self.inputs_outputs, self.layer_of_output
+                    module, self.inputs_outputs, self.module_of_output
                 )
 
 
@@ -293,7 +295,7 @@ class ASTParser(ast.NodeVisitor):
         """
         This method: 
         - retrieves the input and output variables of modules 
-        and populates 'inputs_outputs' and 'layer_of_output' dictionaries.
+        and populates 'inputs_outputs' and 'module_of_output' dictionaries.
         - sets the activation function as attribute of its layer (for PyTorch).
         - adds permute_in attributes to cnn layers if they are preceeded by
         permute tensorop (the permute op is sometimes used before a cnn layer

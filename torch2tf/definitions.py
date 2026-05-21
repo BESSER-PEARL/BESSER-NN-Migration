@@ -23,6 +23,19 @@ actv_fun_mapping = {
     "Softmax": "softmax", "Tanh": "tanh"
 }
 
+functional_to_module_mapping = {
+    "relu": "ReLU", "leaky_relu": "LeakyReLU", "sigmoid": "Sigmoid",
+    "softmax": "Softmax", "tanh": "Tanh", "gelu": "GELU",
+    "adaptive_max_pool1d": "AdaptiveMaxPool1d",
+    "adaptive_avg_pool1d": "AdaptiveAvgPool1d",
+    "adaptive_max_pool2d": "AdaptiveMaxPool2d",
+    "adaptive_avg_pool2d": "AdaptiveAvgPool2d",
+    "adaptive_max_pool3d": "AdaptiveMaxPool3d",
+    "adaptive_avg_pool3d": "AdaptiveAvgPool3d",
+    "max_pool1d": "MaxPool1d", "max_pool2d": "MaxPool2d", "max_pool3d": "MaxPool3d",
+    "avg_pool1d": "AvgPool1d", "avg_pool2d": "AvgPool2d", "avg_pool3d": "AvgPool3d"
+}
+
 params_mapping = {
     "in_channels": "in_channels", "out_channels": "out_channels",
     "kernel_size": "kernel_dim", "stride": "stride_dim", 

@@ -4,6 +4,8 @@ Helper functions to transform PyTorch and TensorFlow nn code to BUML model.
 
 import argparse
 import ast
+import sys
+sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 from typing import TYPE_CHECKING
 
 from besser.BUML.metamodel.nn import Configuration, Dataset, Image
@@ -264,7 +266,7 @@ def set_static_params(lyr_type: str, lyr_params: dict,
 
 
 def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
-                         layer_of_output: dict):
+                         module_of_output: dict):
     """
     It sets the 'input_reused' and 'name_module_input' layer parameters.
 
@@ -272,7 +274,7 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
         lyr_obj (Layer): The buml layer object.
         inputs_outputs (dict): It stores input and output variables 
             of layers.
-        layer_of_output (dict): It stores name of layers given their
+        module_of_output (dict): It stores name of layers given their
             output var.
     
     Returns:
@@ -282,6 +284,6 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
     layer_name = lyr_obj.name
     if (not isinstance(inputs_outputs[layer_name][1], list) and
         inputs_outputs[layer_name][0] != inputs_outputs[layer_name][1]):
-        lyr_in_out = layer_of_output[inputs_outputs[layer_name][0]]
+        lyr_in_out = module_of_output[inputs_outputs[layer_name][0]]
         lyr_obj.input_reused = True
         lyr_obj.name_module_input = lyr_in_out
