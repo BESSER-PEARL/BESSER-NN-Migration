@@ -293,17 +293,41 @@ class ASTParserTorch(ASTParser):
         # Process subscript before processing the call
         if isinstance(node.value, ast.Call) and node.value.args:
             if isinstance(node.value.args[0], ast.Subscript):
-                # Subscript detected: process it first
+                # Check if this is an RNN subscript (e.g., h[-1], output[:, -1, :])
                 subscript_node = node.value.args[0]
+                subscripted_var = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else None
+
+                # Only process through handle_forward_slicing if it's from an RNN
+                is_rnn_subscript = False
+                if subscripted_var and subscripted_var in self.module_of_output:
+                    src_module = self.module_of_output[subscripted_var]
+                    src_layer = next((obj for obj in self.buml_model.layers if obj.name == src_module), None)
+                    if src_layer and hasattr(src_layer, 'return_type'):
+                        is_rnn_subscript = True
+                        print(f"[DEBUG] RNN subscript detected: {subscripted_var} from {src_module}")
+
+                # Process subscript (RNN or non-RNN)
                 temp_name = f"_subscript_temp_{self.tensor_op_counter}"
                 self.tensor_op_counter += 1
                 temp_target = ast.Name(id=temp_name, ctx=ast.Store())
 
-                # Create synthetic assignment for subscript
                 subscript_assign = ast.Assign(targets=[temp_target], value=subscript_node)
                 subscript_assign.lineno = node.lineno
                 subscript_assign.col_offset = node.col_offset
-                self.handle_forward_slicing(subscript_assign)
+
+                if is_rnn_subscript:
+                    # RNN slicing: process with handle_forward_slicing to set return_type
+                    print(f"[DEBUG] Processing RNN subscript: {subscripted_var}")
+                    self.handle_forward_slicing(subscript_assign)
+                else:
+                    # Non-RNN slicing: create slicing TensorOp
+                    print(f"[DEBUG] Processing non-RNN subscript as slicing op: {subscripted_var}")
+                    # Track which variable produced this sliced result
+                    if subscripted_var in self.module_of_output:
+                        self.module_of_output[temp_name] = self.module_of_output[subscripted_var]
+                    # For now, just track the temp variable - the actual slicing will be inline in TF
+                    # TODO: Create proper slicing TensorOp if needed for complex cases
+
                 self.previous_assign = subscript_assign
 
                 # Replace subscript with temp variable in call
@@ -465,6 +489,7 @@ class ASTParserTorch(ASTParser):
                 # 1. We're not in a nested call scenario (activation should be standalone)
                 # 2. The previous assign was a simple layer call
                 should_merge = not (hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer)
+                print(f"[DEBUG] Activation {module_name}: should_merge={should_merge}, is_nested={hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer}")
 
                 if should_merge and self.previous_assign and isinstance(self.previous_assign.value, ast.Call):
                     if (hasattr(self.previous_assign.value.func, 'attr')):
@@ -485,12 +510,22 @@ class ASTParserTorch(ASTParser):
 
                 # If not merging, create activation as a standalone GeneralLayer
                 if not should_merge:
+                    # Create unique name for standalone activation to avoid collisions
+                    unique_name = f"{module_name}_{self.tensor_op_counter}"
+                    self.tensor_op_counter += 1
+
                     actv = self.activation_functions[module_name]
                     actv_lyr = mm_classes.GeneralLayer(
-                        name=module_name,
+                        name=unique_name,
                         actv_func=actv_fun_mapping[actv]
                     )
                     self.buml_model.modules.append(actv_lyr)
+
+                    # Track inputs/outputs for standalone activation
+                    input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
+                    output_var = node.targets[0].id
+                    self.inputs_outputs[unique_name] = [input_var, output_var]
+                    self.module_of_output[output_var] = unique_name
 
             elif not is_subnn_obj:
                 self.is_permute_before_cnn(module_name)
@@ -854,6 +889,15 @@ class ASTParserTorch(ASTParser):
 
         if not lyr_obj:
             print(f"Warning: Layer '{prev_module_name}' not found for slicing operation")
+            self.previous_assign = node
+            return
+
+        # Only process return_type for RNN layers
+        if not hasattr(lyr_obj, 'return_type'):
+            # Not an RNN layer, just track the slicing operation
+            result_var = node.targets[0].id
+            self.module_of_output[result_var] = prev_module_name
+            self.variable_aliases[result_var] = subscripted_var
             self.previous_assign = node
             return
 
