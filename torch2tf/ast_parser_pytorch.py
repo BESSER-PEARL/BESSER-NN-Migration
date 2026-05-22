@@ -217,6 +217,26 @@ class ASTParserTorch(ASTParser):
                         self.is_processing_nested_outer = False
                 return
 
+        # Handle subscript arguments (e.g., self.fc(h[-1]))
+        # Process subscript before processing the call
+        if isinstance(node.value, ast.Call) and node.value.args:
+            if isinstance(node.value.args[0], ast.Subscript):
+                # Subscript detected: process it first
+                subscript_node = node.value.args[0]
+                temp_name = f"_subscript_temp_{self.tensor_op_counter}"
+                self.tensor_op_counter += 1
+                temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+
+                # Create synthetic assignment for subscript
+                subscript_assign = ast.Assign(targets=[temp_target], value=subscript_node)
+                subscript_assign.lineno = node.lineno
+                subscript_assign.col_offset = node.col_offset
+                self.handle_forward_slicing(subscript_assign)
+                self.previous_assign = subscript_assign
+
+                # Replace subscript with temp variable in call
+                node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+
         # Handle nested calls (F.relu(self.conv(x)))
         is_nested_call = False
         if isinstance(node.value, ast.Call) and node.value.args:
