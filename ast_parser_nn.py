@@ -181,7 +181,7 @@ class ASTParser(ast.NodeVisitor):
         It visits annotated assigments. Checks if the model is annotated.
 
         Parameters:
-            node (ast.AnnAssign): The AST node representing an annotated 
+            node (ast.AnnAssign): The AST node representing an annotated
                 assignment statement.
 
         Returns:
@@ -190,6 +190,31 @@ class ASTParser(ast.NodeVisitor):
         if self.input_nn_type == "sequential":
             self.handle_sequential_nn(node)
 
+
+    def visit_Return(self, node: ast.Return):
+        """
+        It visits return statements. If the return value is a module call,
+        it processes it as if it were an assignment.
+
+        Parameters:
+            node (ast.Return): The AST node representing a return statement.
+
+        Returns:
+            None, but processes the return value if it's a layer call.
+        """
+        # Only process if we're in a class (forward method) and input_nn_type is subclassing
+        if not self.in_class or self.input_nn_type != "subclassing":
+            return
+
+        # Check if return value is a Call (e.g., return self.fc(x))
+        if isinstance(node.value, ast.Call):
+            # Create a synthetic assignment node for processing
+            # This allows reusing the existing assignment processing logic
+            synthetic_assign = ast.Assign(
+                targets=[ast.Name(id='_return_output', ctx=ast.Store())],
+                value=node.value
+            )
+            self.visit_Assign(synthetic_assign)
 
 
     def handle_sequential_nn(self, node: ast.Assign):
@@ -276,6 +301,11 @@ class ASTParser(ast.NodeVisitor):
         elif (isinstance(node.targets[0], ast.Name) and
               isinstance(node.value, ast.Subscript)):
             self.handle_forward_slicing(node)
+
+        #Forward method, binary operations (add, subtract, etc.)
+        elif (isinstance(node.targets[0], ast.Name) and
+              isinstance(node.value, ast.BinOp)):
+            self.handle_forward_binop(node)
 
 
     @abstractmethod
@@ -421,10 +451,23 @@ class ASTParser(ast.NodeVisitor):
         return layer_type, params
 
     @abstractmethod
+    def handle_forward_binop(self, node: ast.Assign):
+        """
+        It handles binary operations such as 'x = a + b' or 'x = a.squeeze(1) + b'
+
+        Parameters:
+            node (ast.Assign): The AST node representing an assignment
+                statement.
+
+        Returns:
+            None, but populates the BUML model.
+        """
+
+    @abstractmethod
     def extract_tensorop(self, node: ast.Assign):
         """
         It extracts the tensorop name and its parameters.
-        
+
         Parameters:
             node (ast.Assign): The AST node representing an assignment
                 statement.

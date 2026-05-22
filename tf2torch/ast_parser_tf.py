@@ -86,6 +86,9 @@ class ASTParserTF(ASTParser):
         super().__init__(input_nn_type, only_nn)
 
         self.padding_amount: int | None = None
+        # Track RNN output vs hidden variables separately
+        self.rnn_output_vars = {}  # {module_name: output_var}
+        self.rnn_hidden_vars = {}  # {module_name: hidden_var}
 
     def handle_init(self, node: ast.Assign):
         """

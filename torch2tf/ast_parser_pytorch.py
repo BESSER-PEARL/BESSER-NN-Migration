@@ -38,6 +38,11 @@ class ASTParserTorch(ASTParser):
         super().__init__(input_nn_type, only_nn)
 
         self.activation_functions = {}
+        # Track RNN output vs hidden variables separately
+        self.rnn_output_vars = {}  # {module_name: output_var}
+        self.rnn_hidden_vars = {}  # {module_name: hidden_var}
+        # Track variable aliases (e.g., h_last -> h)
+        self.variable_aliases = {}  # {alias_var: source_var}
 
     def handle_init(self, node: ast.Assign):
         """
@@ -226,7 +231,8 @@ class ASTParserTorch(ASTParser):
                 inner_node = ast.Assign(targets=[temp_target], value=inner_call)
                 inner_node.lineno = node.lineno
                 inner_node.col_offset = node.col_offset
-                self.process_single_call(inner_node)
+                # Recursively call visit_Assign to handle multi-level nesting
+                self.visit_Assign(inner_node)
                 self.previous_assign = inner_node
 
                 # Replace inner call with temp variable in outer call
@@ -338,19 +344,56 @@ class ASTParserTorch(ASTParser):
         if caller_id == "self":
             # Populates inputs_outputs and layer_of_output from forward method
             module_name = node.value.func.attr
-            self.inputs_outputs[module_name] = [node.value.args[0].id,
-                                                node.targets[0].id]
+
+            # Extract input variable, handling inline operations like unsqueeze
+            input_arg = node.value.args[0]
+            if isinstance(input_arg, ast.Name):
+                # Simple variable: x
+                input_var = input_arg.id
+            elif isinstance(input_arg, ast.Call):
+                # Method call: x.unsqueeze(1) or x.squeeze(1)
+                # Create a synthetic intermediate operation
+                input_var = self.extract_inline_tensorop(input_arg, node)
+            else:
+                input_var = "x"  # Fallback
+
+            self.inputs_outputs[module_name] = [input_var, node.targets[0].id]
             self.module_of_output[node.targets[0].id] = module_name
 
             is_subnn_obj = next((obj for obj in self.buml_model.sub_nns if
                                  obj.name == module_name), None)
 
             if module_name in self.activation_functions:
-                prev_lyr_name = self.previous_assign.value.func.attr
-                prev_lyr_obj = next((obj for obj in self.buml_model.modules if
-                                     obj.name == prev_lyr_name), None)
-                actv = self.activation_functions[module_name]
-                prev_lyr_obj.actv_func = actv_fun_mapping[actv]
+                # Only merge activation into previous layer if:
+                # 1. We're not in a nested call scenario (activation should be standalone)
+                # 2. The previous assign was a simple layer call
+                should_merge = not (hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer)
+
+                if should_merge and self.previous_assign and isinstance(self.previous_assign.value, ast.Call):
+                    if (hasattr(self.previous_assign.value.func, 'attr')):
+                        prev_lyr_name = self.previous_assign.value.func.attr
+                        prev_lyr_obj = next((obj for obj in self.buml_model.modules if
+                                             obj.name == prev_lyr_name), None)
+                        if prev_lyr_obj:
+                            actv = self.activation_functions[module_name]
+                            prev_lyr_obj.actv_func = actv_fun_mapping[actv]
+                            # Skip adding activation as separate layer
+                            should_merge = True
+                        else:
+                            should_merge = False
+                    else:
+                        should_merge = False
+                else:
+                    should_merge = False
+
+                # If not merging, create activation as a standalone GeneralLayer
+                if not should_merge:
+                    actv = self.activation_functions[module_name]
+                    actv_lyr = mm_classes.GeneralLayer(
+                        name=module_name,
+                        actv_func=actv_fun_mapping[actv]
+                    )
+                    self.buml_model.modules.append(actv_lyr)
 
             elif not is_subnn_obj:
                 self.is_permute_before_cnn(module_name)
@@ -371,33 +414,59 @@ class ASTParserTorch(ASTParser):
 
     def handle_forward_tuple_assignment(self, node: ast.Assign):
         """
-        It handles rnn tuple assignments such as 
-        'x, _ = self.l4(x)'
-        
+        It handles rnn tuple assignments such as
+        'x, _ = self.l4(x)' or 'out, hidden = self.rnn(x)'
+
         Parameters:
             node (ast.Assign): The AST node representing an assignment
                 statement.
 
         Returns:
-            None, but populates the BUML model. 
+            None, but populates the BUML model.
         """
         module_name = node.value.func.attr
+
+        # Track both variables (output and hidden) for later slicing operations
+        var1 = node.targets[0].elts[0].id if not isinstance(node.targets[0].elts[0], ast.Tuple) else None
+        var2 = node.targets[0].elts[1].id if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0].id
+
+        # For RNNs: var1 is typically output sequence, var2 is hidden state
+        # Track which variable is which for this RNN module
+        if var1 and var1 != "_":
+            self.rnn_output_vars[module_name] = var1
+            self.module_of_output[var1] = module_name
+        if var2 and var2 != "_":
+            self.rnn_hidden_vars[module_name] = var2
+            self.module_of_output[var2] = module_name
+
+        # Determine which is the main output for inputs_outputs tracking
         if node.targets[0].elts[0].id == "_":
             if isinstance(node.targets[0].elts[1], ast.Tuple):
                 rnn_out = node.targets[0].elts[1].elts[0].id
-
             else:
                 rnn_out = node.targets[0].elts[1].id
         else:
             rnn_out = node.targets[0].elts[0].id
             lyr_obj = next((obj for obj in self.buml_model.layers if
                             obj.name == module_name), None)
-            lyr_obj.return_type = "full"
+            if lyr_obj:
+                lyr_obj.return_type = "full"
 
+        # Extract input variable - handle both simple variables and method calls
+        input_arg = node.value.args[0]
+        if isinstance(input_arg, ast.Name):
+            # Simple variable: x
+            rnn_in = input_arg.id
+        elif isinstance(input_arg, ast.Call):
+            # Method call: x.unsqueeze(1) or x.squeeze(1)
+            # Create a synthetic intermediate operation
+            rnn_in = self.extract_inline_tensorop(input_arg, node)
+        else:
+            # Fallback
+            rnn_in = "x"
 
-        rnn_in = node.value.args[0].id
         self.inputs_outputs[module_name] = [rnn_in, rnn_out]
-        self.module_of_output[rnn_out] = module_name
+
         module_obj = next((obj for obj in self.buml_model.layers if
                            obj.name == module_name), None)
         if not module_obj:
@@ -406,29 +475,157 @@ class ASTParserTorch(ASTParser):
         self.buml_model.modules.append(module_obj)
         self.previous_assign = node
 
-    def handle_forward_slicing(self, node: ast.Assign):
+    def handle_forward_binop(self, node: ast.Assign):
         """
-        It handles rnn slicing calls such as 'x = x[:, -1, :]
+        It handles binary operations such as 'x = a + b' or 'x = a.squeeze(1) + b'
+        Extracts any inline tensor operations (like squeeze) and creates a TensorOp for the binop.
 
         Parameters:
             node (ast.Assign): The AST node representing an assignment
                 statement.
 
         Returns:
-            None, but populates the BUML model. 
+            None, but populates the BUML model.
         """
+        binop = node.value
 
-        prev_module_name = self.previous_assign.value.func.attr
+        # Extract left operand variable
+        if isinstance(binop.left, ast.Name):
+            left_var = binop.left.id
+        elif isinstance(binop.left, ast.Call):
+            # Extract inline operation like x.squeeze(1)
+            left_var = self.extract_inline_tensorop(binop.left, node)
+        else:
+            print(f"Warning: Unsupported left operand type in BinOp")
+            return
+
+        # Extract right operand variable
+        if isinstance(binop.right, ast.Name):
+            right_var = binop.right.id
+        elif isinstance(binop.right, ast.Call):
+            # Extract inline operation
+            right_var = self.extract_inline_tensorop(binop.right, node)
+        else:
+            print(f"Warning: Unsupported right operand type in BinOp")
+            return
+
+        # Determine the operation type
+        op_map = {
+            'Add': 'binop_add',
+            'Sub': 'binop_subtract',
+            'Mult': 'binop_multiply',
+            'Div': 'binop_divide'
+        }
+        op_type_name = binop.op.__class__.__name__
+        tns_type = op_map.get(op_type_name)
+
+        if tns_type is None:
+            print(f"Warning: Unsupported binary operation: {op_type_name}")
+            return
+
+        # Get the layer/module names that produced these variables
+        left_layer = self.module_of_output.get(left_var)
+        right_layer = self.module_of_output.get(right_var)
+
+        if left_layer is None or right_layer is None:
+            print(f"Warning: Cannot determine source layers for BinOp operands")
+            return
+
+        # Determine if variables are output or hidden for RNNs with return_type="both"
+        # Resolve aliases first
+        actual_left_var = self.variable_aliases.get(left_var, left_var)
+        actual_right_var = self.variable_aliases.get(right_var, right_var)
+
+        var_types = []
+        for lyr_name, actual_var in zip([left_layer, right_layer], [actual_left_var, actual_right_var]):
+            if lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
+                var_types.append("hidden")
+            elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
+                var_types.append("output")
+            else:
+                var_types.append("output")  # Default
+
+        # Create TensorOp for the binary operation
+        tensorop_param = {
+            "tns_type": tns_type,
+            "layers_of_tensors": [left_layer, right_layer],
+            "actual_vars": var_types,  # Track which component (output/hidden) each refers to
+            "name": f"op_{self.tensor_op_counter}"
+        }
+
+        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        self.buml_model.add_tensor_op(tns_obj)
+        self.buml_model.modules.append(tns_obj)
+        self.tensor_op_counter += 1
+
+        # Track the output variable
+        output_var = node.targets[0].id
+        self.module_of_output[output_var] = tensorop_param["name"]
+
+    def handle_forward_slicing(self, node: ast.Assign):
+        """
+        It handles rnn slicing calls such as 'x = x[:, -1, :]' or 'h = h[-1]'
+
+        Parameters:
+            node (ast.Assign): The AST node representing an assignment
+                statement.
+
+        Returns:
+            None, but populates the BUML model.
+        """
+        # Get the variable being subscripted (e.g., 'h1' from 'h1[-1]')
+        subscripted_var = node.value.value.id
+
+        # Look up which RNN module produced this variable
+        if subscripted_var in self.module_of_output:
+            prev_module_name = self.module_of_output[subscripted_var]
+        else:
+            # Fallback: assume previous_assign was the RNN call
+            if hasattr(self.previous_assign.value, 'func') and hasattr(self.previous_assign.value.func, 'attr'):
+                prev_module_name = self.previous_assign.value.func.attr
+            else:
+                print(f"Warning: Cannot determine RNN module for subscript on '{subscripted_var}'")
+                self.previous_assign = node
+                return
+
         lyr_obj = next((obj for obj in self.buml_model.layers if
                         obj.name == prev_module_name), None)
 
-        if isinstance(node.value.slice, ast.UnaryOp):
-            lyr_obj.return_type = "hidden"
+        if not lyr_obj:
+            print(f"Warning: Layer '{prev_module_name}' not found for slicing operation")
+            self.previous_assign = node
+            return
 
-        elif len(node.value.slice.elts) == 3:
-            lyr_obj.return_type = "last"
+        # Determine the return type based on slicing pattern
+        if isinstance(node.value.slice, ast.UnaryOp):
+            # Pattern: h[-1] means extracting last layer's hidden state
+            # Check if BOTH output and hidden were captured (not underscore)
+            has_output = prev_module_name in self.rnn_output_vars
+            has_hidden = prev_module_name in self.rnn_hidden_vars
+
+            if has_output and has_hidden:
+                # Both output and hidden were captured - need "both"
+                lyr_obj.return_type = "both"
+            else:
+                # Only hidden was captured
+                lyr_obj.return_type = "hidden"
+        elif isinstance(node.value.slice, ast.Tuple) and len(node.value.slice.elts) == 3:
+            # Pattern: out[:, -1, :] means extracting last timestep
+            # Don't overwrite "both" if it was already set from a previous slicing operation
+            if lyr_obj.return_type != "both":
+                lyr_obj.return_type = "last"
         else:
-            print("ast.Subscript is not recognised!")
+            print(f"Warning: Unrecognized subscript pattern on '{subscripted_var}'")
+
+        # Track the result variable so it can be used in subsequent operations (e.g., concat)
+        result_var = node.targets[0].id
+        self.module_of_output[result_var] = prev_module_name
+
+        # IMPORTANT: Track which actual variable this sliced result came from
+        # This is crucial for correct concat operations
+        # e.g., h1_last = h1[-1] means h1_last is an alias for h1
+        self.variable_aliases[result_var] = subscripted_var
+
         self.previous_assign = node
 
 
@@ -512,6 +709,69 @@ class ASTParserTorch(ASTParser):
                         self.buml_model.modules.pop()
 
 
+    def extract_inline_tensorop(self, call_node: ast.Call, parent_node: ast.Assign):
+        """
+        Extracts inline tensor operations like x.unsqueeze(1) or x.squeeze(1)
+        and creates a synthetic intermediate operation.
+
+        Parameters:
+            call_node (ast.Call): The inline method call node
+            parent_node (ast.Assign): The parent assignment node
+
+        Returns:
+            str: The name of the intermediate variable created
+        """
+        # Check if it's a method call on a variable
+        if not (isinstance(call_node.func, ast.Attribute) and
+                isinstance(call_node.func.value, ast.Name)):
+            # Not a simple method call, return the variable name if possible
+            if hasattr(call_node.func, 'value') and hasattr(call_node.func.value, 'id'):
+                return call_node.func.value.id
+            return "x"
+
+        base_var = call_node.func.value.id
+        op_type = call_node.func.attr
+
+        # Only handle squeeze/unsqueeze for now
+        if op_type not in ['squeeze', 'unsqueeze']:
+            return base_var
+
+        # Create intermediate variable name
+        intermediate_var = f"_inline_{op_type}_{self.tensor_op_counter}"
+
+        # Extract dimension parameter
+        dim_value = None
+        if len(call_node.args) > 0:
+            dim_value = self.param_value(call_node.args[0])
+        else:
+            for kw in call_node.keywords:
+                if kw.arg == "dim":
+                    dim_value = self.param_value(kw.value)
+
+        # Get the layer/module that produced the base variable
+        base_layer = self.module_of_output.get(base_var)
+        if base_layer is None:
+            # If not tracked, just return the base variable
+            return base_var
+
+        # Create tensor operation with layers_of_tensors to track the source
+        tensorop_param = {
+            "tns_type": op_type,
+            "reduce_dim": dim_value,
+            "layers_of_tensors": [base_layer],  # Track which layer this operates on
+            "name": f"op_{self.tensor_op_counter}"
+        }
+
+        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        self.buml_model.add_tensor_op(tns_obj)
+        self.buml_model.modules.append(tns_obj)
+        self.tensor_op_counter += 1
+
+        # Track the intermediate variable
+        self.module_of_output[intermediate_var] = tensorop_param["name"]
+
+        return intermediate_var
+
     def extract_tensorop(self, node: ast.Assign):
         """
         It extracts the tensorop name and its parameters.
@@ -543,6 +803,39 @@ class ASTParserTorch(ASTParser):
             reshape_dim = [op_args[0].value, op_args[1].value]
             tensorop_param = {"tns_type": op_type,
                               "reshape_dim": reshape_dim}
+        elif op_type == "mean":
+            # Extract the dim parameter from keywords
+            reduce_dim = None
+            for kw in node.value.keywords:
+                if kw.arg == "dim":
+                    reduce_dim = self.param_value(kw.value)
+            if reduce_dim is None:
+                print(f"Warning: mean operation without dim parameter - not supported")
+                return
+            tensorop_param = {"tns_type": "mean",
+                              "reduce_dim": reduce_dim}
+        elif op_type == "squeeze":
+            # Extract the dim parameter - can be positional arg or keyword
+            squeeze_dim = None
+            if len(op_args) > 0:
+                squeeze_dim = self.param_value(op_args[0])
+            else:
+                for kw in node.value.keywords:
+                    if kw.arg == "dim":
+                        squeeze_dim = self.param_value(kw.value)
+            tensorop_param = {"tns_type": "squeeze",
+                              "reduce_dim": squeeze_dim}
+        elif op_type == "unsqueeze":
+            # Extract the dim parameter - can be positional arg or keyword
+            unsqueeze_dim = None
+            if len(op_args) > 0:
+                unsqueeze_dim = self.param_value(op_args[0])
+            else:
+                for kw in node.value.keywords:
+                    if kw.arg == "dim":
+                        unsqueeze_dim = self.param_value(kw.value)
+            tensorop_param = {"tns_type": "unsqueeze",
+                              "reduce_dim": unsqueeze_dim}
         else:
             print(f"{op_type} is not recognized!")
             return
@@ -579,13 +872,47 @@ class ASTParserTorch(ASTParser):
                             obj.name == prev_lyr_name), None)
             lyr_obj.return_type =  "hidden"
         else:
-            layers_of_tensors = [self.module_of_output[ops_args[0].id],
-                                 self.module_of_output[ops_args[1].id]]
+            # Extract variable names - handle both simple names and method calls
+            def extract_var_name_and_create_op(arg):
+                if isinstance(arg, ast.Name):
+                    return arg.id
+                elif isinstance(arg, ast.Call):
+                    # Method call like x.squeeze(1) - create the operation and return result var
+                    return self.extract_inline_tensorop(arg, node)
+                else:
+                    return None
+
+            var1 = extract_var_name_and_create_op(ops_args[0])
+            var2 = extract_var_name_and_create_op(ops_args[1])
+
+            if var1 is None or var2 is None:
+                # Can't extract variable names - skip this concat
+                print(f"Warning: Cannot extract variables from concat operation")
+                return None
+
+            # Resolve aliases
+            actual_var1 = self.variable_aliases.get(var1, var1)
+            actual_var2 = self.variable_aliases.get(var2, var2)
+
+            layers_of_tensors = [self.module_of_output[actual_var1],
+                                 self.module_of_output[actual_var2]]
             cat_dim = self.param_value(node.value.keywords[0].value)
+
+            # Determine if each variable is output or hidden for RNNs with return_type="both"
+            var_types = []
+            for lyr_name, actual_var in zip(layers_of_tensors, [actual_var1, actual_var2]):
+                if lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
+                    var_types.append("hidden")
+                elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
+                    var_types.append("output")
+                else:
+                    var_types.append("output")  # Default
 
             tensorop_param = {"tns_type": "concatenate",
                               "layers_of_tensors": layers_of_tensors,
-                              "concatenate_dim": cat_dim}
+                              "concatenate_dim": cat_dim,
+                              # Store which component (output/hidden) each refers to
+                              "actual_vars": var_types}
 
         return tensorop_param
 
