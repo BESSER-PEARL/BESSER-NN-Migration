@@ -214,6 +214,9 @@ class ASTParser(ast.NodeVisitor):
                 targets=[ast.Name(id='_return_output', ctx=ast.Store())],
                 value=node.value
             )
+            # Copy location info from original node
+            synthetic_assign.lineno = node.lineno
+            synthetic_assign.col_offset = node.col_offset
             self.visit_Assign(synthetic_assign)
 
 

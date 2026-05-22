@@ -38,17 +38,17 @@ functional_to_module_mapping = {
 
 params_mapping = {
     "in_channels": "in_channels", "out_channels": "out_channels",
-    "kernel_size": "kernel_dim", "stride": "stride_dim", 
-    "padding": "padding_amount", "output_size": "output_dim", 
-    "input_size": "input_size", "hidden_size": "hidden_size", 
-    "bidirectional": "bidirectional", "dropout": "dropout", 
-    "batch_first": "batch_first", "normalized_shape": "normalized_shape", 
-    "p": "rate", "num_features": "num_features", 
-    "num_embeddings": "num_embeddings", "embedding_dim": "embedding_dim", 
-    "start_dim": "start_dim", "end_dim": "end_dim", 
+    "kernel_size": "kernel_dim", "stride": "stride_dim",
+    "padding": "padding_amount", "output_size": "output_dim",
+    "input_size": "input_size", "hidden_size": "hidden_size",
+    "bidirectional": "bidirectional", "dropout": "dropout",
+    "batch_first": "batch_first", "normalized_shape": "normalized_shape",
+    "p": "rate", "num_features": "num_features",
+    "num_embeddings": "num_embeddings", "embedding_dim": "embedding_dim",
+    "start_dim": "start_dim", "end_dim": "end_dim",
     "in_features": "in_features", "out_features": "out_features",
     "return_type": "return_type", "permute_in": "permute_in",
-    "permute_out": "permute_out"
+    "permute_out": "permute_out", "nonlinearity": "actv_func"
 }
 
 static_params = {
