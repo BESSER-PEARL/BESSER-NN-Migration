@@ -104,7 +104,32 @@ class ASTParserTorch(ASTParser):
                 lyr_type, lyr_params = self.extract_layer(elt)
 
                 if lyr_type in actv_fun_mapping:
-                    subnn.layers[-1].actv_func = actv_fun_mapping[lyr_type]
+                    # Check if previous layer supports activation functions
+                    # Using same logic as generator's add_separate_activation_if_needed
+                    prev_layer_supports_activ = False
+                    if subnn.layers:
+                        prev_layer = subnn.layers[-1]
+                        prev_layer_class = prev_layer.__class__.__name__
+                        prev_layer_parent = prev_layer.__class__.mro()[1].__name__
+
+                        # Layers that DON'T support activation (same as generator logic)
+                        unsupported = prev_layer_parent in ["NormalizationLayer", "LayerModifier"] or \
+                                     prev_layer_class in ["EmbeddingLayer", "PoolingLayer", "FlattenLayer"]
+
+                        prev_layer_supports_activ = not unsupported
+
+                    if prev_layer_supports_activ:
+                        # Merge with previous layer as activation attribute
+                        subnn.layers[-1].actv_func = actv_fun_mapping[lyr_type]
+                    else:
+                        # Create standalone activation layer
+                        actv_params = {
+                            "name": f"layer_{layer_id}",
+                            "actv_func": actv_fun_mapping[lyr_type]
+                        }
+                        subnn_layer = getattr(mm_classes, "GeneralLayer")(**actv_params)
+                        subnn.add_layer(subnn_layer)
+                        layer_id += 1
                 elif lyr_type == "Permute":
                     last_lyr = subnn.layers[-1] if subnn.layers else None
 
