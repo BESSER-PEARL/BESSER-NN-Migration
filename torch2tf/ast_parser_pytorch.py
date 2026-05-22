@@ -545,6 +545,16 @@ class ASTParserTorch(ASTParser):
         elif isinstance(binop.left, (ast.Constant, ast.Num)):
             # Handle constant operand
             left_var = binop.left.value if isinstance(binop.left, ast.Constant) else binop.left.n
+        elif isinstance(binop.left, ast.BinOp):
+            # Handle nested binop like (x1 + x2) + x3
+            temp_name = f"_binop_temp_{self.tensor_op_counter}"
+            self.tensor_op_counter += 1
+            temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+            binop_assign = ast.Assign(targets=[temp_target], value=binop.left)
+            binop_assign.lineno = node.lineno
+            binop_assign.col_offset = node.col_offset
+            self.handle_forward_binop(binop_assign)
+            left_var = temp_name
         else:
             print(f"Warning: Unsupported left operand type in BinOp: {type(binop.left).__name__}")
             return
@@ -568,6 +578,16 @@ class ASTParserTorch(ASTParser):
         elif isinstance(binop.right, (ast.Constant, ast.Num)):
             # Handle constant operand
             right_var = binop.right.value if isinstance(binop.right, ast.Constant) else binop.right.n
+        elif isinstance(binop.right, ast.BinOp):
+            # Handle nested binop like x1 + (x2 + x3)
+            temp_name = f"_binop_temp_{self.tensor_op_counter}"
+            self.tensor_op_counter += 1
+            temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+            binop_assign = ast.Assign(targets=[temp_target], value=binop.right)
+            binop_assign.lineno = node.lineno
+            binop_assign.col_offset = node.col_offset
+            self.handle_forward_binop(binop_assign)
+            right_var = temp_name
         else:
             print(f"Warning: Unsupported right operand type in BinOp: {type(binop.right).__name__}")
             return
