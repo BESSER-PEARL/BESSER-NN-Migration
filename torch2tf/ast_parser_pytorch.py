@@ -461,11 +461,18 @@ class ASTParserTorch(ASTParser):
 
         # Determine which is the main output for inputs_outputs tracking
         if node.targets[0].elts[0].id == "_":
+            # First element is discarded - we're only using hidden state
             if isinstance(node.targets[0].elts[1], ast.Tuple):
                 rnn_out = node.targets[0].elts[1].elts[0].id
             else:
                 rnn_out = node.targets[0].elts[1].id
+            # Set return_type to "hidden" since output sequence is discarded
+            lyr_obj = next((obj for obj in self.buml_model.layers if
+                            obj.name == module_name), None)
+            if lyr_obj:
+                lyr_obj.return_type = "hidden"
         else:
+            # First element is used - we're using output sequence
             rnn_out = node.targets[0].elts[0].id
             lyr_obj = next((obj for obj in self.buml_model.layers if
                             obj.name == module_name), None)
