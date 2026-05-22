@@ -460,24 +460,34 @@ class ASTParserTorch(ASTParser):
             self.module_of_output[var2] = module_name
 
         # Determine which is the main output for inputs_outputs tracking
-        if node.targets[0].elts[0].id == "_":
-            # First element is discarded - we're only using hidden state
+        # Determine return_type based on which elements are used
+        first_elem = node.targets[0].elts[0]
+        second_elem = node.targets[0].elts[1] if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0]
+
+        first_is_underscore = isinstance(first_elem, ast.Name) and first_elem.id == "_"
+        second_is_underscore = isinstance(second_elem, ast.Name) and second_elem.id == "_"
+
+        lyr_obj = next((obj for obj in self.buml_model.layers if
+                        obj.name == module_name), None)
+
+        if first_is_underscore and not second_is_underscore:
+            # Only hidden state is used: _, h = rnn(x)
             if isinstance(node.targets[0].elts[1], ast.Tuple):
                 rnn_out = node.targets[0].elts[1].elts[0].id
             else:
                 rnn_out = node.targets[0].elts[1].id
-            # Set return_type to "hidden" since output sequence is discarded
-            lyr_obj = next((obj for obj in self.buml_model.layers if
-                            obj.name == module_name), None)
             if lyr_obj:
                 lyr_obj.return_type = "hidden"
-        else:
-            # First element is used - we're using output sequence
+        elif not first_is_underscore and second_is_underscore:
+            # Only output sequence is used: out, _ = rnn(x)
             rnn_out = node.targets[0].elts[0].id
-            lyr_obj = next((obj for obj in self.buml_model.layers if
-                            obj.name == module_name), None)
             if lyr_obj:
                 lyr_obj.return_type = "full"
+        else:
+            # Both are used: out, h = rnn(x)
+            rnn_out = node.targets[0].elts[0].id
+            if lyr_obj:
+                lyr_obj.return_type = "both"
 
         # Extract input variable - handle both simple variables and method calls
         input_arg = node.value.args[0]
@@ -522,8 +532,21 @@ class ASTParserTorch(ASTParser):
         elif isinstance(binop.left, ast.Call):
             # Extract inline operation like x.squeeze(1)
             left_var = self.extract_inline_tensorop(binop.left, node)
+        elif isinstance(binop.left, ast.Subscript):
+            # Handle subscript like out[:, -1, :]
+            temp_name = f"_subscript_temp_{self.tensor_op_counter}"
+            self.tensor_op_counter += 1
+            temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+            subscript_assign = ast.Assign(targets=[temp_target], value=binop.left)
+            subscript_assign.lineno = node.lineno
+            subscript_assign.col_offset = node.col_offset
+            self.handle_forward_slicing(subscript_assign)
+            left_var = temp_name
+        elif isinstance(binop.left, (ast.Constant, ast.Num)):
+            # Handle constant operand
+            left_var = binop.left.value if isinstance(binop.left, ast.Constant) else binop.left.n
         else:
-            print(f"Warning: Unsupported left operand type in BinOp")
+            print(f"Warning: Unsupported left operand type in BinOp: {type(binop.left).__name__}")
             return
 
         # Extract right operand variable
@@ -532,8 +555,21 @@ class ASTParserTorch(ASTParser):
         elif isinstance(binop.right, ast.Call):
             # Extract inline operation
             right_var = self.extract_inline_tensorop(binop.right, node)
+        elif isinstance(binop.right, ast.Subscript):
+            # Handle subscript like out[:, -1, :]
+            temp_name = f"_subscript_temp_{self.tensor_op_counter}"
+            self.tensor_op_counter += 1
+            temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+            subscript_assign = ast.Assign(targets=[temp_target], value=binop.right)
+            subscript_assign.lineno = node.lineno
+            subscript_assign.col_offset = node.col_offset
+            self.handle_forward_slicing(subscript_assign)
+            right_var = temp_name
+        elif isinstance(binop.right, (ast.Constant, ast.Num)):
+            # Handle constant operand
+            right_var = binop.right.value if isinstance(binop.right, ast.Constant) else binop.right.n
         else:
-            print(f"Warning: Unsupported right operand type in BinOp")
+            print(f"Warning: Unsupported right operand type in BinOp: {type(binop.right).__name__}")
             return
 
         # Determine the operation type
@@ -551,8 +587,9 @@ class ASTParserTorch(ASTParser):
             return
 
         # Get the layer/module names that produced these variables
-        left_layer = self.module_of_output.get(left_var)
-        right_layer = self.module_of_output.get(right_var)
+        # For constants (float/int), we use the value directly instead of a layer name
+        left_layer = left_var if isinstance(left_var, (int, float)) else self.module_of_output.get(left_var)
+        right_layer = right_var if isinstance(right_var, (int, float)) else self.module_of_output.get(right_var)
 
         if left_layer is None or right_layer is None:
             print(f"Warning: Cannot determine source layers for BinOp operands")
@@ -560,12 +597,15 @@ class ASTParserTorch(ASTParser):
 
         # Determine if variables are output or hidden for RNNs with return_type="both"
         # Resolve aliases first
-        actual_left_var = self.variable_aliases.get(left_var, left_var)
-        actual_right_var = self.variable_aliases.get(right_var, right_var)
+        actual_left_var = self.variable_aliases.get(left_var, left_var) if isinstance(left_var, str) else left_var
+        actual_right_var = self.variable_aliases.get(right_var, right_var) if isinstance(right_var, str) else right_var
 
         var_types = []
         for lyr_name, actual_var in zip([left_layer, right_layer], [actual_left_var, actual_right_var]):
-            if lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
+            # Skip type checking for constant values
+            if isinstance(lyr_name, (int, float)):
+                var_types.append("output")  # Constants don't have type, use default
+            elif lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
                 var_types.append("hidden")
             elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
                 var_types.append("output")
@@ -748,16 +788,24 @@ class ASTParserTorch(ASTParser):
         Returns:
             str: The name of the intermediate variable created
         """
-        # Check if it's a method call on a variable
-        if not (isinstance(call_node.func, ast.Attribute) and
-                isinstance(call_node.func.value, ast.Name)):
-            # Not a simple method call, return the variable name if possible
+        # Check if it's a method call
+        if not isinstance(call_node.func, ast.Attribute):
+            return "x"
+
+        op_type = call_node.func.attr
+
+        # Check if it's a method call on a variable or on another call (chained)
+        if isinstance(call_node.func.value, ast.Name):
+            base_var = call_node.func.value.id
+        elif isinstance(call_node.func.value, ast.Call):
+            # Chained call like h.unsqueeze(1).squeeze(1)
+            # Recursively process the inner call first
+            base_var = self.extract_inline_tensorop(call_node.func.value, parent_node)
+        else:
+            # Not a simple method call, return default
             if hasattr(call_node.func, 'value') and hasattr(call_node.func.value, 'id'):
                 return call_node.func.value.id
             return "x"
-
-        base_var = call_node.func.value.id
-        op_type = call_node.func.attr
 
         # Only handle squeeze/unsqueeze for now
         if op_type not in ['squeeze', 'unsqueeze']:
