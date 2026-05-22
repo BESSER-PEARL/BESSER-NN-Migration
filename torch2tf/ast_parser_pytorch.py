@@ -75,6 +75,9 @@ class ASTParserTorch(ASTParser):
                     is_rnn = lyr_type in ['RNN', 'LSTM', 'GRU']
 
                     if is_rnn and num_layers > 1:
+                        # Process positional params first so we can access named params
+                        process_positional_params(lyr_type, lyr_params, pos_params)
+
                         # Create multiple BUML layers for stacked RNN
                         layer_names = []
                         original_return_type = lyr_params.get('return_type', 'full')
@@ -98,11 +101,13 @@ class ASTParserTorch(ASTParser):
                             else:
                                 layer_params['return_type'] = original_return_type
 
+                            # Add empty positional_params for transform_layer
+                            layer_params['positional_params'] = []
+
                             # Transform and create BUML layer
                             buml_lyr_type, buml_params = transform_layer(
                                 lyr_type, layer_params, layer_params['name']
                             )
-                            print("nadia lyr_params", buml_params)
                             buml_layer = getattr(mm_classes, buml_lyr_type)(**buml_params)
                             self.buml_model.add_layer(buml_layer)
 
@@ -114,7 +119,6 @@ class ASTParserTorch(ASTParser):
                         lyr_type, lyr_params = transform_layer(
                             lyr_type, lyr_params, module_name
                         )
-                        print("nadia lyr_params", lyr_params)
                         buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
                         self.buml_model.add_layer(buml_layer)
                 else:
