@@ -43,6 +43,8 @@ class ASTParserTorch(ASTParser):
         self.rnn_hidden_vars = {}  # {module_name: hidden_var}
         # Track variable aliases (e.g., h_last -> h)
         self.variable_aliases = {}  # {alias_var: source_var}
+        # Track multi-layer RNNs: {module_name: [layer_name_0, layer_name_1, ...]}
+        self.multi_layer_rnns = {}
 
     def handle_init(self, node: ast.Assign):
         """
@@ -68,12 +70,53 @@ class ASTParserTorch(ASTParser):
             else:
                 lyr_type, lyr_params = self.extract_layer(node.value)
                 if lyr_type not in actv_fun_mapping:
-                    lyr_type, lyr_params = transform_layer(
-                        lyr_type, lyr_params, module_name
-                    )
-                    print("nadia lyr_params", lyr_params)
-                    buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-                    self.buml_model.add_layer(buml_layer)
+                    # Check if this is a multi-layer RNN (num_layers > 1)
+                    num_layers = lyr_params.get('num_layers', 1)
+                    is_rnn = lyr_type in ['RNN', 'LSTM', 'GRU']
+
+                    if is_rnn and num_layers > 1:
+                        # Create multiple BUML layers for stacked RNN
+                        layer_names = []
+                        original_return_type = lyr_params.get('return_type', 'full')
+
+                        for i in range(num_layers):
+                            layer_params = lyr_params.copy()
+                            # Remove num_layers from params as BUML doesn't support it
+                            layer_params.pop('num_layers', None)
+
+                            # Update layer name
+                            layer_params['name'] = f"{module_name}_layer_{i}"
+                            layer_names.append(layer_params['name'])
+
+                            # First layer keeps input_size, others use hidden_size as input
+                            if i > 0:
+                                layer_params['input_size'] = lyr_params['hidden_size']
+
+                            # All layers except last must return full sequence
+                            if i < num_layers - 1:
+                                layer_params['return_type'] = 'full'
+                            else:
+                                layer_params['return_type'] = original_return_type
+
+                            # Transform and create BUML layer
+                            buml_lyr_type, buml_params = transform_layer(
+                                lyr_type, layer_params, layer_params['name']
+                            )
+                            print("nadia lyr_params", buml_params)
+                            buml_layer = getattr(mm_classes, buml_lyr_type)(**buml_params)
+                            self.buml_model.add_layer(buml_layer)
+
+                        # Track this multi-layer RNN
+                        self.multi_layer_rnns[module_name] = layer_names
+                    else:
+                        # Single layer - remove num_layers if present
+                        lyr_params.pop('num_layers', None)
+                        lyr_type, lyr_params = transform_layer(
+                            lyr_type, lyr_params, module_name
+                        )
+                        print("nadia lyr_params", lyr_params)
+                        buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+                        self.buml_model.add_layer(buml_layer)
                 else:
                     self.activation_functions[module_name] = lyr_type
 
@@ -390,6 +433,11 @@ class ASTParserTorch(ASTParser):
             # Populates inputs_outputs and layer_of_output from forward method
             module_name = node.value.func.attr
 
+            # Check if this is a multi-layer RNN that needs to be expanded
+            if module_name in self.multi_layer_rnns:
+                self.expand_multi_layer_rnn_call(node, module_name, is_tuple=False)
+                return
+
             # Extract input variable, handling inline operations like unsqueeze
             input_arg = node.value.args[0]
             if isinstance(input_arg, ast.Name):
@@ -457,6 +505,98 @@ class ASTParserTorch(ASTParser):
             #tensorops
             self.extract_tensorop(node)
 
+    def expand_multi_layer_rnn_call(self, node: ast.Assign, module_name: str, is_tuple: bool):
+        """
+        Expand a multi-layer RNN call into sequential calls to individual layers.
+
+        For example, if self.gru has num_layers=3:
+        - out, h = self.gru(x) becomes:
+          - temp_0 = self.gru_layer_0(x)
+          - temp_1 = self.gru_layer_1(temp_0)
+          - out, h = self.gru_layer_2(temp_1)
+        """
+        layer_names = self.multi_layer_rnns[module_name]
+
+        # Get the input variable from the original call
+        input_arg = node.value.args[0]
+        if isinstance(input_arg, ast.Name):
+            current_input = input_arg.id
+        elif isinstance(input_arg, ast.Call):
+            current_input = self.extract_inline_tensorop(input_arg, node)
+        else:
+            current_input = "x"
+
+        # Process each layer in the stack
+        for i, layer_name in enumerate(layer_names):
+            is_last_layer = (i == len(layer_names) - 1)
+
+            if is_last_layer:
+                # Last layer - modify the original node and let the normal processing handle it
+                node.value.func.attr = layer_name
+                if i > 0:
+                    # Update input to use temp var from previous layer
+                    node.value.args[0] = ast.Name(id=current_input, ctx=ast.Load())
+
+                # Now process this node with normal logic (no recursion since we're using layer_name not module_name)
+                if is_tuple:
+                    # Manually inline the tuple assignment logic to avoid recursion
+                    var1 = node.targets[0].elts[0].id if not isinstance(node.targets[0].elts[0], ast.Tuple) else None
+                    var2 = node.targets[0].elts[1].id if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0].id
+
+                    if var1 and var1 != "_":
+                        self.rnn_output_vars[layer_name] = var1
+                        self.module_of_output[var1] = layer_name
+                    if var2 and var2 != "_":
+                        self.rnn_hidden_vars[layer_name] = var2
+                        self.module_of_output[var2] = layer_name
+
+                    first_elem = node.targets[0].elts[0]
+                    second_elem = node.targets[0].elts[1] if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0]
+                    first_is_underscore = isinstance(first_elem, ast.Name) and first_elem.id == "_"
+                    second_is_underscore = isinstance(second_elem, ast.Name) and second_elem.id == "_"
+
+                    lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == layer_name), None)
+
+                    if first_is_underscore and not second_is_underscore:
+                        rnn_out = node.targets[0].elts[1].id if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0].id
+                        if lyr_obj:
+                            lyr_obj.return_type = "hidden"
+                    elif not first_is_underscore and second_is_underscore:
+                        rnn_out = node.targets[0].elts[0].id
+                        if lyr_obj:
+                            lyr_obj.return_type = "full"
+                    else:
+                        rnn_out = node.targets[0].elts[0].id
+                        if lyr_obj:
+                            lyr_obj.return_type = "both"
+
+                    self.inputs_outputs[layer_name] = [current_input, rnn_out]
+
+                    if lyr_obj:
+                        self.buml_model.modules.append(lyr_obj)
+                else:
+                    # Simple call
+                    output_var = node.targets[0].id
+                    self.inputs_outputs[layer_name] = [current_input, output_var]
+                    self.module_of_output[output_var] = layer_name
+
+                    lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == layer_name), None)
+                    if lyr_obj:
+                        self.buml_model.modules.append(lyr_obj)
+
+            else:
+                # Intermediate layer - simple call storing to temp variable
+                temp_var = f"_mlrnn_{module_name}_{i}"
+                self.inputs_outputs[layer_name] = [current_input, temp_var]
+                self.module_of_output[temp_var] = layer_name
+
+                # Add layer to modules
+                module_obj = next((obj for obj in self.buml_model.layers if obj.name == layer_name), None)
+                if module_obj:
+                    self.buml_model.modules.append(module_obj)
+
+                current_input = temp_var
+
     def handle_forward_tuple_assignment(self, node: ast.Assign):
         """
         It handles rnn tuple assignments such as
@@ -470,6 +610,11 @@ class ASTParserTorch(ASTParser):
             None, but populates the BUML model.
         """
         module_name = node.value.func.attr
+
+        # Check if this is a multi-layer RNN that needs to be expanded
+        if module_name in self.multi_layer_rnns:
+            self.expand_multi_layer_rnn_call(node, module_name, is_tuple=True)
+            return
 
         # Track both variables (output and hidden) for later slicing operations
         var1 = node.targets[0].elts[0].id if not isinstance(node.targets[0].elts[0], ast.Tuple) else None
