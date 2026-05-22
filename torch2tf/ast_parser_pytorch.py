@@ -46,6 +46,110 @@ class ASTParserTorch(ASTParser):
         # Track multi-layer RNNs: {module_name: [layer_name_0, layer_name_1, ...]}
         self.multi_layer_rnns = {}
 
+    def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
+        """
+        Extract the subscript/slice pattern from an AST Subscript node as a string.
+
+        Parameters:
+            subscript_node (ast.Subscript): The AST subscript node
+
+        Returns:
+            str: String representation of the subscript pattern (e.g., "[-1]", "[:, -1, :]")
+        """
+        def slice_to_string(slice_node):
+            if isinstance(slice_node, ast.Slice):
+                lower = ast.unparse(slice_node.lower) if slice_node.lower else ""
+                upper = ast.unparse(slice_node.upper) if slice_node.upper else ""
+                step = ast.unparse(slice_node.step) if slice_node.step else ""
+                if step:
+                    return f"{lower}:{upper}:{step}"
+                else:
+                    return f"{lower}:{upper}" if lower or upper else ":"
+            elif isinstance(slice_node, ast.Tuple):
+                # Multi-dimensional slicing like [:, -1, :]
+                elements = [slice_to_string(elt) for elt in slice_node.elts]
+                return ", ".join(elements)
+            else:
+                # Single index like -1 or 0
+                return ast.unparse(slice_node)
+
+        pattern = slice_to_string(subscript_node.slice)
+        return f"[{pattern}]"
+
+    def create_subscript_tensorop(self, source_var: str, subscript_pattern: str, output_var: str):
+        """
+        Create a subscript TensorOp for general slicing operations.
+
+        Parameters:
+            source_var (str): The variable being subscripted
+            subscript_pattern (str): The subscript pattern as a string (e.g., "[-1]")
+            output_var (str): The output variable name
+
+        Returns:
+            None, but adds TensorOp to BUML model
+        """
+        op_name = f"_subscript_op_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+
+        # Get the source module that produced the variable
+        source_module = self.module_of_output.get(source_var, source_var)
+
+        print(f"[DEBUG] Creating subscript TensorOp: {op_name}, source={source_module}, pattern={subscript_pattern}")
+
+        subscript_op = mm_classes.TensorOp(
+            name=op_name,
+            tns_type='subscript',
+            layers_of_tensors=[source_module],  # The layer/op that produced the tensor
+            subscript_indices=subscript_pattern
+        )
+
+        self.buml_model.modules.append(subscript_op)
+        self.inputs_outputs[op_name] = [source_var, output_var]
+        self.module_of_output[output_var] = op_name
+
+        print(f"[DEBUG] Subscript TensorOp created: {op_name} -> {output_var}")
+
+    def handle_subscript_operation(self, subscript_node: ast.Subscript, temp_name: str, node: ast.Assign):
+        """
+        Unified handler for subscript operations - detects RNN vs non-RNN and handles accordingly.
+
+        Parameters:
+            subscript_node (ast.Subscript): The subscript AST node
+            temp_name (str): The temporary variable name for the result
+            node (ast.Assign): The parent assignment node
+
+        Returns:
+            None, but creates TensorOp or sets RNN return_type
+        """
+        subscripted_var = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else None
+
+        # Check if this is an RNN subscript
+        is_rnn_subscript = False
+        if subscripted_var and subscripted_var in self.module_of_output:
+            src_module = self.module_of_output[subscripted_var]
+            src_layer = next((obj for obj in self.buml_model.layers if obj.name == src_module), None)
+            if src_layer and hasattr(src_layer, 'return_type'):
+                is_rnn_subscript = True
+                print(f"[DEBUG] RNN subscript detected: {subscripted_var} from {src_module}")
+
+        # Create temp assignment node
+        temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+        subscript_assign = ast.Assign(targets=[temp_target], value=subscript_node)
+        subscript_assign.lineno = node.lineno
+        subscript_assign.col_offset = node.col_offset
+
+        if is_rnn_subscript:
+            # RNN slicing: process with handle_forward_slicing to set return_type
+            print(f"[DEBUG] Processing RNN subscript: {subscripted_var}")
+            self.handle_forward_slicing(subscript_assign)
+        else:
+            # Non-RNN slicing: create subscript TensorOp for general slicing
+            print(f"[DEBUG] Processing non-RNN subscript as slicing op: {subscripted_var}")
+            subscript_pattern = self.extract_subscript_pattern(subscript_node)
+            self.create_subscript_tensorop(subscripted_var, subscript_pattern, temp_name)
+
+        self.previous_assign = subscript_assign
+
     def handle_init(self, node: ast.Assign):
         """
         It retrieves the sub_nn layers, adds their activation functions 
@@ -293,42 +397,11 @@ class ASTParserTorch(ASTParser):
         # Process subscript before processing the call
         if isinstance(node.value, ast.Call) and node.value.args:
             if isinstance(node.value.args[0], ast.Subscript):
-                # Check if this is an RNN subscript (e.g., h[-1], output[:, -1, :])
                 subscript_node = node.value.args[0]
-                subscripted_var = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else None
-
-                # Only process through handle_forward_slicing if it's from an RNN
-                is_rnn_subscript = False
-                if subscripted_var and subscripted_var in self.module_of_output:
-                    src_module = self.module_of_output[subscripted_var]
-                    src_layer = next((obj for obj in self.buml_model.layers if obj.name == src_module), None)
-                    if src_layer and hasattr(src_layer, 'return_type'):
-                        is_rnn_subscript = True
-                        print(f"[DEBUG] RNN subscript detected: {subscripted_var} from {src_module}")
-
-                # Process subscript (RNN or non-RNN)
                 temp_name = f"_subscript_temp_{self.tensor_op_counter}"
                 self.tensor_op_counter += 1
-                temp_target = ast.Name(id=temp_name, ctx=ast.Store())
 
-                subscript_assign = ast.Assign(targets=[temp_target], value=subscript_node)
-                subscript_assign.lineno = node.lineno
-                subscript_assign.col_offset = node.col_offset
-
-                if is_rnn_subscript:
-                    # RNN slicing: process with handle_forward_slicing to set return_type
-                    print(f"[DEBUG] Processing RNN subscript: {subscripted_var}")
-                    self.handle_forward_slicing(subscript_assign)
-                else:
-                    # Non-RNN slicing: create slicing TensorOp
-                    print(f"[DEBUG] Processing non-RNN subscript as slicing op: {subscripted_var}")
-                    # Track which variable produced this sliced result
-                    if subscripted_var in self.module_of_output:
-                        self.module_of_output[temp_name] = self.module_of_output[subscripted_var]
-                    # For now, just track the temp variable - the actual slicing will be inline in TF
-                    # TODO: Create proper slicing TensorOp if needed for complex cases
-
-                self.previous_assign = subscript_assign
+                self.handle_subscript_operation(subscript_node, temp_name, node)
 
                 # Replace subscript with temp variable in call
                 node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
@@ -745,11 +818,7 @@ class ASTParserTorch(ASTParser):
             # Handle subscript like out[:, -1, :]
             temp_name = f"_subscript_temp_{self.tensor_op_counter}"
             self.tensor_op_counter += 1
-            temp_target = ast.Name(id=temp_name, ctx=ast.Store())
-            subscript_assign = ast.Assign(targets=[temp_target], value=binop.left)
-            subscript_assign.lineno = node.lineno
-            subscript_assign.col_offset = node.col_offset
-            self.handle_forward_slicing(subscript_assign)
+            self.handle_subscript_operation(binop.left, temp_name, node)
             left_var = temp_name
         elif isinstance(binop.left, (ast.Constant, ast.Num)):
             # Handle constant operand
@@ -778,11 +847,7 @@ class ASTParserTorch(ASTParser):
             # Handle subscript like out[:, -1, :]
             temp_name = f"_subscript_temp_{self.tensor_op_counter}"
             self.tensor_op_counter += 1
-            temp_target = ast.Name(id=temp_name, ctx=ast.Store())
-            subscript_assign = ast.Assign(targets=[temp_target], value=binop.right)
-            subscript_assign.lineno = node.lineno
-            subscript_assign.col_offset = node.col_offset
-            self.handle_forward_slicing(subscript_assign)
+            self.handle_subscript_operation(binop.right, temp_name, node)
             right_var = temp_name
         elif isinstance(binop.right, (ast.Constant, ast.Num)):
             # Handle constant operand
@@ -894,10 +959,11 @@ class ASTParserTorch(ASTParser):
 
         # Only process return_type for RNN layers
         if not hasattr(lyr_obj, 'return_type'):
-            # Not an RNN layer, just track the slicing operation
+            # Not an RNN layer, create subscript TensorOp for general slicing
             result_var = node.targets[0].id
-            self.module_of_output[result_var] = prev_module_name
-            self.variable_aliases[result_var] = subscripted_var
+            print(f"[DEBUG] Processing non-RNN subscript in handle_forward_slicing: {subscripted_var}")
+            subscript_pattern = self.extract_subscript_pattern(node.value)
+            self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
             self.previous_assign = node
             return
 
