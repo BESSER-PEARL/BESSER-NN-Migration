@@ -93,11 +93,11 @@ class ASTParser(ast.NodeVisitor):
 
     def set_remaining_lyr_params(self):
         """
-        It iterates through the layers to set their 'input_reused'
+        It iterates through the layers and tensorops to set their 'input_reused'
         and 'name_module_input' parameters.
         """
         for i, module in enumerate(self.buml_model.modules):
-            if isinstance(module, Layer):
+            if isinstance(module, Layer) or hasattr(module, 'input_reused'):
                 set_remaining_params(
                     module, self.inputs_outputs, self.module_of_output,
                     self.buml_model.modules, i
@@ -309,6 +309,11 @@ class ASTParser(ast.NodeVisitor):
         elif (isinstance(node.targets[0], ast.Name) and
               isinstance(node.value, ast.BinOp)):
             self.handle_forward_binop(node)
+
+        #Forward method, simple variable assignments (e.g., inp = x)
+        elif (isinstance(node.targets[0], ast.Name) and
+              isinstance(node.value, ast.Name)):
+            self.handle_forward_variable_assignment(node)
 
 
     @abstractmethod

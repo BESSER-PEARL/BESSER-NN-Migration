@@ -285,14 +285,23 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
     """
 
     layer_name = lyr_obj.name
+
+    # Skip if module is not in inputs_outputs
+    if layer_name not in inputs_outputs:
+        return
+
     if (not isinstance(inputs_outputs[layer_name][1], list) and
         inputs_outputs[layer_name][0] != inputs_outputs[layer_name][1]):
         input_var = inputs_outputs[layer_name][0]
         if input_var in module_of_output:
             lyr_in_out = module_of_output[input_var]
 
+            # Special case: INPUT marker for network input
+            if lyr_in_out == 'INPUT':
+                lyr_obj.input_reused = True
+                lyr_obj.name_module_input = 'INPUT'
             # Check temporal ordering: the referenced module must come before this one
-            if modules_list is not None and current_index is not None:
+            elif modules_list is not None and current_index is not None:
                 referenced_module = next((m for m in modules_list if m.name == lyr_in_out), None)
                 if referenced_module:
                     referenced_index = modules_list.index(referenced_module)
