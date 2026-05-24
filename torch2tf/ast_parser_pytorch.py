@@ -458,8 +458,8 @@ class ASTParserTorch(ASTParser):
 
         caller_id = node.value.func.value.id
 
-        # Handle functional API (F.layer or torch.nn.functional.layer)
-        if caller_id == "F" or caller_id == "functional":
+        # Handle functional API (F.layer, torch.nn.functional.layer, or torch.layer)
+        if caller_id == "F" or caller_id == "functional" or caller_id == "torch":
             func_name = node.value.func.attr
 
             # Check if it maps to a known module
@@ -752,6 +752,16 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but populates the BUML model.
         """
+        # Check if this is a method call (e.g., x.max(dim=1)) vs module call (e.g., self.rnn(x))
+        if hasattr(node.value.func, 'value') and isinstance(node.value.func.value, ast.Name):
+            caller_id = node.value.func.value.id
+            # If caller is not "self", it's a method call on a tensor - handle as TensorOp
+            if caller_id != "self":
+                # This is a method call like x.max(dim=1) that returns a tuple
+                # Extract the first value and handle as TensorOp
+                self.extract_tensorop(node)
+                return
+
         module_name = node.value.func.attr
 
         # Check if this is a multi-layer RNN that needs to be expanded
@@ -1226,7 +1236,15 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but populates the buml model.
         """
-        target_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else "?"
+        # Handle both simple assignments (x = ...) and tuple assignments (x, _ = ...)
+        if isinstance(node.targets[0], ast.Name):
+            target_var = node.targets[0].id
+        elif isinstance(node.targets[0], ast.Tuple):
+            # Tuple assignment - use the first element (e.g., max_pool, _ = x.max())
+            first_elem = node.targets[0].elts[0]
+            target_var = first_elem.id if isinstance(first_elem, ast.Name) else "?"
+        else:
+            target_var = "?"
         print(f"DEBUG extract_tensorop: processing {target_var} = ...")
 
         # Handle .values attribute accessor (e.g., x.max(dim=1).values)
@@ -1325,9 +1343,18 @@ class ASTParserTorch(ASTParser):
             self.tensor_op_counter+=1
 
             # Track tensorop output so activations can detect it
-            output_var = node.targets[0].id
-            self.module_of_output[output_var] = op_name
-            print(f"DEBUG: Added {output_var} -> {op_name} to module_of_output")
+            # Handle both simple and tuple assignments
+            if isinstance(node.targets[0], ast.Name):
+                output_var = node.targets[0].id
+            elif isinstance(node.targets[0], ast.Tuple):
+                first_elem = node.targets[0].elts[0]
+                output_var = first_elem.id if isinstance(first_elem, ast.Name) else None
+            else:
+                output_var = None
+
+            if output_var:
+                self.module_of_output[output_var] = op_name
+                print(f"DEBUG: Added {output_var} -> {op_name} to module_of_output")
             # Note: inputs_outputs for tensorops handled differently - they use layers_of_tensors
 
 
