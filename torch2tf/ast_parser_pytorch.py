@@ -579,6 +579,9 @@ class ASTParserTorch(ASTParser):
                         if prev_lyr_obj:
                             actv = self.activation_functions[module_name]
                             prev_lyr_obj.actv_func = actv_fun_mapping[actv]
+                            # Update module_of_output to point to the layer, not the activation
+                            output_var = node.targets[0].id
+                            self.module_of_output[output_var] = prev_lyr_name
                             # Skip adding activation as separate layer
                             should_merge = True
                         else:
