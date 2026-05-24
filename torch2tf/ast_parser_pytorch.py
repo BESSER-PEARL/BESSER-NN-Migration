@@ -1202,8 +1202,23 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but populates the buml model.
         """
-        op_type = node.value.func.attr
-        op_args = node.value.args
+        target_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else "?"
+        print(f"DEBUG extract_tensorop: processing {target_var} = ...")
+
+        # Handle .values attribute accessor (e.g., x.max(dim=1).values)
+        call_node = node.value
+        if isinstance(node.value, ast.Attribute) and node.value.attr == 'values':
+            print(f"DEBUG: Found .values accessor, unwrapping to Call node")
+            # Unwrap to get the underlying Call node
+            call_node = node.value.value
+
+        if not isinstance(call_node, ast.Call):
+            print(f"DEBUG: extract_tensorop called on non-Call node: {ast.dump(node.value)}")
+            return
+
+        op_type = call_node.func.attr
+        print(f"DEBUG: op_type = {op_type}")
+        op_args = call_node.args
         tensorop_param = None
         if op_type == "permute":
             tensorop_param = self.extract_tensorop_permute(op_args)
@@ -1225,21 +1240,40 @@ class ASTParserTorch(ASTParser):
         elif op_type == "mean":
             # Extract the dim parameter from keywords
             reduce_dim = None
-            for kw in node.value.keywords:
+            for kw in call_node.keywords:
                 if kw.arg == "dim":
                     reduce_dim = self.param_value(kw.value)
             if reduce_dim is None:
                 print(f"Warning: mean operation without dim parameter - not supported")
                 return
+            # Track which variable this operation is called on (e.g., x.mean())
+            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+            source_layers = [self.module_of_output[source_var]] if source_var and source_var in self.module_of_output else None
             tensorop_param = {"tns_type": "mean",
-                              "reduce_dim": reduce_dim}
+                              "reduce_dim": reduce_dim,
+                              "layers_of_tensors": source_layers}
+        elif op_type == "max":
+            # Extract the dim parameter from keywords
+            reduce_dim = None
+            for kw in call_node.keywords:
+                if kw.arg == "dim":
+                    reduce_dim = self.param_value(kw.value)
+            if reduce_dim is None:
+                print(f"Warning: max operation without dim parameter - not supported")
+                return
+            # Track which variable this operation is called on (e.g., x.max())
+            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+            source_layers = [self.module_of_output[source_var]] if source_var and source_var in self.module_of_output else None
+            tensorop_param = {"tns_type": "max",
+                              "reduce_dim": reduce_dim,
+                              "layers_of_tensors": source_layers}
         elif op_type == "squeeze":
             # Extract the dim parameter - can be positional arg or keyword
             squeeze_dim = None
             if len(op_args) > 0:
                 squeeze_dim = self.param_value(op_args[0])
             else:
-                for kw in node.value.keywords:
+                for kw in call_node.keywords:
                     if kw.arg == "dim":
                         squeeze_dim = self.param_value(kw.value)
             tensorop_param = {"tns_type": "squeeze",
@@ -1250,7 +1284,7 @@ class ASTParserTorch(ASTParser):
             if len(op_args) > 0:
                 unsqueeze_dim = self.param_value(op_args[0])
             else:
-                for kw in node.value.keywords:
+                for kw in call_node.keywords:
                     if kw.arg == "dim":
                         unsqueeze_dim = self.param_value(kw.value)
             tensorop_param = {"tns_type": "unsqueeze",
@@ -1269,6 +1303,7 @@ class ASTParserTorch(ASTParser):
             # Track tensorop output so activations can detect it
             output_var = node.targets[0].id
             self.module_of_output[output_var] = op_name
+            print(f"DEBUG: Added {output_var} -> {op_name} to module_of_output")
             # Note: inputs_outputs for tensorops handled differently - they use layers_of_tensors
 
 
@@ -1289,49 +1324,60 @@ class ASTParserTorch(ASTParser):
             prev_lyr_name = self.previous_assign.value.func.attr
             lyr_obj = next((obj for obj in self.buml_model.layers if
                             obj.name == prev_lyr_name), None)
-            lyr_obj.return_type =  "hidden"
-        else:
-            # Extract variable names - handle both simple names and method calls
-            def extract_var_name_and_create_op(arg):
-                if isinstance(arg, ast.Name):
-                    return arg.id
-                elif isinstance(arg, ast.Call):
-                    # Method call like x.squeeze(1) - create the operation and return result var
-                    return self.extract_inline_tensorop(arg, node)
-                else:
-                    return None
+            if lyr_obj:
+                lyr_obj.return_type =  "hidden"
 
-            var1 = extract_var_name_and_create_op(ops_args[0])
-            var2 = extract_var_name_and_create_op(ops_args[1])
-
-            if var1 is None or var2 is None:
-                # Can't extract variable names - skip this concat
-                print(f"Warning: Cannot extract variables from concat operation")
+        # Extract variable names - handle both simple names and method calls
+        def extract_var_name_and_create_op(arg):
+            if isinstance(arg, ast.Name):
+                return arg.id
+            elif isinstance(arg, ast.Call):
+                # Method call like x.squeeze(1) - create the operation and return result var
+                return self.extract_inline_tensorop(arg, node)
+            elif isinstance(arg, ast.Subscript):
+                # Subscript like h_n[-2] - create subscript TensorOp
+                temp_name = f"_subscript_temp_{self.tensor_op_counter}"
+                self.tensor_op_counter += 1
+                self.handle_subscript_operation(arg, temp_name, node)
+                return temp_name
+            else:
                 return None
 
-            # Resolve aliases
-            actual_var1 = self.variable_aliases.get(var1, var1)
-            actual_var2 = self.variable_aliases.get(var2, var2)
+        var1 = extract_var_name_and_create_op(ops_args[0])
+        var2 = extract_var_name_and_create_op(ops_args[1])
 
-            layers_of_tensors = [self.module_of_output[actual_var1],
-                                 self.module_of_output[actual_var2]]
-            cat_dim = self.param_value(node.value.keywords[0].value)
+        print(f"DEBUG concat args: var1={var1}, var2={var2}")
+        if var1 is None or var2 is None:
+            # Can't extract variable names - skip this concat
+            print(f"Warning: Cannot extract variables from concat operation (var1={var1}, var2={var2})")
+            return None
 
-            # Determine if each variable is output or hidden for RNNs with return_type="both"
-            var_types = []
-            for lyr_name, actual_var in zip(layers_of_tensors, [actual_var1, actual_var2]):
-                if lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
-                    var_types.append("hidden")
-                elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
-                    var_types.append("output")
-                else:
-                    var_types.append("output")  # Default
+        # Resolve aliases - but only if the variable is not already in module_of_output
+        # (subscript temps are in both variable_aliases and module_of_output)
+        actual_var1 = var1 if var1 in self.module_of_output else self.variable_aliases.get(var1, var1)
+        actual_var2 = var2 if var2 in self.module_of_output else self.variable_aliases.get(var2, var2)
 
-            tensorop_param = {"tns_type": "concatenate",
-                              "layers_of_tensors": layers_of_tensors,
-                              "concatenate_dim": cat_dim,
-                              # Store which component (output/hidden) each refers to
-                              "actual_vars": var_types}
+        print(f"DEBUG concat: Looking for {actual_var1} and {actual_var2}")
+        print(f"DEBUG concat: module_of_output keys = {list(self.module_of_output.keys())}")
+        layers_of_tensors = [self.module_of_output[actual_var1],
+                             self.module_of_output[actual_var2]]
+        cat_dim = self.param_value(node.value.keywords[0].value)
+
+        # Determine if each variable is output or hidden for RNNs with return_type="both"
+        var_types = []
+        for lyr_name, actual_var in zip(layers_of_tensors, [actual_var1, actual_var2]):
+            if lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
+                var_types.append("hidden")
+            elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
+                var_types.append("output")
+            else:
+                var_types.append("output")  # Default
+
+        tensorop_param = {"tns_type": "concatenate",
+                          "layers_of_tensors": layers_of_tensors,
+                          "concatenate_dim": cat_dim,
+                          # Store which component (output/hidden) each refers to
+                          "actual_vars": var_types}
 
         return tensorop_param
 

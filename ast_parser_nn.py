@@ -295,6 +295,12 @@ class ASTParser(ast.NodeVisitor):
               isinstance(node.value, ast.Call)):
             self.handle_forward_simple_call(node)
 
+        #Forward method, attribute access on call result (e.g., x.max(dim=1).values)
+        elif (isinstance(node.targets[0], ast.Name) and
+              isinstance(node.value, ast.Attribute) and
+              isinstance(node.value.value, ast.Call)):
+            self.handle_forward_simple_call(node)
+
         #Forward RNN
         elif (isinstance(node.targets[0], ast.Tuple) and
               isinstance(node.value, ast.Call)):
