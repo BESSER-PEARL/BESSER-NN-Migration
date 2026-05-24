@@ -618,7 +618,31 @@ class ASTParserTorch(ASTParser):
                     module_obj = next((obj for obj in subnns if
                                        obj.name == module_name), None)
 
-                self.buml_model.modules.append(module_obj)
+                # Check if this layer was already used - if so, create a synthetic instance
+                # to track this specific use
+                if module_obj and module_obj in self.buml_model.modules:
+                    # Layer reuse detected - create a synthetic copy
+                    import copy
+                    synthetic_name = f"{module_name}_use_{self.tensor_op_counter}"
+                    self.tensor_op_counter += 1
+
+                    # Create a shallow copy with a new name
+                    synthetic_module = copy.copy(module_obj)
+                    synthetic_module.name = synthetic_name
+
+                    # Update inputs_outputs to use the synthetic name
+                    if module_name in self.inputs_outputs:
+                        self.inputs_outputs[synthetic_name] = self.inputs_outputs[module_name]
+
+                    # Update module_of_output for the output variable
+                    output_var = node.targets[0].id
+                    self.module_of_output[output_var] = synthetic_name
+
+                    # Append synthetic module
+                    self.buml_model.layers.append(synthetic_module)
+                    self.buml_model.modules.append(synthetic_module)
+                elif module_obj:
+                    self.buml_model.modules.append(module_obj)
 
         else:
             #tensorops
