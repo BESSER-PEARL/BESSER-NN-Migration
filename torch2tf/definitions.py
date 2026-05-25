@@ -48,6 +48,7 @@ params_mapping = {
     "batch_first": "batch_first", "normalized_shape": "normalized_shape",
     "p": "rate", "num_features": "num_features",
     "num_embeddings": "num_embeddings", "embedding_dim": "embedding_dim",
+    "padding_idx": "padding_idx",
     "start_dim": "start_dim", "end_dim": "end_dim",
     "in_features": "in_features", "out_features": "out_features",
     "return_type": "return_type", "permute_in": "permute_in",
