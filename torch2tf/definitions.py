@@ -12,9 +12,10 @@ layers_mapping = {
     "AdaptiveAvgPool3d": "PoolingLayer", "AdaptiveMaxPool1d": "PoolingLayer", 
     "AdaptiveMaxPool2d": "PoolingLayer", "AdaptiveMaxPool3d": "PoolingLayer", 
     "Flatten": "FlattenLayer", "Linear": "LinearLayer", 
-    "Embedding": "EmbeddingLayer", "BatchNorm1d": "BatchNormLayer", 
+    "Embedding": "EmbeddingLayer", "BatchNorm1d": "BatchNormLayer",
     "BatchNorm2d": "BatchNormLayer", "BatchNorm3d": "BatchNormLayer",
-    "LayerNorm": "LayerNormLayer", "Dropout": "DropoutLayer", 
+    "LayerNorm": "LayerNormLayer", "Dropout": "DropoutLayer", "Dropout1d": "DropoutLayer",
+    "Dropout2d": "DropoutLayer", "Dropout3d": "DropoutLayer", 
     "RNN": "SimpleRNNLayer", "LSTM": "LSTMLayer", "GRU": "GRULayer"
 }
 
@@ -92,7 +93,7 @@ pos_params = {"Linear": ["in_features", "out_features"],
               "MaxPool": ["kernel_size", "stride", "padding"],
               "AdaptiveAvgPool": ["output_size"],
               "AdaptiveMaxPool": ["output_size"],
-              "Dropout": ["p"],
+              "Dropout": ["p"], "Dropout1d": ["p"], "Dropout2d": ["p"], "Dropout3d": ["p"],
               "LayerNorm": ["normalized_shape"],
               "BatchNorm": ["num_features"]}
 

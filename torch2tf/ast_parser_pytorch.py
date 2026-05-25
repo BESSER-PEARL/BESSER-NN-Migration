@@ -1682,6 +1682,10 @@ def transform_layer(lyr_type: str, lyr_params: dict,
     lyr_params = process_params(lyr_type, lyr_params)
     lyr_params["name"] = lyr_name
 
+    # Extract dimension from spatial dropout layers (Dropout1d, Dropout2d, Dropout3d)
+    if lyr_type in ["Dropout1d", "Dropout2d", "Dropout3d"]:
+        lyr_params["dimension"] = lyr_type[-2]  # Extract '1', '2', or '3'
+
     lyr_type = layers_mapping[lyr_type]
     return lyr_type, lyr_params
 
