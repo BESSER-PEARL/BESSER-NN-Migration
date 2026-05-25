@@ -34,7 +34,8 @@ functional_to_module_mapping = {
     "adaptive_max_pool3d": "AdaptiveMaxPool3d",
     "adaptive_avg_pool3d": "AdaptiveAvgPool3d",
     "max_pool1d": "MaxPool1d", "max_pool2d": "MaxPool2d", "max_pool3d": "MaxPool3d",
-    "avg_pool1d": "AvgPool1d", "avg_pool2d": "AvgPool2d", "avg_pool3d": "AvgPool3d"
+    "avg_pool1d": "AvgPool1d", "avg_pool2d": "AvgPool2d", "avg_pool3d": "AvgPool3d",
+    "flatten": "Flatten"
 }
 
 params_mapping = {
@@ -83,7 +84,7 @@ loss_func_mapping = {"CrossEntropyLoss": "crossentropy",
 
 pos_params = {"Linear": ["in_features", "out_features"],
               "Embedding": ["num_embeddings", "embedding_dim"],
-              "Flatten": ["Flatten", "end_dim"],
+              "Flatten": ["start_dim", "end_dim"],
               "RNN": ["input_size", "hidden_size"],
               "LSTM": ["input_size", "hidden_size"],
               "GRU": ["input_size", "hidden_size"],
