@@ -45,6 +45,8 @@ class ASTParserTorch(ASTParser):
         self.variable_aliases = {}  # {alias_var: source_var}
         # Track multi-layer RNNs: {module_name: [layer_name_0, layer_name_1, ...]}
         self.multi_layer_rnns = {}
+        # Track layer reuse count for creating unique reuse names
+        self.layer_reuse_count = {}  # {layer_name: reuse_count}
 
     def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
         """
@@ -1242,7 +1244,11 @@ class ASTParserTorch(ASTParser):
             return "x"
 
         # Only handle squeeze/unsqueeze for now
+        # Layer calls (self.layer_name(...)) should be handled by the caller
         if op_type not in ['squeeze', 'unsqueeze']:
+            # If this is a layer call (base_var == 'self'), signal to caller
+            if base_var == 'self':
+                return None  # Signal that this needs special handling
             return base_var
 
         # Create intermediate variable name
@@ -1533,8 +1539,68 @@ class ASTParserTorch(ASTParser):
             if isinstance(arg, ast.Name):
                 return arg.id
             elif isinstance(arg, ast.Call):
-                # Method call like x.squeeze(1) - create the operation and return result var
-                return self.extract_inline_tensorop(arg, node)
+                # Check if it's a layer call (self.layer_name(...))
+                if (isinstance(arg.func, ast.Attribute) and
+                    isinstance(arg.func.value, ast.Name) and
+                    arg.func.value.id == 'self'):
+                    # Layer call - need to handle layer reuse properly
+                    layer_name = arg.func.attr
+
+                    # Find the layer in the BUML model's layers list
+                    layer_obj = next((lyr for lyr in self.buml_model.layers if lyr.name == layer_name), None)
+
+                    if layer_obj:
+                        # Check if this is a reuse (layer already in modules)
+                        if layer_obj in self.buml_model.modules:
+                            # Layer reuse - increment reuse count
+                            self.layer_reuse_count[layer_name] = self.layer_reuse_count.get(layer_name, 0) + 1
+                            use_count = self.layer_reuse_count[layer_name]
+
+                            # Create a synthetic layer reference for this specific use
+                            import copy
+                            reuse_layer = copy.copy(layer_obj)
+                            reuse_layer.name = f"{layer_name}_use_{use_count}"
+                            reuse_layer.input_reused = True  # Mark that input is shared with other layers
+
+                            # Track the input for this use
+                            if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+                                input_var = arg.args[0].id
+                                if input_var in self.module_of_output:
+                                    reuse_layer.name_module_input = self.module_of_output[input_var]
+
+                            self.buml_model.modules.append(reuse_layer)
+
+                            # Create temp variable for this use
+                            temp_name = f"_nested_temp_{self.tensor_op_counter}"
+                            self.tensor_op_counter += 1
+                            self.module_of_output[temp_name] = reuse_layer.name
+                            return temp_name
+                        else:
+                            # First use of this layer - also mark as input_reused if it will be reused
+                            # Track the input for this layer
+                            if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+                                input_var = arg.args[0].id
+                                if input_var in self.module_of_output:
+                                    layer_obj.name_module_input = self.module_of_output[input_var]
+                                    layer_obj.input_reused = True  # Mark that input is shared
+
+                            self.buml_model.modules.append(layer_obj)
+
+                            # Create temp variable for the layer's output
+                            temp_name = f"_nested_temp_{self.tensor_op_counter}"
+                            self.tensor_op_counter += 1
+                            self.module_of_output[temp_name] = layer_name
+                            return temp_name
+                    else:
+                        print(f"Warning: Layer '{layer_name}' not found in BUML model")
+                        return None
+                else:
+                    # Method call like x.squeeze(1) - create the operation and return result var
+                    result = self.extract_inline_tensorop(arg, node)
+                    if result is None:
+                        print(f"Warning: extract_inline_tensorop returned None for {ast.unparse(arg)}")
+                        return None
+                    return result
             elif isinstance(arg, ast.Subscript):
                 # Subscript like h_n[-2] - create subscript TensorOp
                 temp_name = f"_subscript_temp_{self.tensor_op_counter}"
