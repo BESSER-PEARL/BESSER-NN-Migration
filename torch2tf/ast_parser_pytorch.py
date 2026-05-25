@@ -1329,8 +1329,17 @@ class ASTParserTorch(ASTParser):
                               "layers_of_tensors": layers_of_tensors}
         elif op_type == "transpose":
             transpose_dim = [op_args[i].value for i in range(len(op_args))]
+            # Track which variable this operation is called on (e.g., x.transpose())
+            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+            if source_var and source_var in self.module_of_output:
+                source_layers = [self.module_of_output[source_var]]
+            elif source_var:
+                source_layers = ['INPUT']
+            else:
+                source_layers = None
             tensorop_param = {"tns_type": op_type,
-                              "transpose_dim": transpose_dim}
+                              "transpose_dim": transpose_dim,
+                              "layers_of_tensors": source_layers}
         elif op_type == "reshape":
             # Handle variable number of arguments (e.g., b*t, 32 or b, t, 16)
             reshape_dim = [self.param_value(arg) for arg in op_args]
@@ -1356,8 +1365,20 @@ class ASTParserTorch(ASTParser):
             if reduce_dim is None:
                 print(f"Warning: mean operation without dim parameter - not supported")
                 return
-            # Track which variable this operation is called on (e.g., x.mean())
-            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+            # Track which variable this operation is called on
+            # For method calls: x.mean() -> source_var = x
+            # For module calls: torch.mean(x, ...) -> source_var = first argument
+            if isinstance(call_node.func.value, ast.Name):
+                # Check if it's a module call (torch.mean) or method call (x.mean)
+                if call_node.func.value.id in ['torch', 'F', 'nn']:
+                    # Module call: get first argument as source
+                    source_var = op_args[0].id if len(op_args) > 0 and isinstance(op_args[0], ast.Name) else None
+                else:
+                    # Method call: func.value is the source
+                    source_var = call_node.func.value.id
+            else:
+                source_var = None
+
             if source_var and source_var in self.module_of_output:
                 source_layers = [self.module_of_output[source_var]]
             elif source_var:
@@ -1377,8 +1398,51 @@ class ASTParserTorch(ASTParser):
             if reduce_dim is None:
                 print(f"Warning: max operation without dim parameter - not supported")
                 return
-            # Track which variable this operation is called on (e.g., x.max())
-            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+            # Track which variable this operation is called on
+            # For method calls: x.max() -> source_var = x
+            # For module calls: torch.max(x, ...) -> source_var = first argument
+            if isinstance(call_node.func.value, ast.Name):
+                if call_node.func.value.id in ['torch', 'F', 'nn']:
+                    # Module call: get first argument as source
+                    source_var = op_args[0].id if len(op_args) > 0 and isinstance(op_args[0], ast.Name) else None
+                else:
+                    # Method call: func.value is the source
+                    source_var = call_node.func.value.id
+            else:
+                source_var = None
+
+            if source_var and source_var in self.module_of_output:
+                source_layers = [self.module_of_output[source_var]]
+            elif source_var:
+                # Variable not in module_of_output means it's the original network input
+                source_layers = ['INPUT']
+            else:
+                source_layers = None
+            tensorop_param = {"tns_type": "max",
+                              "reduce_dim": reduce_dim,
+                              "layers_of_tensors": source_layers}
+        elif op_type == "amax":
+            # torch.amax is same as torch.max with dim parameter
+            reduce_dim = None
+            for kw in call_node.keywords:
+                if kw.arg == "dim":
+                    reduce_dim = self.param_value(kw.value)
+            if reduce_dim is None:
+                print(f"Warning: amax operation without dim parameter - not supported")
+                return
+            # Track which variable this operation is called on
+            # For method calls: x.amax() -> source_var = x
+            # For module calls: torch.amax(x, ...) -> source_var = first argument
+            if isinstance(call_node.func.value, ast.Name):
+                if call_node.func.value.id in ['torch', 'F', 'nn']:
+                    # Module call: get first argument as source
+                    source_var = op_args[0].id if len(op_args) > 0 and isinstance(op_args[0], ast.Name) else None
+                else:
+                    # Method call: func.value is the source
+                    source_var = call_node.func.value.id
+            else:
+                source_var = None
+
             if source_var and source_var in self.module_of_output:
                 source_layers = [self.module_of_output[source_var]]
             elif source_var:
