@@ -306,6 +306,11 @@ class ASTParser(ast.NodeVisitor):
               isinstance(node.value, ast.Call)):
             self.handle_forward_tuple_assignment(node)
 
+        #Forward shape unpacking (e.g., b, t, _ = x.shape)
+        elif (isinstance(node.targets[0], ast.Tuple) and
+              isinstance(node.value, ast.Attribute)):
+            self.handle_forward_shape_unpacking(node)
+
         #Forward RNN
         elif (isinstance(node.targets[0], ast.Name) and
               isinstance(node.value, ast.Subscript)):
@@ -338,22 +343,34 @@ class ASTParser(ast.NodeVisitor):
     @abstractmethod
     def handle_forward_simple_call(self, node: ast.Assign):
         """
-        This method: 
-        - retrieves the input and output variables of modules 
+        This method:
+        - retrieves the input and output variables of modules
         and populates 'inputs_outputs' and 'module_of_output' dictionaries.
         - sets the activation function as attribute of its layer (for PyTorch).
         - adds permute_in attributes to cnn layers if they are preceeded by
         permute tensorop (the permute op is sometimes used before a cnn layer
-        to make pytorch and tensorflow models equivalent as cnn in both 
+        to make pytorch and tensorflow models equivalent as cnn in both
         frameworks receive data in a different order). Relevant for PyTorch.
-        - sets the order of modules in buml model and processes tensorops.  
+        - sets the order of modules in buml model and processes tensorops.
 
         Parameters:
             node (ast.Assign): The AST node representing an assignment
                 statement.
 
         Returns:
-            None, but populates the BUML model. 
+            None, but populates the BUML model.
+        """
+
+    @abstractmethod
+    def handle_forward_shape_unpacking(self, node: ast.Assign):
+        """
+        Handle tuple unpacking of shape attributes (e.g., b, t, _ = x.shape).
+
+        Parameters:
+            node (ast.Assign): The AST node with tuple target and attribute value.
+
+        Returns:
+            None, but should track shape variables for use in reshape operations.
         """
 
     def handle_forward_tuple_assignment(self, node: ast.Assign):
@@ -416,6 +433,20 @@ class ASTParser(ast.NodeVisitor):
             func_name = self.param_value(param.func)
             args = ", ".join(str(self.param_value(arg)) for arg in param.args)
             return f"{func_name}({args})"
+        elif isinstance(param, ast.BinOp):
+            # Handle binary operations like a * b, a + b, etc.
+            left = self.param_value(param.left)
+            right = self.param_value(param.right)
+            op_map = {
+                ast.Mult: '*',
+                ast.Add: '+',
+                ast.Sub: '-',
+                ast.Div: '/',
+                ast.FloorDiv: '//',
+                ast.Mod: '%',
+            }
+            op_symbol = op_map.get(type(param.op), '?')
+            return f"{left} {op_symbol} {right}"
 
         print("unhandled type", param)
         return param

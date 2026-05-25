@@ -994,6 +994,51 @@ class ASTParserTorch(ASTParser):
         output_var = node.targets[0].id
         self.module_of_output[output_var] = tensorop_param["name"]
 
+    def handle_forward_shape_unpacking(self, node: ast.Assign):
+        """
+        Handle tuple unpacking of shape attributes (e.g., b, t, _ = x.shape).
+        Creates TensorOp assignments for each shape dimension.
+
+        Parameters:
+            node (ast.Assign): The AST node with tuple target and attribute value.
+
+        Returns:
+            None, but creates TensorOps for shape dimension extraction.
+        """
+        # Extract the tuple elements (variable names)
+        tuple_target = node.targets[0]
+        var_names = []
+        for elt in tuple_target.elts:
+            if isinstance(elt, ast.Name):
+                var_names.append(elt.id)
+            else:
+                var_names.append('_')  # Placeholder for unused variables
+
+        # Extract the source variable (e.g., 'x' from 'x.shape')
+        if isinstance(node.value.value, ast.Name):
+            source_var = node.value.value.id
+            attr_name = node.value.attr
+
+            # Only handle .shape attribute
+            if attr_name == 'shape':
+                # Create a TensorOp for each non-underscore variable
+                for idx, var_name in enumerate(var_names):
+                    if var_name != '_':  # Skip underscore placeholders
+                        # Use the variable name directly as the TensorOp name
+                        # This ensures the generated code uses the correct variable names
+                        tensorop_param = {
+                            "name": var_name,
+                            "tns_type": "shape_dim",
+                            "layers_of_tensors": [source_var],  # Source variable
+                            "reduce_dim": idx  # Dimension index
+                        }
+                        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+                        self.buml_model.add_tensor_op(tns_obj)
+
+                        # Track the output variable
+                        self.module_of_output[var_name] = var_name
+                        print(f"[DEBUG] Shape dimension TensorOp: {var_name} = tf.shape({source_var})[{idx}] (op: {var_name})")
+
     def handle_forward_slicing(self, node: ast.Assign):
         """
         It handles rnn slicing calls such as 'x = x[:, -1, :]' or 'h = h[-1]'
@@ -1288,9 +1333,21 @@ class ASTParserTorch(ASTParser):
             tensorop_param = {"tns_type": op_type,
                               "transpose_dim": transpose_dim}
         elif op_type == "reshape":
-            reshape_dim = [op_args[0].value, op_args[1].value]
+            # Handle variable number of arguments (e.g., b*t, 32 or b, t, 16)
+            reshape_dim = [self.param_value(arg) for arg in op_args]
+            # Track which variable this operation is called on (e.g., x.reshape())
+            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+            if source_var and source_var in self.module_of_output:
+                source_layers = [self.module_of_output[source_var]]
+            elif source_var:
+                # Variable not in module_of_output means it's the original network input
+                source_layers = ['INPUT']
+            else:
+                source_layers = None
             tensorop_param = {"tns_type": op_type,
                               "reshape_dim": reshape_dim}
+            if source_layers:
+                tensorop_param["layers_of_tensors"] = source_layers
         elif op_type == "mean":
             # Extract the dim parameter from keywords
             reduce_dim = None
