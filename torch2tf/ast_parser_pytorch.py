@@ -987,7 +987,6 @@ class ASTParserTorch(ASTParser):
 
         tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
         self.buml_model.add_tensor_op(tns_obj)
-        self.buml_model.modules.append(tns_obj)
         self.tensor_op_counter += 1
 
         # Track the output variable
