@@ -1471,7 +1471,12 @@ class ASTParserTorch(ASTParser):
                     hasattr(source_layer, 'bidirectional') and source_layer.bidirectional and
                     hasattr(source_layer, 'return_type') and source_layer.return_type == 'hidden'):
                     # This exact pattern is handled by bidirectional unpacking
-                    print(f"[DEBUG] Skipping h[-2], h[-1] concat - handled by bidirectional unpacking of {source_layer_name}")
+                    # Track the output variable to point to the source layer
+                    output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
+                    if output_var:
+                        self.module_of_output[output_var] = source_layer_name
+                        print(f"[DEBUG] Skipping h[-2], h[-1] concat - handled by bidirectional unpacking of {source_layer_name}")
+                        print(f"[DEBUG] Mapped {output_var} -> {source_layer_name} (bidirectional concat output)")
                     return None
 
         # Determine if each variable is output or hidden for RNNs with return_type="both"
