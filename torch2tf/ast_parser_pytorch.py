@@ -1396,11 +1396,17 @@ class ASTParserTorch(ASTParser):
         ops_args = node.value.args[0].elts
         tensorop_param = None
         if isinstance(ops_args[0], ast.Subscript):
-            prev_lyr_name = self.previous_assign.value.func.attr
-            lyr_obj = next((obj for obj in self.buml_model.layers if
-                            obj.name == prev_lyr_name), None)
-            if lyr_obj:
-                lyr_obj.return_type =  "hidden"
+            # Check if previous_assign exists and has expected structure before accessing
+            if (self.previous_assign and
+                hasattr(self.previous_assign, 'value') and
+                isinstance(self.previous_assign.value, ast.Call) and
+                hasattr(self.previous_assign.value, 'func') and
+                hasattr(self.previous_assign.value.func, 'attr')):
+                prev_lyr_name = self.previous_assign.value.func.attr
+                lyr_obj = next((obj for obj in self.buml_model.layers if
+                                obj.name == prev_lyr_name), None)
+                if lyr_obj:
+                    lyr_obj.return_type =  "hidden"
 
         # Extract variable names - handle both simple names and method calls
         def extract_var_name_and_create_op(arg):
@@ -1439,6 +1445,34 @@ class ASTParserTorch(ASTParser):
         print(f"DEBUG concat: module_of_output keys = {list(self.module_of_output.keys())}")
         layers_of_tensors = [self.module_of_output[actual_var] for actual_var in actual_vars]
         cat_dim = self.param_value(node.value.keywords[0].value)
+
+        # Check if this is torch.cat([h[-2], h[-1]], dim=1) pattern for bidirectional RNN
+        # Only skip if subscripts are specifically -2 and -1 (last layer forward/backward)
+        if (len(ops_args) == 2 and
+            all(isinstance(arg, ast.Subscript) for arg in ops_args) and
+            len(set(layers_of_tensors)) == 1):  # All from same source layer
+            # Extract subscript indices
+            indices = []
+            for arg in ops_args:
+                if isinstance(arg.slice, ast.UnaryOp) and isinstance(arg.slice.op, ast.USub):
+                    # Negative index like -2, -1
+                    indices.append(-arg.slice.operand.value)
+                elif isinstance(arg.slice, ast.Constant):
+                    indices.append(arg.slice.value)
+                else:
+                    indices = None
+                    break
+
+            # Check if indices are -2 and -1 (in any order)
+            if indices and set(indices) == {-2, -1}:
+                source_layer_name = layers_of_tensors[0]
+                source_layer = next((obj for obj in self.buml_model.layers if obj.name == source_layer_name), None)
+                if (source_layer and
+                    hasattr(source_layer, 'bidirectional') and source_layer.bidirectional and
+                    hasattr(source_layer, 'return_type') and source_layer.return_type == 'hidden'):
+                    # This exact pattern is handled by bidirectional unpacking
+                    print(f"[DEBUG] Skipping h[-2], h[-1] concat - handled by bidirectional unpacking of {source_layer_name}")
+                    return None
 
         # Determine if each variable is output or hidden for RNNs with return_type="both"
         var_types = []
