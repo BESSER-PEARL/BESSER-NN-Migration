@@ -193,24 +193,16 @@ def param_to_list(lyr_type: str, lyr_params: dict, params_to_convert: list,
         None
     """
 
-    # DEBUG: Log when processing adaptive pooling layers
-    if "AdaptiveMaxPool" in lyr_type or "AdaptiveAvgPool" in lyr_type:
-        print(f"[DEBUG] param_to_list called for: {lyr_type}")
-        print(f"[DEBUG] lyr_params: {lyr_params}")
-        print(f"[DEBUG] params_to_convert: {params_to_convert}")
-        print(f"[DEBUG] lyr_type in layers_of_params: {lyr_type in layers_of_params}")
-
     if lyr_type in layers_of_params:
         for param in lyr_params:
             if lyr_type.endswith("2d") or lyr_type.endswith("3d"):
-                if (param in ["kernel_size", "stride", "output_size"] and
+                if (param in ["kernel_size", "stride", "output_size", "dilation"] and
                     isinstance(lyr_params[param], int)):
                     dim = 2 if lyr_type.endswith("2d") else 3
                     lyr_params[param] = [lyr_params[param]] * dim
             else:
                 if (param in params_to_convert and
                     isinstance(lyr_params[param], int)):
-                    print(f"[DEBUG] Converting {param}: {lyr_params[param]} -> [{lyr_params[param]}]")
                     lyr_params[param] = [lyr_params[param]]
 
 

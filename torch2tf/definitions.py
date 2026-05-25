@@ -42,6 +42,7 @@ params_mapping = {
     "in_channels": "in_channels", "out_channels": "out_channels",
     "kernel_size": "kernel_dim", "stride": "stride_dim",
     "padding": "padding_amount", "output_size": "output_dim",
+    "dilation": "dilation", "groups": "groups", "bias": "bias",
     "input_size": "input_size", "hidden_size": "hidden_size",
     "bidirectional": "bidirectional", "dropout": "dropout",
     "batch_first": "batch_first", "normalized_shape": "normalized_shape",
@@ -99,7 +100,7 @@ pos_params = {"Linear": ["in_features", "out_features"],
               "BatchNorm": ["num_features"]}
 
 
-int2list_params = ["kernel_size", "stride", "output_size", "normalized_shape"]
+int2list_params = ["kernel_size", "stride", "output_size", "normalized_shape", "dilation"]
 lyrs_of_int2list_params = ["Conv1d", "Conv2d", "Conv3d", "MaxPool1d",
                            "AvgPool1d", "MaxPool2d", "AvgPool2d", 
                            "MaxPool3d", "AvgPool3d", "LayerNorm",

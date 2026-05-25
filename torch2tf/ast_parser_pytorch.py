@@ -97,13 +97,11 @@ class ASTParserTorch(ASTParser):
         resolved_var = source_var
         while resolved_var in self.variable_aliases:
             resolved_var = self.variable_aliases[resolved_var]
-            print(f"[DEBUG] Resolved alias: {source_var} -> {resolved_var}")
 
         # Get the source module that produced the variable
         # If it's the input variable 'x', use 'x' as a special marker
         source_module = self.module_of_output.get(resolved_var, resolved_var)
 
-        print(f"[DEBUG] Creating subscript TensorOp: {op_name}, source={source_module}, pattern={subscript_pattern}")
 
         subscript_op = mm_classes.TensorOp(
             name=op_name,
@@ -116,7 +114,6 @@ class ASTParserTorch(ASTParser):
         self.inputs_outputs[op_name] = [resolved_var, output_var]
         self.module_of_output[output_var] = op_name
 
-        print(f"[DEBUG] Subscript TensorOp created: {op_name} -> {output_var}")
 
     def handle_subscript_operation(self, subscript_node: ast.Subscript, temp_name: str, node: ast.Assign):
         """
@@ -139,7 +136,6 @@ class ASTParserTorch(ASTParser):
             src_layer = next((obj for obj in self.buml_model.layers if obj.name == src_module), None)
             if src_layer and hasattr(src_layer, 'return_type'):
                 is_rnn_subscript = True
-                print(f"[DEBUG] RNN subscript detected: {subscripted_var} from {src_module}")
 
         # Create temp assignment node
         temp_target = ast.Name(id=temp_name, ctx=ast.Store())
@@ -149,11 +145,9 @@ class ASTParserTorch(ASTParser):
 
         if is_rnn_subscript:
             # RNN slicing: process with handle_forward_slicing to set return_type
-            print(f"[DEBUG] Processing RNN subscript: {subscripted_var}")
             self.handle_forward_slicing(subscript_assign)
         else:
             # Non-RNN slicing: create subscript TensorOp for general slicing
-            print(f"[DEBUG] Processing non-RNN subscript as slicing op: {subscripted_var}")
             subscript_pattern = self.extract_subscript_pattern(subscript_node)
             self.create_subscript_tensorop(subscripted_var, subscript_pattern, temp_name)
 
@@ -571,7 +565,6 @@ class ASTParserTorch(ASTParser):
                 # 1. We're not in a nested call scenario (activation should be standalone)
                 # 2. The previous assign was a simple layer call
                 should_merge = not (hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer)
-                print(f"[DEBUG] Activation {module_name}: should_merge={should_merge}, is_nested={hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer}")
 
                 if should_merge and self.previous_assign and isinstance(self.previous_assign.value, ast.Call):
                     if (hasattr(self.previous_assign.value.func, 'attr')):
@@ -854,16 +847,13 @@ class ASTParserTorch(ASTParser):
         target_var = node.targets[0].id
         source_var = node.value.id
 
-        print(f"[DEBUG] Variable assignment: {target_var} = {source_var}")
 
         # If source is tracked in module_of_output, propagate it to target
         if source_var in self.module_of_output:
             self.module_of_output[target_var] = self.module_of_output[source_var]
-            print(f"[DEBUG] Propagated module tracking: {target_var} -> {self.module_of_output[source_var]}")
         else:
             # Source is not tracked, mark as network input with special marker
             self.module_of_output[target_var] = 'INPUT'
-            print(f"[DEBUG] Tracked as input variable: {target_var} = {source_var} -> INPUT")
 
         self.previous_assign = node
 
@@ -1038,7 +1028,6 @@ class ASTParserTorch(ASTParser):
 
                         # Track the output variable
                         self.module_of_output[var_name] = var_name
-                        print(f"[DEBUG] Shape dimension TensorOp: {var_name} = tf.shape({source_var})[{idx}] (op: {var_name})")
 
     def handle_forward_slicing(self, node: ast.Assign):
         """
@@ -1054,19 +1043,15 @@ class ASTParserTorch(ASTParser):
         # Get the variable being subscripted (e.g., 'h1' from 'h1[-1]')
         subscripted_var = node.value.value.id
         result_var = node.targets[0].id
-        print(f"[DEBUG] handle_forward_slicing: {result_var} = {subscripted_var}[...]")
 
         # Look up which module produced this variable
         if subscripted_var in self.module_of_output:
             prev_module_name = self.module_of_output[subscripted_var]
-            print(f"[DEBUG] Found module for {subscripted_var}: {prev_module_name}")
         else:
             # Fallback: assume previous_assign was the layer call
             if hasattr(self.previous_assign.value, 'func') and hasattr(self.previous_assign.value.func, 'attr'):
                 prev_module_name = self.previous_assign.value.func.attr
-                print(f"[DEBUG] Using fallback module: {prev_module_name}")
             else:
-                print(f"[DEBUG] Cannot determine module for subscript on '{subscripted_var}', returning early")
                 self.previous_assign = node
                 return
 
@@ -1082,8 +1067,6 @@ class ASTParserTorch(ASTParser):
         if not hasattr(lyr_obj, 'return_type'):
             # Not an RNN layer, create subscript TensorOp for general slicing
             result_var = node.targets[0].id
-            print(f"[DEBUG] Non-RNN layer detected in handle_forward_slicing: {prev_module_name}")
-            print(f"[DEBUG] Processing non-RNN subscript in handle_forward_slicing: {subscripted_var}")
             subscript_pattern = self.extract_subscript_pattern(node.value)
             self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
             self.previous_assign = node
@@ -1108,7 +1091,6 @@ class ASTParserTorch(ASTParser):
             # If the RNN already has return_sequences=True, create a subscript TensorOp instead
             if lyr_obj.return_type == "full":
                 # RNN returns full sequence, create subscript TensorOp to extract last timestep
-                print(f"[DEBUG] Creating subscript TensorOp for {result_var} = {subscripted_var}[:, -1, :]")
                 subscript_pattern = self.extract_subscript_pattern(node.value)
                 self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
                 self.previous_assign = node
@@ -1116,7 +1098,6 @@ class ASTParserTorch(ASTParser):
             # Don't overwrite "both" if it was already set from a previous slicing operation
             if lyr_obj.return_type != "both":
                 lyr_obj.return_type = "last"
-                print(f"[DEBUG] Set return_type='last' for {prev_module_name}")
         else:
             print(f"Warning: Unrecognized subscript pattern on '{subscripted_var}'")
 
@@ -1307,21 +1288,17 @@ class ASTParserTorch(ASTParser):
             target_var = first_elem.id if isinstance(first_elem, ast.Name) else "?"
         else:
             target_var = "?"
-        print(f"DEBUG extract_tensorop: processing {target_var} = ...")
 
         # Handle .values attribute accessor (e.g., x.max(dim=1).values)
         call_node = node.value
         if isinstance(node.value, ast.Attribute) and node.value.attr == 'values':
-            print(f"DEBUG: Found .values accessor, unwrapping to Call node")
             # Unwrap to get the underlying Call node
             call_node = node.value.value
 
         if not isinstance(call_node, ast.Call):
-            print(f"DEBUG: extract_tensorop called on non-Call node: {ast.dump(node.value)}")
             return
 
         op_type = call_node.func.attr
-        print(f"DEBUG: op_type = {op_type}")
         op_args = call_node.args
         tensorop_param = None
         if op_type == "permute":
@@ -1504,7 +1481,6 @@ class ASTParserTorch(ASTParser):
 
             if output_var:
                 self.module_of_output[output_var] = op_name
-                print(f"DEBUG: Added {output_var} -> {op_name} to module_of_output")
             # Note: inputs_outputs for tensorops handled differently - they use layers_of_tensors
 
 
@@ -1619,7 +1595,6 @@ class ASTParserTorch(ASTParser):
                 return None
             variables.append(var)
 
-        print(f"DEBUG concat args: {', '.join(f'var{i}={v}' for i, v in enumerate(variables))}")
 
         # Resolve aliases for all variables
         actual_vars = []
@@ -1627,8 +1602,6 @@ class ASTParserTorch(ASTParser):
             actual_var = var if var in self.module_of_output else self.variable_aliases.get(var, var)
             actual_vars.append(actual_var)
 
-        print(f"DEBUG concat: Looking for {', '.join(actual_vars)}")
-        print(f"DEBUG concat: module_of_output keys = {list(self.module_of_output.keys())}")
         layers_of_tensors = [self.module_of_output[actual_var] for actual_var in actual_vars]
         cat_dim = self.param_value(node.value.keywords[0].value)
 
@@ -1661,8 +1634,6 @@ class ASTParserTorch(ASTParser):
                     output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
                     if output_var:
                         self.module_of_output[output_var] = source_layer_name
-                        print(f"[DEBUG] Skipping h[-2], h[-1] concat - handled by bidirectional unpacking of {source_layer_name}")
-                        print(f"[DEBUG] Mapped {output_var} -> {source_layer_name} (bidirectional concat output)")
                     return None
 
         # Determine if each variable is output or hidden for RNNs with return_type="both"
