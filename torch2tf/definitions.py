@@ -20,7 +20,7 @@ layers_mapping = {
 
 actv_fun_mapping = {
     "ReLU": "relu", "LeakyReLU": "leaky_relu", "Sigmoid": "sigmoid",
-    "Softmax": "softmax", "Tanh": "tanh"
+    "Softmax": "softmax", "Tanh": "tanh", "GELU": "gelu"
 }
 
 functional_to_module_mapping = {
