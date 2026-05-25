@@ -313,3 +313,7 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
                 # Fallback to old behavior if indices not provided
                 lyr_obj.input_reused = True
                 lyr_obj.name_module_input = lyr_in_out
+        else:
+            # Input variable not in module_of_output means it's the original network input
+            lyr_obj.input_reused = True
+            lyr_obj.name_module_input = 'INPUT'

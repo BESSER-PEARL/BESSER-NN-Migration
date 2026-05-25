@@ -1057,7 +1057,16 @@ class ASTParserTorch(ASTParser):
                 # Only hidden was captured
                 lyr_obj.return_type = "hidden"
         elif isinstance(node.value.slice, ast.Tuple) and len(node.value.slice.elts) == 3:
-            # Pattern: out[:, -1, :] means extracting last timestep
+            # Pattern: out[:, -1, :] means extracting last timestep from sequence
+            # Check if this is extracting from an already-returned output
+            # If the RNN already has return_sequences=True, create a subscript TensorOp instead
+            if lyr_obj.return_type == "full":
+                # RNN returns full sequence, create subscript TensorOp to extract last timestep
+                print(f"[DEBUG] Creating subscript TensorOp for {result_var} = {subscripted_var}[:, -1, :]")
+                subscript_pattern = self.extract_subscript_pattern(node.value)
+                self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
+                self.previous_assign = node
+                return
             # Don't overwrite "both" if it was already set from a previous slicing operation
             if lyr_obj.return_type != "both":
                 lyr_obj.return_type = "last"
@@ -1293,7 +1302,13 @@ class ASTParserTorch(ASTParser):
                 return
             # Track which variable this operation is called on (e.g., x.mean())
             source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
-            source_layers = [self.module_of_output[source_var]] if source_var and source_var in self.module_of_output else None
+            if source_var and source_var in self.module_of_output:
+                source_layers = [self.module_of_output[source_var]]
+            elif source_var:
+                # Variable not in module_of_output means it's the original network input
+                source_layers = ['INPUT']
+            else:
+                source_layers = None
             tensorop_param = {"tns_type": "mean",
                               "reduce_dim": reduce_dim,
                               "layers_of_tensors": source_layers}
@@ -1308,7 +1323,13 @@ class ASTParserTorch(ASTParser):
                 return
             # Track which variable this operation is called on (e.g., x.max())
             source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
-            source_layers = [self.module_of_output[source_var]] if source_var and source_var in self.module_of_output else None
+            if source_var and source_var in self.module_of_output:
+                source_layers = [self.module_of_output[source_var]]
+            elif source_var:
+                # Variable not in module_of_output means it's the original network input
+                source_layers = ['INPUT']
+            else:
+                source_layers = None
             tensorop_param = {"tns_type": "max",
                               "reduce_dim": reduce_dim,
                               "layers_of_tensors": source_layers}
@@ -1397,29 +1418,31 @@ class ASTParserTorch(ASTParser):
             else:
                 return None
 
-        var1 = extract_var_name_and_create_op(ops_args[0])
-        var2 = extract_var_name_and_create_op(ops_args[1])
+        # Extract all variables (not just 2)
+        variables = []
+        for arg in ops_args:
+            var = extract_var_name_and_create_op(arg)
+            if var is None:
+                print(f"Warning: Cannot extract variable from concat argument")
+                return None
+            variables.append(var)
 
-        print(f"DEBUG concat args: var1={var1}, var2={var2}")
-        if var1 is None or var2 is None:
-            # Can't extract variable names - skip this concat
-            print(f"Warning: Cannot extract variables from concat operation (var1={var1}, var2={var2})")
-            return None
+        print(f"DEBUG concat args: {', '.join(f'var{i}={v}' for i, v in enumerate(variables))}")
 
-        # Resolve aliases - but only if the variable is not already in module_of_output
-        # (subscript temps are in both variable_aliases and module_of_output)
-        actual_var1 = var1 if var1 in self.module_of_output else self.variable_aliases.get(var1, var1)
-        actual_var2 = var2 if var2 in self.module_of_output else self.variable_aliases.get(var2, var2)
+        # Resolve aliases for all variables
+        actual_vars = []
+        for var in variables:
+            actual_var = var if var in self.module_of_output else self.variable_aliases.get(var, var)
+            actual_vars.append(actual_var)
 
-        print(f"DEBUG concat: Looking for {actual_var1} and {actual_var2}")
+        print(f"DEBUG concat: Looking for {', '.join(actual_vars)}")
         print(f"DEBUG concat: module_of_output keys = {list(self.module_of_output.keys())}")
-        layers_of_tensors = [self.module_of_output[actual_var1],
-                             self.module_of_output[actual_var2]]
+        layers_of_tensors = [self.module_of_output[actual_var] for actual_var in actual_vars]
         cat_dim = self.param_value(node.value.keywords[0].value)
 
         # Determine if each variable is output or hidden for RNNs with return_type="both"
         var_types = []
-        for lyr_name, actual_var in zip(layers_of_tensors, [actual_var1, actual_var2]):
+        for lyr_name, actual_var in zip(layers_of_tensors, actual_vars):
             if lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
                 var_types.append("hidden")
             elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
