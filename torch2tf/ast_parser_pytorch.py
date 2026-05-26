@@ -1047,25 +1047,25 @@ class ASTParserTorch(ASTParser):
         # Look up which module produced this variable
         if subscripted_var in self.module_of_output:
             prev_module_name = self.module_of_output[subscripted_var]
-        else:
-            # Fallback: assume previous_assign was the layer call
-            if hasattr(self.previous_assign.value, 'func') and hasattr(self.previous_assign.value.func, 'attr'):
-                prev_module_name = self.previous_assign.value.func.attr
+
+            # Try to find the layer object
+            lyr_obj = next((obj for obj in self.buml_model.layers if
+                            obj.name == prev_module_name), None)
+
+            # If layer found and is RNN, handle RNN-specific slicing
+            if lyr_obj and hasattr(lyr_obj, 'return_type'):
+                # RNN layer - continue with RNN-specific processing below
+                pass
             else:
+                # Not an RNN layer - create subscript TensorOp
+                result_var = node.targets[0].id
+                subscript_pattern = self.extract_subscript_pattern(node.value)
+                self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
                 self.previous_assign = node
                 return
-
-        lyr_obj = next((obj for obj in self.buml_model.layers if
-                        obj.name == prev_module_name), None)
-
-        if not lyr_obj:
-            print(f"Warning: Layer '{prev_module_name}' not found for slicing operation")
-            self.previous_assign = node
-            return
-
-        # Only process return_type for RNN layers
-        if not hasattr(lyr_obj, 'return_type'):
-            # Not an RNN layer, create subscript TensorOp for general slicing
+        else:
+            # Variable not in module_of_output - likely an input parameter or undefined
+            # Create subscript TensorOp (create_subscript_tensorop handles unknown vars)
             result_var = node.targets[0].id
             subscript_pattern = self.extract_subscript_pattern(node.value)
             self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
