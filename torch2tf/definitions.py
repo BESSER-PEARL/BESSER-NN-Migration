@@ -47,6 +47,9 @@ params_mapping = {
     "bidirectional": "bidirectional", "dropout": "dropout",
     "batch_first": "batch_first", "normalized_shape": "normalized_shape",
     "p": "rate", "num_features": "num_features",
+    "eps": "eps", "momentum": "momentum", "affine": "affine",
+    "elementwise_affine": "affine",  # LayerNorm uses elementwise_affine
+    "track_running_stats": "track_running_stats",
     "num_embeddings": "num_embeddings", "embedding_dim": "embedding_dim",
     "padding_idx": "padding_idx",
     "start_dim": "start_dim", "end_dim": "end_dim",
