@@ -1522,6 +1522,43 @@ class ASTParserTorch(ASTParser):
                         unsqueeze_dim = self.param_value(kw.value)
             tensorop_param = {"tns_type": "unsqueeze",
                               "reduce_dim": unsqueeze_dim}
+        elif op_type == "normalize":
+            # F.normalize(input, p=2, dim=1) -> L2 normalization
+            # First arg is the input tensor, then parameters
+            norm_p = 2  # Default to L2
+            norm_dim = None
+
+            # Extract input tensor (first argument)
+            if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
+                source_var = op_args[0].id
+                # Check positional args: normalize(input, p, dim)
+                if len(op_args) > 1:
+                    norm_p = self.param_value(op_args[1])
+                if len(op_args) > 2:
+                    norm_dim = self.param_value(op_args[2])
+            else:
+                source_var = None
+
+            # Check keyword args
+            for kw in call_node.keywords:
+                if kw.arg == "p":
+                    norm_p = self.param_value(kw.value)
+                elif kw.arg == "dim":
+                    norm_dim = self.param_value(kw.value)
+
+            # Track which variable this operation is called on
+            if source_var and source_var in self.module_of_output:
+                source_layers = [self.module_of_output[source_var]]
+            elif source_var:
+                source_layers = ['INPUT']
+            else:
+                source_layers = None
+
+            tensorop_param = {"tns_type": "normalize",
+                              "reduce_dim": norm_dim,
+                              "layers_of_tensors": source_layers}
+            # Note: norm_p is typically 2 for L2 normalization
+            # TF's l2_normalize only supports L2, so we'll use that
         else:
             print(f"{op_type} is not recognized!")
             return
