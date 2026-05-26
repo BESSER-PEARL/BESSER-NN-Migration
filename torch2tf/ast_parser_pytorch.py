@@ -1104,6 +1104,14 @@ class ASTParserTorch(ASTParser):
             if has_output and has_hidden:
                 # Both output and hidden were captured - need "both"
                 lyr_obj.return_type = "both"
+                # Mark that hidden state is the primary output since code explicitly extracted h[-1]
+                lyr_obj.use_hidden_as_output = True
+                # Update inputs_outputs to use hidden variable as primary output
+                if prev_module_name in self.rnn_hidden_vars:
+                    hidden_var = self.rnn_hidden_vars[prev_module_name]
+                    if prev_module_name in self.inputs_outputs:
+                        # Update the output variable (second element) to be the hidden variable
+                        self.inputs_outputs[prev_module_name][1] = hidden_var
             else:
                 # Only hidden was captured
                 lyr_obj.return_type = "hidden"
