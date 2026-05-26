@@ -47,8 +47,8 @@ class ASTParserTorch(ASTParser):
         self.multi_layer_rnns = {}
         # Track layer reuse count for creating unique reuse names
         self.layer_reuse_count = {}  # {layer_name: reuse_count}
-        # Track how many times each variable is used as input
-        self.variable_usage_count = {}  # {var_name: count}
+        # Track the output variable of the immediately previous layer
+        self.prev_layer_output = None  # str: variable name
 
     def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
         """
@@ -559,24 +559,23 @@ class ASTParserTorch(ASTParser):
             self.inputs_outputs[module_name] = [input_var, node.targets[0].id]
             self.module_of_output[node.targets[0].id] = module_name
 
-            # Track variable usage and mark layer if input is used multiple times
-            # This handles cases like: avg = self.avgpool(x); mx = self.maxpool(x)
-            if input_var in self.variable_usage_count:
-                # Variable has been used before - mark this layer to preserve input
-                self.variable_usage_count[input_var] += 1
-                module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
-                if module_obj:
+            # Detect when a layer uses a TensorOp output or a variable from earlier
+            # This handles parallel operations: avg = avgpool(x); mx = maxpool(x)
+            module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
+            if module_obj and input_var in self.module_of_output:
+                source_module = self.module_of_output[input_var]
+                # Mark layer if it uses a TensorOp output (likely parallel/branching operation)
+                if source_module.startswith("op_"):
                     module_obj.input_reused = True
-                    # Set name_module_input to ensure generator uses correct input
-                    # Look up which module produced this input variable
-                    if input_var in self.module_of_output:
-                        source_module = self.module_of_output[input_var]
-                        # Check if source is a TensorOp (has "op_" prefix)
-                        if source_module.startswith("op_"):
-                            module_obj.name_module_input = source_module
-            else:
-                # First use of this variable
-                self.variable_usage_count[input_var] = 1
+                    # Set name_module_input for parallel ops (when another layer is in between)
+                    if self.prev_layer_output and input_var != self.prev_layer_output:
+                        module_obj.name_module_input = source_module
+                # Also mark if input differs from prev output (uses earlier variable)
+                elif self.prev_layer_output and input_var != self.prev_layer_output:
+                    module_obj.input_reused = True
+
+            # Update prev_layer_output to this layer's output
+            self.prev_layer_output = node.targets[0].id
 
             # Check if input variable was saved for residual connection
             # If so, mark the layer to use a new output variable instead of reusing input
@@ -1022,6 +1021,9 @@ class ASTParserTorch(ASTParser):
         # Track the output variable
         output_var = node.targets[0].id
         self.module_of_output[output_var] = tensorop_param["name"]
+
+        # Update prev_layer_output for TensorOps
+        self.prev_layer_output = output_var
 
         # Mark source layers for residual connections
         # When we have x = a + b where a and b are from different layers,
