@@ -1224,9 +1224,9 @@ class ASTParserTorch(ASTParser):
                 return call_node.func.value.id
             return "x"
 
-        # Only handle squeeze/unsqueeze for now
+        # Only handle squeeze/unsqueeze/repeat for now
         # Layer calls (self.layer_name(...)) should be handled by the caller
-        if op_type not in ['squeeze', 'unsqueeze']:
+        if op_type not in ['squeeze', 'unsqueeze', 'repeat']:
             # If this is a layer call (base_var == 'self'), signal to caller
             if base_var == 'self':
                 return None  # Signal that this needs special handling
@@ -1234,15 +1234,6 @@ class ASTParserTorch(ASTParser):
 
         # Create intermediate variable name
         intermediate_var = f"_inline_{op_type}_{self.tensor_op_counter}"
-
-        # Extract dimension parameter
-        dim_value = None
-        if len(call_node.args) > 0:
-            dim_value = self.param_value(call_node.args[0])
-        else:
-            for kw in call_node.keywords:
-                if kw.arg == "dim":
-                    dim_value = self.param_value(kw.value)
 
         # Get the layer/module that produced the base variable
         base_layer = self.module_of_output.get(base_var)
@@ -1253,10 +1244,28 @@ class ASTParserTorch(ASTParser):
         # Create tensor operation with layers_of_tensors to track the source
         tensorop_param = {
             "tns_type": op_type,
-            "reduce_dim": dim_value,
             "layers_of_tensors": [base_layer],  # Track which layer this operates on
             "name": f"op_{self.tensor_op_counter}"
         }
+
+        # Extract parameters based on operation type
+        if op_type == 'repeat':
+            # repeat takes multiple arguments (one per dimension)
+            # e.g., .repeat(1, t, 1) means repeat 1x along dim0, t times along dim1, 1x along dim2
+            repeat_counts = []
+            for arg in call_node.args:
+                repeat_counts.append(self.param_value(arg))
+            tensorop_param["repeat_dim"] = repeat_counts
+        else:
+            # squeeze/unsqueeze take a single dimension parameter
+            dim_value = None
+            if len(call_node.args) > 0:
+                dim_value = self.param_value(call_node.args[0])
+            else:
+                for kw in call_node.keywords:
+                    if kw.arg == "dim":
+                        dim_value = self.param_value(kw.value)
+            tensorop_param["reduce_dim"] = dim_value
 
         tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
         self.buml_model.add_tensor_op(tns_obj)
@@ -1600,6 +1609,33 @@ class ASTParserTorch(ASTParser):
                 self.module_of_output[output_var] = layer_name
 
             return  # Don't create a TensorOp
+        elif op_type == "repeat":
+            # x.repeat(1, t, 1) -> repeats tensor along each dimension
+            # Extract repeat counts for each dimension, resolving variable references
+            repeat_counts = []
+            for arg in op_args:
+                if isinstance(arg, ast.Name):
+                    # Variable reference - resolve to operation name
+                    var_name = arg.id
+                    if var_name in self.module_of_output:
+                        repeat_counts.append(self.module_of_output[var_name])
+                    else:
+                        repeat_counts.append(var_name)
+                else:
+                    repeat_counts.append(self.param_value(arg))
+
+            # Track source variable
+            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+            if source_var and source_var in self.module_of_output:
+                source_layers = [self.module_of_output[source_var]]
+            elif source_var:
+                source_layers = ['INPUT']
+            else:
+                source_layers = None
+
+            tensorop_param = {"tns_type": "repeat",
+                              "repeat_dim": repeat_counts,
+                              "layers_of_tensors": source_layers}
         else:
             print(f"{op_type} is not recognized!")
             return
