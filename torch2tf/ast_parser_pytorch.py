@@ -47,6 +47,8 @@ class ASTParserTorch(ASTParser):
         self.multi_layer_rnns = {}
         # Track layer reuse count for creating unique reuse names
         self.layer_reuse_count = {}  # {layer_name: reuse_count}
+        # Track how many times each variable is used as input
+        self.variable_usage_count = {}  # {var_name: count}
 
     def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
         """
@@ -557,6 +559,25 @@ class ASTParserTorch(ASTParser):
             self.inputs_outputs[module_name] = [input_var, node.targets[0].id]
             self.module_of_output[node.targets[0].id] = module_name
 
+            # Track variable usage and mark layer if input is used multiple times
+            # This handles cases like: avg = self.avgpool(x); mx = self.maxpool(x)
+            if input_var in self.variable_usage_count:
+                # Variable has been used before - mark this layer to preserve input
+                self.variable_usage_count[input_var] += 1
+                module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
+                if module_obj:
+                    module_obj.input_reused = True
+                    # Set name_module_input to ensure generator uses correct input
+                    # Look up which module produced this input variable
+                    if input_var in self.module_of_output:
+                        source_module = self.module_of_output[input_var]
+                        # Check if source is a TensorOp (has "op_" prefix)
+                        if source_module.startswith("op_"):
+                            module_obj.name_module_input = source_module
+            else:
+                # First use of this variable
+                self.variable_usage_count[input_var] = 1
+
             # Check if input variable was saved for residual connection
             # If so, mark the layer to use a new output variable instead of reusing input
             if hasattr(self, '_variables_saved_for_residual') and input_var in self._variables_saved_for_residual:
@@ -1001,6 +1022,19 @@ class ASTParserTorch(ASTParser):
         # Track the output variable
         output_var = node.targets[0].id
         self.module_of_output[output_var] = tensorop_param["name"]
+
+        # Mark source layers for residual connections
+        # When we have x = a + b where a and b are from different layers,
+        # mark both source layers so their inputs are preserved
+        if tns_type == "binop_add" and isinstance(left_layer, str) and isinstance(right_layer, str):
+            # Find the layer objects for both operands
+            for layer_name in [left_layer, right_layer]:
+                if layer_name and not isinstance(layer_name, (int, float)):
+                    # Look up the layer that produced this output
+                    layer_obj = next((obj for obj in self.buml_model.layers if obj.name == layer_name), None)
+                    if layer_obj:
+                        # Mark that this layer's input should be preserved (residual connection)
+                        layer_obj.input_reused = True
 
     def handle_forward_shape_unpacking(self, node: ast.Assign):
         """
