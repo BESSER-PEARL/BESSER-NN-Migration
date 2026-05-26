@@ -1809,31 +1809,42 @@ class ASTParserTorch(ASTParser):
         cat_dim = self.param_value(node.value.keywords[0].value)
 
         # Check if this is torch.cat([h[-2], h[-1]], dim=1) pattern for bidirectional RNN
-        # Only skip if subscripts are specifically -2 and -1 (last layer forward/backward)
-        if (len(ops_args) == 2 and
-            all(isinstance(arg, ast.Subscript) for arg in ops_args) and
-            len(set(layers_of_tensors)) == 1):  # All from same source layer
-            # Extract subscript indices
-            indices = []
-            for arg in ops_args:
-                if isinstance(arg.slice, ast.UnaryOp) and isinstance(arg.slice.op, ast.USub):
-                    # Negative index like -2, -1
-                    indices.append(-arg.slice.operand.value)
-                elif isinstance(arg.slice, ast.Constant):
-                    indices.append(arg.slice.value)
-                else:
-                    indices = None
-                    break
+        # Handle both inline subscripts and variables from subscripts
+        if (len(ops_args) == 2 and len(set(layers_of_tensors)) == 1):  # Concatenating 2 things from same source
+            source_layer_name = layers_of_tensors[0]
+            source_layer = next((obj for obj in self.buml_model.layers if obj.name == source_layer_name), None)
 
-            # Check if indices are -2 and -1 (in any order)
-            if indices and set(indices) == {-2, -1}:
-                source_layer_name = layers_of_tensors[0]
-                source_layer = next((obj for obj in self.buml_model.layers if obj.name == source_layer_name), None)
-                if (source_layer and
-                    hasattr(source_layer, 'bidirectional') and source_layer.bidirectional and
-                    hasattr(source_layer, 'return_type') and source_layer.return_type == 'hidden'):
-                    # This exact pattern is handled by bidirectional unpacking
-                    # Track the output variable to point to the source layer
+            # Check if source is a bidirectional RNN returning hidden states
+            if (source_layer and
+                hasattr(source_layer, 'bidirectional') and source_layer.bidirectional and
+                hasattr(source_layer, 'return_type') and source_layer.return_type == 'hidden'):
+
+                # Case 1: Inline subscripts like torch.cat([h[-2], h[-1]])
+                if all(isinstance(arg, ast.Subscript) for arg in ops_args):
+                    # Extract subscript indices
+                    indices = []
+                    for arg in ops_args:
+                        if isinstance(arg.slice, ast.UnaryOp) and isinstance(arg.slice.op, ast.USub):
+                            indices.append(-arg.slice.operand.value)
+                        elif isinstance(arg.slice, ast.Constant):
+                            indices.append(arg.slice.value)
+                        else:
+                            indices = None
+                            break
+
+                    # Check if indices are -2 and -1 (in any order)
+                    if indices and set(indices) == {-2, -1}:
+                        output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
+                        if output_var:
+                            self.module_of_output[output_var] = source_layer_name
+                        return None
+
+                # Case 2: Variables from subscripts like torch.cat([h_forward, h_backward])
+                # If both variables point to the same bidirectional RNN, this is the forward/backward concat
+                # which is already handled by bidirectional unpacking
+                elif all(isinstance(arg, ast.Name) for arg in ops_args):
+                    # This is concatenating variables that came from the bidirectional RNN
+                    # Skip creating the TensorOp since bidirectional unpacking handles it
                     output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
                     if output_var:
                         self.module_of_output[output_var] = source_layer_name
