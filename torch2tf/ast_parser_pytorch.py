@@ -1559,6 +1559,47 @@ class ASTParserTorch(ASTParser):
                               "layers_of_tensors": source_layers}
             # Note: norm_p is typically 2 for L2 normalization
             # TF's l2_normalize only supports L2, so we'll use that
+        elif op_type == "flatten":
+            # x.flatten(start_dim=1) -> create FlattenLayer
+            # Extract start_dim and end_dim parameters
+            start_dim = 1  # Default
+            end_dim = -1   # Default
+
+            if len(op_args) > 0:
+                start_dim = self.param_value(op_args[0])
+            if len(op_args) > 1:
+                end_dim = self.param_value(op_args[1])
+
+            for kw in call_node.keywords:
+                if kw.arg == "start_dim":
+                    start_dim = self.param_value(kw.value)
+                elif kw.arg == "end_dim":
+                    end_dim = self.param_value(kw.value)
+
+            # Track source variable
+            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+            name_module_input = self.module_of_output.get(source_var, source_var)
+
+            # Create FlattenLayer
+            layer_name = f"flatten_{self.tensor_op_counter}"
+            self.tensor_op_counter += 1
+
+            flatten_params = {
+                "name": layer_name,
+                "start_dim": start_dim,
+                "end_dim": end_dim,
+                "name_module_input": name_module_input
+            }
+
+            flatten_layer = getattr(mm_classes, "FlattenLayer")(**flatten_params)
+            self.buml_model.add_layer(flatten_layer)
+
+            # Track output variable
+            if isinstance(node.targets[0], ast.Name):
+                output_var = node.targets[0].id
+                self.module_of_output[output_var] = layer_name
+
+            return  # Don't create a TensorOp
         else:
             print(f"{op_type} is not recognized!")
             return
