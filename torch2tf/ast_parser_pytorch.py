@@ -1323,9 +1323,51 @@ class ASTParserTorch(ASTParser):
             tensorop_param = {"tns_type": op_type,
                               "transpose_dim": transpose_dim,
                               "layers_of_tensors": source_layers}
-        elif op_type == "reshape":
+        elif op_type == "reshape" or op_type == "view":
             # Handle variable number of arguments (e.g., b*t, 32 or b, t, 16)
-            reshape_dim = [self.param_value(arg) for arg in op_args]
+            # view() is the same as reshape() in PyTorch
+            # For nested calls like x.view(x.size(0), -1), the nested call may have been
+            # processed already by the general nested call handling, creating a temp variable
+            reshape_dim = []
+            for arg in op_args:
+                if isinstance(arg, ast.Call) and hasattr(arg.func, 'attr') and arg.func.attr == 'size':
+                    # This is a nested x.size(dim) call - extract it as a separate operation
+                    if len(arg.args) > 0:
+                        dim_idx = self.param_value(arg.args[0])
+                        source_var = arg.func.value.id if isinstance(arg.func.value, ast.Name) else None
+                        if source_var and source_var in self.module_of_output:
+                            source_layers = [self.module_of_output[source_var]]
+                        elif source_var:
+                            source_layers = ['INPUT']
+                        else:
+                            source_layers = None
+
+                        # Create the shape_dim tensor operation
+                        op_name = f"op_{self.tensor_op_counter}"
+                        shape_tensorop_param = {"tns_type": "shape_dim",
+                                                "reduce_dim": dim_idx,
+                                                "layers_of_tensors": source_layers,
+                                                "name": op_name}
+                        tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+                        self.buml_model.add_tensor_op(tns_obj)
+                        self.tensor_op_counter += 1
+                        # Use the operation name in reshape_dim - it will be resolved to variable by generator
+                        reshape_dim.append(op_name)
+                    else:
+                        reshape_dim.append(self.param_value(arg))
+                elif isinstance(arg, ast.Name) and arg.id in self.module_of_output:
+                    # This might be a temp variable from nested call handling
+                    # Check if it refers to a tensor operation
+                    layer_name = self.module_of_output[arg.id]
+                    # Check if this is a tensor operation (would have _op suffix in modules_details)
+                    if layer_name.startswith('op_'):
+                        # This is a tensor operation - use its name directly
+                        reshape_dim.append(layer_name)
+                    else:
+                        reshape_dim.append(self.param_value(arg))
+                else:
+                    reshape_dim.append(self.param_value(arg))
+
             # Track which variable this operation is called on (e.g., x.reshape())
             source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
             if source_var and source_var in self.module_of_output:
@@ -1335,10 +1377,32 @@ class ASTParserTorch(ASTParser):
                 source_layers = ['INPUT']
             else:
                 source_layers = None
-            tensorop_param = {"tns_type": op_type,
+            tensorop_param = {"tns_type": "reshape",  # Normalize to "reshape"
                               "reshape_dim": reshape_dim}
             if source_layers:
                 tensorop_param["layers_of_tensors"] = source_layers
+        elif op_type == "size":
+            # x.size(0) -> tf.shape(x)[0]
+            # Get the dimension argument
+            if len(op_args) > 0:
+                dim_idx = self.param_value(op_args[0])
+            else:
+                # size() without args returns full shape - not commonly used in assignments
+                print(f"Warning: size() without dimension argument - not fully supported")
+                return
+
+            # Track which variable this operation is called on
+            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+            if source_var and source_var in self.module_of_output:
+                source_layers = [self.module_of_output[source_var]]
+            elif source_var:
+                source_layers = ['INPUT']
+            else:
+                source_layers = None
+
+            tensorop_param = {"tns_type": "shape_dim",
+                              "reduce_dim": dim_idx,  # Use reduce_dim for consistency with existing code
+                              "layers_of_tensors": source_layers}
         elif op_type == "mean":
             # Extract the dim parameter from keywords
             reduce_dim = None
