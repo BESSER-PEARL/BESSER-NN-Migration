@@ -1029,6 +1029,11 @@ class ASTParserTorch(ASTParser):
 
             # Only handle .shape attribute
             if attr_name == 'shape':
+                # Resolve source variable to its producing module
+                # If source_var is in module_of_output, use that module as the source
+                # Otherwise, use source_var directly (will be treated as INPUT by generator)
+                source_module = self.module_of_output.get(source_var, source_var)
+
                 # Create a TensorOp for each non-underscore variable
                 for idx, var_name in enumerate(var_names):
                     if var_name != '_':  # Skip underscore placeholders
@@ -1037,7 +1042,7 @@ class ASTParserTorch(ASTParser):
                         tensorop_param = {
                             "name": var_name,
                             "tns_type": "shape_dim",
-                            "layers_of_tensors": [source_var],  # Source variable
+                            "layers_of_tensors": [source_module],  # Resolved source module
                             "reduce_dim": idx  # Dimension index
                         }
                         tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
