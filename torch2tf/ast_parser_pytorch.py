@@ -1988,8 +1988,10 @@ def process_params(lyr_type: str, lyr_params: dict):
     for param in lyr_params:
         if param in params_mapping:
             updated_lyr_params[params_mapping[param]] = lyr_params[param]
-        elif param in ["actv_func", "name"]:
-            updated_lyr_params[param] = lyr_params[param]
+        elif param in ["actv_func", "name", "inplace"]:
+            # Ignored parameters: actv_func/name handled separately, inplace not needed in TF
+            if param in ["actv_func", "name"]:
+                updated_lyr_params[param] = lyr_params[param]
         else:
             print(f"parameter {param} of layer {lyr_type} is not found!")
 
