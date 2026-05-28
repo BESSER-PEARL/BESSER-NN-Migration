@@ -50,6 +50,42 @@ class ASTParserTorch(ASTParser):
         # Track the output variable of the immediately previous layer
         self.prev_layer_output = None  # str: variable name
         # Note: migration_warnings inherited from base ASTParser class
+        # Performance optimization: O(1) lookup dicts instead of O(n) searches
+        self.layer_by_name = {}  # {layer_name: layer_obj}
+        self.module_by_name = {}  # {module_name: module_obj}
+
+    def _add_layer_with_tracking(self, layer_obj):
+        """Add layer to model and update lookup dict for O(1) access."""
+        self.buml_model.add_layer(layer_obj)
+        if hasattr(layer_obj, 'name'):
+            self.layer_by_name[layer_obj.name] = layer_obj
+            self.module_by_name[layer_obj.name] = layer_obj
+
+    def _add_module_with_tracking(self, module_obj):
+        """Add module to model and update lookup dict for O(1) access."""
+        self.buml_model.modules.append(module_obj)
+        if hasattr(module_obj, 'name'):
+            self.module_by_name[module_obj.name] = module_obj
+
+    def _get_layer_by_name(self, layer_name):
+        """Get layer by name using O(1) lookup, fallback to linear search if not in dict."""
+        if layer_name in self.layer_by_name:
+            return self.layer_by_name[layer_name]
+        # Fallback to linear search and update dict (for layers added before tracking)
+        layer_obj = next((obj for obj in self.buml_model.layers if obj.name == layer_name), None)
+        if layer_obj:
+            self.layer_by_name[layer_name] = layer_obj
+        return layer_obj
+
+    def _get_module_by_name(self, module_name):
+        """Get module by name using O(1) lookup, fallback to linear search if not in dict."""
+        if module_name in self.module_by_name:
+            return self.module_by_name[module_name]
+        # Fallback to linear search and update dict (for modules added before tracking)
+        module_obj = next((obj for obj in self.buml_model.modules if obj.name == module_name), None)
+        if module_obj:
+            self.module_by_name[module_name] = module_obj
+        return module_obj
 
     def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
         """
@@ -136,7 +172,7 @@ class ASTParserTorch(ASTParser):
         is_rnn_subscript = False
         if subscripted_var and subscripted_var in self.module_of_output:
             src_module = self.module_of_output[subscripted_var]
-            src_layer = next((obj for obj in self.buml_model.layers if obj.name == src_module), None)
+            src_layer = self._get_layer_by_name(src_module)
             if src_layer and hasattr(src_layer, 'return_type'):
                 is_rnn_subscript = True
 
@@ -500,8 +536,7 @@ class ASTParserTorch(ASTParser):
                     # Check if previous module is a TensorOp
                     if input_var in self.module_of_output:
                         prev_lyr_name = self.module_of_output[input_var]
-                        prev_lyr_obj = next((obj for obj in self.buml_model.modules if
-                                           obj.name == prev_lyr_name), None)
+                        prev_lyr_obj = self._get_module_by_name(prev_lyr_name)
                         prev_cls = prev_lyr_obj.__class__.__name__ if prev_lyr_obj else "None"
                         if prev_lyr_obj and prev_cls == "TensorOp":
                             prev_is_tensorop = True
@@ -587,7 +622,7 @@ class ASTParserTorch(ASTParser):
 
             # Detect when a layer uses a TensorOp output or a variable from earlier
             # This handles parallel operations: avg = avgpool(x); mx = maxpool(x)
-            module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
+            module_obj = self._get_layer_by_name(module_name)
             if module_obj and input_var in self.module_of_output:
                 source_module = self.module_of_output[input_var]
                 # Mark layer if it uses a TensorOp output (likely parallel/branching operation)
@@ -607,7 +642,7 @@ class ASTParserTorch(ASTParser):
             # If so, mark the layer to use a new output variable instead of reusing input
             if hasattr(self, '_variables_saved_for_residual') and input_var in self._variables_saved_for_residual:
                 # Find the layer object and mark it
-                module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
+                module_obj = self._get_layer_by_name(module_name)
                 if module_obj:
                     module_obj.input_reused = True
                 # Remove from set since we've handled this case
@@ -625,8 +660,7 @@ class ASTParserTorch(ASTParser):
                 if should_merge and self.previous_assign and isinstance(self.previous_assign.value, ast.Call):
                     if (hasattr(self.previous_assign.value.func, 'attr')):
                         prev_lyr_name = self.previous_assign.value.func.attr
-                        prev_lyr_obj = next((obj for obj in self.buml_model.modules if
-                                             obj.name == prev_lyr_name), None)
+                        prev_lyr_obj = self._get_module_by_name(prev_lyr_name)
                         if prev_lyr_obj:
                             actv = self.activation_functions[module_name]
                             actv_func = actv_fun_mapping.get(actv)
@@ -765,7 +799,7 @@ class ASTParserTorch(ASTParser):
                     first_is_underscore = isinstance(first_elem, ast.Name) and first_elem.id == "_"
                     second_is_underscore = isinstance(second_elem, ast.Name) and second_elem.id == "_"
 
-                    lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == layer_name), None)
+                    lyr_obj = self._get_layer_by_name(layer_name)
 
                     if first_is_underscore and not second_is_underscore:
                         rnn_out = node.targets[0].elts[1].id if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0].id
@@ -790,7 +824,7 @@ class ASTParserTorch(ASTParser):
                     self.inputs_outputs[layer_name] = [current_input, output_var]
                     self.module_of_output[output_var] = layer_name
 
-                    lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == layer_name), None)
+                    lyr_obj = self._get_layer_by_name(layer_name)
                     if lyr_obj:
                         self.buml_model.modules.append(lyr_obj)
 
@@ -801,7 +835,7 @@ class ASTParserTorch(ASTParser):
                 self.module_of_output[temp_var] = layer_name
 
                 # Add layer to modules
-                module_obj = next((obj for obj in self.buml_model.layers if obj.name == layer_name), None)
+                module_obj = self._get_layer_by_name(layer_name)
                 if module_obj:
                     self.buml_model.modules.append(module_obj)
 
@@ -1080,7 +1114,7 @@ class ASTParserTorch(ASTParser):
             for layer_name in [left_layer, right_layer]:
                 if layer_name and not isinstance(layer_name, (int, float)):
                     # Look up the layer that produced this output
-                    layer_obj = next((obj for obj in self.buml_model.layers if obj.name == layer_name), None)
+                    layer_obj = self._get_layer_by_name(layer_name)
                     if layer_obj:
                         # Mark that this layer's input should be preserved (residual connection)
                         layer_obj.input_reused = True
@@ -1950,7 +1984,7 @@ class ASTParserTorch(ASTParser):
         # Handle both inline subscripts and variables from subscripts
         if (len(ops_args) == 2 and len(set(layers_of_tensors)) == 1):  # Concatenating 2 things from same source
             source_layer_name = layers_of_tensors[0]
-            source_layer = next((obj for obj in self.buml_model.layers if obj.name == source_layer_name), None)
+            source_layer = self._get_layer_by_name(source_layer_name)
 
             # Check if source is a bidirectional RNN returning hidden states
             if (source_layer and
