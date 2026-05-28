@@ -1827,6 +1827,126 @@ class ASTParserTorch(ASTParser):
             self._create_and_track_tensorop(tensorop_param, call_node, node)
 
 
+    def _extract_concat_arg_variable(self, arg, node):
+        """Extract variable name from concatenation argument, handling layer calls and inline ops."""
+        if isinstance(arg, ast.Name):
+            return arg.id
+        elif isinstance(arg, ast.Call):
+            # Check if it's a layer call (self.layer_name(...))
+            if (isinstance(arg.func, ast.Attribute) and
+                isinstance(arg.func.value, ast.Name) and
+                arg.func.value.id == 'self'):
+                layer_name = arg.func.attr
+                layer_obj = next((lyr for lyr in self.buml_model.layers if lyr.name == layer_name), None)
+
+                if layer_obj:
+                    # Handle layer reuse
+                    if layer_obj in self.buml_model.modules:
+                        self.layer_reuse_count[layer_name] = self.layer_reuse_count.get(layer_name, 0) + 1
+                        use_count = self.layer_reuse_count[layer_name]
+
+                        import copy
+                        reuse_layer = copy.copy(layer_obj)
+                        reuse_layer.name = f"{layer_name}_use_{use_count}"
+                        reuse_layer.input_reused = True
+
+                        if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+                            input_var = arg.args[0].id
+                            if input_var in self.module_of_output:
+                                reuse_layer.name_module_input = self.module_of_output[input_var]
+
+                        self.buml_model.modules.append(reuse_layer)
+                        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
+                        self.tensor_op_counter += 1
+                        self.module_of_output[temp_name] = reuse_layer.name
+                        return temp_name
+                    else:
+                        # First use
+                        if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+                            input_var = arg.args[0].id
+                            if input_var in self.module_of_output:
+                                layer_obj.name_module_input = self.module_of_output[input_var]
+                                layer_obj.input_reused = True
+
+                        self.buml_model.modules.append(layer_obj)
+                        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
+                        self.tensor_op_counter += 1
+                        self.module_of_output[temp_name] = layer_name
+                        return temp_name
+                else:
+                    self.migration_warnings.append(
+                        f"Concatenation operation: Layer '{layer_name}' referenced but not found in the model. Check if it was defined earlier."
+                    )
+                    return None
+            else:
+                # Method call like x.squeeze(1)
+                result = self.extract_inline_tensorop(arg, node)
+                if result is None:
+                    self.migration_warnings.append(
+                        f"Concatenation operation: Could not process inline operation '{ast.unparse(arg)}'. This argument will be skipped."
+                    )
+                    return None
+                return result
+        elif isinstance(arg, ast.Subscript):
+            temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
+            self.tensor_op_counter += 1
+            self.handle_subscript_operation(arg, temp_name, node)
+            return temp_name
+        else:
+            return None
+
+    def _check_bidirectional_rnn_concat(self, ops_args, layers_of_tensors, node):
+        """Check if this is a bidirectional RNN concatenation pattern and handle it."""
+        if not (len(ops_args) == 2 and len(set(layers_of_tensors)) == 1):
+            return False
+
+        source_layer_name = layers_of_tensors[0]
+        source_layer = self._get_layer_by_name(source_layer_name)
+
+        if not (source_layer and
+                hasattr(source_layer, 'bidirectional') and source_layer.bidirectional and
+                hasattr(source_layer, 'return_type') and source_layer.return_type == 'hidden'):
+            return False
+
+        # Case 1: Inline subscripts like torch.cat([h[-2], h[-1]])
+        if all(isinstance(arg, ast.Subscript) for arg in ops_args):
+            indices = []
+            for arg in ops_args:
+                if isinstance(arg.slice, ast.UnaryOp) and isinstance(arg.slice.op, ast.USub):
+                    indices.append(-arg.slice.operand.value)
+                elif isinstance(arg.slice, ast.Constant):
+                    indices.append(arg.slice.value)
+                else:
+                    indices = None
+                    break
+
+            if indices and set(indices) == {-2, -1}:
+                output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
+                if output_var:
+                    self.module_of_output[output_var] = source_layer_name
+                return True
+
+        # Case 2: Variables from subscripts
+        elif all(isinstance(arg, ast.Name) for arg in ops_args):
+            output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
+            if output_var:
+                self.module_of_output[output_var] = source_layer_name
+            return True
+
+        return False
+
+    def _determine_rnn_var_types(self, layers_of_tensors, actual_vars):
+        """Determine if each variable is output or hidden for RNNs with return_type='both'."""
+        var_types = []
+        for lyr_name, actual_var in zip(layers_of_tensors, actual_vars):
+            if lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
+                var_types.append("hidden")
+            elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
+                var_types.append("output")
+            else:
+                var_types.append("output")
+        return var_types
+
     def extract_tensorop_concatenate(self, node):
         """
         It extracts the concatenate tensorop information.
@@ -1839,104 +1959,23 @@ class ASTParserTorch(ASTParser):
             The tensorop parameters.
         """
         ops_args = node.value.args[0].elts
-        tensorop_param = None
+
+        # Update previous layer return_type if first arg is subscript
         if isinstance(ops_args[0], ast.Subscript):
-            # Check if previous_assign exists and has expected structure before accessing
             if (self.previous_assign and
                 hasattr(self.previous_assign, 'value') and
                 isinstance(self.previous_assign.value, ast.Call) and
                 hasattr(self.previous_assign.value, 'func') and
                 hasattr(self.previous_assign.value.func, 'attr')):
                 prev_lyr_name = self.previous_assign.value.func.attr
-                lyr_obj = next((obj for obj in self.buml_model.layers if
-                                obj.name == prev_lyr_name), None)
+                lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == prev_lyr_name), None)
                 if lyr_obj:
-                    lyr_obj.return_type =  "hidden"
+                    lyr_obj.return_type = "hidden"
 
-        # Extract variable names - handle both simple names and method calls
-        def extract_var_name_and_create_op(arg):
-            if isinstance(arg, ast.Name):
-                return arg.id
-            elif isinstance(arg, ast.Call):
-                # Check if it's a layer call (self.layer_name(...))
-                if (isinstance(arg.func, ast.Attribute) and
-                    isinstance(arg.func.value, ast.Name) and
-                    arg.func.value.id == 'self'):
-                    # Layer call - need to handle layer reuse properly
-                    layer_name = arg.func.attr
-
-                    # Find the layer in the BUML model's layers list
-                    layer_obj = next((lyr for lyr in self.buml_model.layers if lyr.name == layer_name), None)
-
-                    if layer_obj:
-                        # Check if this is a reuse (layer already in modules)
-                        if layer_obj in self.buml_model.modules:
-                            # Layer reuse - increment reuse count
-                            self.layer_reuse_count[layer_name] = self.layer_reuse_count.get(layer_name, 0) + 1
-                            use_count = self.layer_reuse_count[layer_name]
-
-                            # Create a synthetic layer reference for this specific use
-                            import copy
-                            reuse_layer = copy.copy(layer_obj)
-                            reuse_layer.name = f"{layer_name}_use_{use_count}"
-                            reuse_layer.input_reused = True  # Mark that input is shared with other layers
-
-                            # Track the input for this use
-                            if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
-                                input_var = arg.args[0].id
-                                if input_var in self.module_of_output:
-                                    reuse_layer.name_module_input = self.module_of_output[input_var]
-
-                            self.buml_model.modules.append(reuse_layer)
-
-                            # Create temp variable for this use
-                            temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
-                            self.tensor_op_counter += 1
-                            self.module_of_output[temp_name] = reuse_layer.name
-                            return temp_name
-                        else:
-                            # First use of this layer - also mark as input_reused if it will be reused
-                            # Track the input for this layer
-                            if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
-                                input_var = arg.args[0].id
-                                if input_var in self.module_of_output:
-                                    layer_obj.name_module_input = self.module_of_output[input_var]
-                                    layer_obj.input_reused = True  # Mark that input is shared
-
-                            self.buml_model.modules.append(layer_obj)
-
-                            # Create temp variable for the layer's output
-                            temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
-                            self.tensor_op_counter += 1
-                            self.module_of_output[temp_name] = layer_name
-                            return temp_name
-                    else:
-                        self.migration_warnings.append(
-                            f"Concatenation operation: Layer '{layer_name}' referenced but not found in the model. Check if it was defined earlier."
-                        )
-                        return None
-                else:
-                    # Method call like x.squeeze(1) - create the operation and return result var
-                    result = self.extract_inline_tensorop(arg, node)
-                    if result is None:
-                        self.migration_warnings.append(
-                            f"Concatenation operation: Could not process inline operation '{ast.unparse(arg)}'. This argument will be skipped."
-                        )
-                        return None
-                    return result
-            elif isinstance(arg, ast.Subscript):
-                # Subscript like h_n[-2] - create subscript TensorOp
-                temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
-                self.tensor_op_counter += 1
-                self.handle_subscript_operation(arg, temp_name, node)
-                return temp_name
-            else:
-                return None
-
-        # Extract all variables (not just 2)
+        # Extract all variables from concatenation arguments
         variables = []
         for arg in ops_args:
-            var = extract_var_name_and_create_op(arg)
+            var = self._extract_concat_arg_variable(arg, node)
             if var is None:
                 self.migration_warnings.append(
                     f"Line {node.lineno}: Cannot extract variable from concatenation argument. Make sure all concat arguments are valid variables or layer outputs."
@@ -1944,8 +1983,7 @@ class ASTParserTorch(ASTParser):
                 return None
             variables.append(var)
 
-
-        # Resolve aliases for all variables
+        # Resolve aliases
         actual_vars = []
         for var in variables:
             actual_var = var if var in self.module_of_output else self.variable_aliases.get(var, var)
@@ -1954,65 +1992,19 @@ class ASTParserTorch(ASTParser):
         layers_of_tensors = [self.module_of_output[actual_var] for actual_var in actual_vars]
         cat_dim = self.param_value(node.value.keywords[0].value)
 
-        # Check if this is torch.cat([h[-2], h[-1]], dim=1) pattern for bidirectional RNN
-        # Handle both inline subscripts and variables from subscripts
-        if (len(ops_args) == 2 and len(set(layers_of_tensors)) == 1):  # Concatenating 2 things from same source
-            source_layer_name = layers_of_tensors[0]
-            source_layer = self._get_layer_by_name(source_layer_name)
+        # Check for bidirectional RNN pattern
+        if self._check_bidirectional_rnn_concat(ops_args, layers_of_tensors, node):
+            return None
 
-            # Check if source is a bidirectional RNN returning hidden states
-            if (source_layer and
-                hasattr(source_layer, 'bidirectional') and source_layer.bidirectional and
-                hasattr(source_layer, 'return_type') and source_layer.return_type == 'hidden'):
+        # Determine var types for RNNs
+        var_types = self._determine_rnn_var_types(layers_of_tensors, actual_vars)
 
-                # Case 1: Inline subscripts like torch.cat([h[-2], h[-1]])
-                if all(isinstance(arg, ast.Subscript) for arg in ops_args):
-                    # Extract subscript indices
-                    indices = []
-                    for arg in ops_args:
-                        if isinstance(arg.slice, ast.UnaryOp) and isinstance(arg.slice.op, ast.USub):
-                            indices.append(-arg.slice.operand.value)
-                        elif isinstance(arg.slice, ast.Constant):
-                            indices.append(arg.slice.value)
-                        else:
-                            indices = None
-                            break
-
-                    # Check if indices are -2 and -1 (in any order)
-                    if indices and set(indices) == {-2, -1}:
-                        output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
-                        if output_var:
-                            self.module_of_output[output_var] = source_layer_name
-                        return None
-
-                # Case 2: Variables from subscripts like torch.cat([h_forward, h_backward])
-                # If both variables point to the same bidirectional RNN, this is the forward/backward concat
-                # which is already handled by bidirectional unpacking
-                elif all(isinstance(arg, ast.Name) for arg in ops_args):
-                    # This is concatenating variables that came from the bidirectional RNN
-                    # Skip creating the TensorOp since bidirectional unpacking handles it
-                    output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
-                    if output_var:
-                        self.module_of_output[output_var] = source_layer_name
-                    return None
-
-        # Determine if each variable is output or hidden for RNNs with return_type="both"
-        var_types = []
-        for lyr_name, actual_var in zip(layers_of_tensors, actual_vars):
-            if lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
-                var_types.append("hidden")
-            elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
-                var_types.append("output")
-            else:
-                var_types.append("output")  # Default
-
-        tensorop_param = {"tns_type": "concatenate",
-                          "layers_of_tensors": layers_of_tensors,
-                          "concatenate_dim": cat_dim,
-                          # Store which component (output/hidden) each refers to
-                          "actual_vars": var_types}
-
-        return tensorop_param
+        return {
+            "tns_type": "concatenate",
+            "layers_of_tensors": layers_of_tensors,
+            "concatenate_dim": cat_dim,
+            "actual_vars": var_types
+        }
 
 
     def extract_tensorop_permute(self, ops_args):
