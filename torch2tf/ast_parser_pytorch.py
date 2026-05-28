@@ -64,6 +64,26 @@ class ASTParserTorch(ASTParser):
         self.layer_by_name = {}  # {layer_name: layer_obj}
         self.module_by_name = {}  # {module_name: module_obj}
 
+        # Operation handler mapping for dispatch pattern
+        self._op_handlers = {
+            "permute": lambda cn, n, args: self.extract_tensorop_permute(args),
+            "cat": lambda cn, n, args: self.extract_tensorop_concatenate(n),
+            "mul": lambda cn, n, args: self._extract_op_multiply(cn, n, "mul"),
+            "matmul": lambda cn, n, args: self._extract_op_multiply(cn, n, "matmul"),
+            "transpose": lambda cn, n, args: self._extract_op_transpose(cn, args),
+            "reshape": lambda cn, n, args: self._extract_op_reshape(cn, n, args),
+            "view": lambda cn, n, args: self._extract_op_reshape(cn, n, args),
+            "size": lambda cn, n, args: self._extract_op_size(cn, n, args),
+            "mean": lambda cn, n, args: self._extract_op_mean(cn, n, args),
+            "max": lambda cn, n, args: self._extract_op_max(cn, n, args),
+            "amax": lambda cn, n, args: self._extract_op_amax(cn, n, args),
+            "squeeze": lambda cn, n, args: self._extract_op_squeeze(cn, args),
+            "unsqueeze": lambda cn, n, args: self._extract_op_unsqueeze(cn, args),
+            "normalize": lambda cn, n, args: self._extract_op_normalize(cn, args),
+            "flatten": lambda cn, n, args: self._extract_op_flatten(cn, n, args),
+            "repeat": lambda cn, n, args: self._extract_op_repeat(cn, args),
+        }
+
     def _add_layer_with_tracking(self, layer_obj):
         """Add layer to model and update lookup dict for O(1) access."""
         self.buml_model.add_layer(layer_obj)
@@ -1457,6 +1477,333 @@ class ASTParserTorch(ASTParser):
 
         return intermediate_var
 
+    def _create_and_track_tensorop(self, tensorop_param, call_node, node):
+        """
+        Create TensorOp object and track its output.
+
+        Parameters:
+            tensorop_param (dict): Parameters for TensorOp creation
+            call_node (ast.Call): The call node for source variable extraction
+            node (ast.Assign): The assignment node for output tracking
+
+        Returns:
+            None, but adds TensorOp to model and tracks output
+        """
+        op_name = f"op_{self.tensor_op_counter}"
+        tensorop_param["name"] = op_name
+        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        self.buml_model.add_tensor_op(tns_obj)
+        self.tensor_op_counter += 1
+
+        # Check if this tensorop's source variable was saved for residual connection
+        if isinstance(call_node.func, ast.Attribute) and isinstance(call_node.func.value, ast.Name):
+            source_var = call_node.func.value.id
+            if hasattr(self, '_variables_saved_for_residual') and source_var in self._variables_saved_for_residual:
+                tns_obj.input_reused = True
+                self._variables_saved_for_residual.discard(source_var)
+
+        # Track tensorop output - handle both simple and tuple assignments
+        if isinstance(node.targets[0], ast.Name):
+            output_var = node.targets[0].id
+        elif isinstance(node.targets[0], ast.Tuple):
+            first_elem = node.targets[0].elts[0]
+            output_var = first_elem.id if isinstance(first_elem, ast.Name) else None
+        else:
+            output_var = None
+
+        if output_var:
+            self.module_of_output[output_var] = op_name
+
+    def _extract_op_multiply(self, call_node, node, op_type):
+        """Extract mul/matmul operation parameters."""
+        op_args = call_node.args
+        if (not op_args or len(op_args) < 2 or
+            not isinstance(op_args[0], ast.Name) or not isinstance(op_args[1], ast.Name)):
+            self.migration_warnings.append(
+                f"Line {node.lineno}: The {op_type} operation has invalid arguments and will be skipped."
+            )
+            return None
+
+        left_var = op_args[0].id
+        right_var = op_args[1].id
+
+        if left_var not in self.module_of_output or right_var not in self.module_of_output:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Cannot find source variables for {op_type} operation. Make sure both operands are defined earlier in the code."
+            )
+            return None
+
+        layers_of_tensors = [self.module_of_output[left_var], self.module_of_output[right_var]]
+        return {"tns_type": op_type+"tiply", "layers_of_tensors": layers_of_tensors}
+
+    def _extract_op_transpose(self, call_node, op_args):
+        """Extract transpose operation parameters."""
+        transpose_dim = [op_args[i].value for i in range(len(op_args))]
+        source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+        return {"tns_type": "transpose", "transpose_dim": transpose_dim, "layers_of_tensors": source_layers}
+
+    def _extract_op_reshape(self, call_node, node, op_args):
+        """Extract reshape/view operation parameters."""
+        reshape_dim = []
+        for arg in op_args:
+            if isinstance(arg, ast.Call) and hasattr(arg.func, 'attr') and arg.func.attr == 'size':
+                if len(arg.args) > 0:
+                    dim_idx = self.param_value(arg.args[0])
+                    source_var = arg.func.value.id if isinstance(arg.func.value, ast.Name) else None
+                    if source_var and source_var in self.module_of_output:
+                        source_layers = [self.module_of_output[source_var]]
+                    elif source_var:
+                        source_layers = ['INPUT']
+                    else:
+                        source_layers = None
+
+                    op_name = f"op_{self.tensor_op_counter}"
+                    shape_tensorop_param = {"tns_type": "shape_dim", "reduce_dim": dim_idx,
+                                           "layers_of_tensors": source_layers, "name": op_name}
+                    tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+                    self.buml_model.add_tensor_op(tns_obj)
+                    self.tensor_op_counter += 1
+                    reshape_dim.append(op_name)
+                else:
+                    reshape_dim.append(self.param_value(arg))
+            elif isinstance(arg, ast.Name) and arg.id in self.module_of_output:
+                layer_name = self.module_of_output[arg.id]
+                if layer_name.startswith('op_'):
+                    reshape_dim.append(layer_name)
+                else:
+                    reshape_dim.append(self.param_value(arg))
+            else:
+                reshape_dim.append(self.param_value(arg))
+
+        source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+
+        tensorop_param = {"tns_type": "reshape", "reshape_dim": reshape_dim}
+        if source_layers:
+            tensorop_param["layers_of_tensors"] = source_layers
+        return tensorop_param
+
+    def _extract_op_size(self, call_node, node, op_args):
+        """Extract size operation parameters."""
+        if len(op_args) > 0:
+            dim_idx = self.param_value(op_args[0])
+        else:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: The size() operation without dimension argument is not fully supported. Specify a dimension for better results."
+            )
+            return None
+
+        source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+
+        return {"tns_type": "shape_dim", "reduce_dim": dim_idx, "layers_of_tensors": source_layers}
+
+    def _extract_op_mean(self, call_node, node, op_args):
+        """Extract mean operation parameters."""
+        reduce_dim = None
+        for kw in call_node.keywords:
+            if kw.arg == "dim":
+                reduce_dim = self.param_value(kw.value)
+        if reduce_dim is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: The mean operation requires a dim parameter. Please specify which dimension to reduce."
+            )
+            return None
+
+        if isinstance(call_node.func.value, ast.Name):
+            if call_node.func.value.id in ['torch', 'F', 'nn']:
+                source_var = op_args[0].id if len(op_args) > 0 and isinstance(op_args[0], ast.Name) else None
+            else:
+                source_var = call_node.func.value.id
+        else:
+            source_var = None
+
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+        return {"tns_type": "mean", "reduce_dim": reduce_dim, "layers_of_tensors": source_layers}
+
+    def _extract_op_max(self, call_node, node, op_args):
+        """Extract max operation parameters."""
+        reduce_dim = None
+        for kw in call_node.keywords:
+            if kw.arg == "dim":
+                reduce_dim = self.param_value(kw.value)
+        if reduce_dim is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: The max operation requires a dim parameter. Please specify which dimension to reduce."
+            )
+            return None
+
+        if isinstance(call_node.func.value, ast.Name):
+            if call_node.func.value.id in ['torch', 'F', 'nn']:
+                source_var = op_args[0].id if len(op_args) > 0 and isinstance(op_args[0], ast.Name) else None
+            else:
+                source_var = call_node.func.value.id
+        else:
+            source_var = None
+
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+        return {"tns_type": "max", "reduce_dim": reduce_dim, "layers_of_tensors": source_layers}
+
+    def _extract_op_amax(self, call_node, node, op_args):
+        """Extract amax operation parameters (same as max with dim)."""
+        reduce_dim = None
+        for kw in call_node.keywords:
+            if kw.arg == "dim":
+                reduce_dim = self.param_value(kw.value)
+        if reduce_dim is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: The amax operation requires a dim parameter. Please specify which dimension to reduce."
+            )
+            return None
+
+        if isinstance(call_node.func.value, ast.Name):
+            if call_node.func.value.id in ['torch', 'F', 'nn']:
+                source_var = op_args[0].id if len(op_args) > 0 and isinstance(op_args[0], ast.Name) else None
+            else:
+                source_var = call_node.func.value.id
+        else:
+            source_var = None
+
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+        return {"tns_type": "max", "reduce_dim": reduce_dim, "layers_of_tensors": source_layers}
+
+    def _extract_op_squeeze(self, call_node, op_args):
+        """Extract squeeze operation parameters."""
+        squeeze_dim = None
+        if len(op_args) > 0:
+            squeeze_dim = self.param_value(op_args[0])
+        else:
+            for kw in call_node.keywords:
+                if kw.arg == "dim":
+                    squeeze_dim = self.param_value(kw.value)
+        return {"tns_type": "squeeze", "reduce_dim": squeeze_dim}
+
+    def _extract_op_unsqueeze(self, call_node, op_args):
+        """Extract unsqueeze operation parameters."""
+        unsqueeze_dim = None
+        if len(op_args) > 0:
+            unsqueeze_dim = self.param_value(op_args[0])
+        else:
+            for kw in call_node.keywords:
+                if kw.arg == "dim":
+                    unsqueeze_dim = self.param_value(kw.value)
+        return {"tns_type": "unsqueeze", "reduce_dim": unsqueeze_dim}
+
+    def _extract_op_normalize(self, call_node, op_args):
+        """Extract normalize operation parameters."""
+        norm_dim = None
+        source_var = None
+
+        if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
+            source_var = op_args[0].id
+            if len(op_args) > 2:
+                norm_dim = self.param_value(op_args[2])
+
+        for kw in call_node.keywords:
+            if kw.arg == "dim":
+                norm_dim = self.param_value(kw.value)
+
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+
+        return {"tns_type": "normalize", "reduce_dim": norm_dim, "layers_of_tensors": source_layers}
+
+    def _extract_op_flatten(self, call_node, node, op_args):
+        """Extract flatten operation and create FlattenLayer (not a TensorOp)."""
+        start_dim = 1
+        end_dim = -1
+
+        if len(op_args) > 0:
+            start_dim = self.param_value(op_args[0])
+        if len(op_args) > 1:
+            end_dim = self.param_value(op_args[1])
+
+        for kw in call_node.keywords:
+            if kw.arg == "start_dim":
+                start_dim = self.param_value(kw.value)
+            elif kw.arg == "end_dim":
+                end_dim = self.param_value(kw.value)
+
+        source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+        name_module_input = self.module_of_output.get(source_var, source_var)
+
+        layer_name = f"flatten_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+
+        flatten_params = {
+            "name": layer_name,
+            "start_dim": start_dim,
+            "end_dim": end_dim,
+            "name_module_input": name_module_input
+        }
+
+        flatten_layer = getattr(mm_classes, "FlattenLayer")(**flatten_params)
+        self.buml_model.add_layer(flatten_layer)
+
+        if isinstance(node.targets[0], ast.Name):
+            output_var = node.targets[0].id
+            self.module_of_output[output_var] = layer_name
+
+        return "flatten_created"  # Special marker to skip TensorOp creation
+
+    def _extract_op_repeat(self, call_node, op_args):
+        """Extract repeat operation parameters."""
+        repeat_counts = []
+        for arg in op_args:
+            if isinstance(arg, ast.Name):
+                var_name = arg.id
+                if var_name in self.module_of_output:
+                    repeat_counts.append(self.module_of_output[var_name])
+                else:
+                    repeat_counts.append(var_name)
+            else:
+                repeat_counts.append(self.param_value(arg))
+
+        source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+
+        return {"tns_type": "repeat", "repeat_dim": repeat_counts, "layers_of_tensors": source_layers}
+
     def extract_tensorop(self, node: ast.Assign):
         """
         It extracts the tensorop name and its parameters.
@@ -1471,7 +1818,6 @@ class ASTParserTorch(ASTParser):
         # Handle .values attribute accessor (e.g., x.max(dim=1).values)
         call_node = node.value
         if isinstance(node.value, ast.Attribute) and node.value.attr == 'values':
-            # Unwrap to get the underlying Call node
             call_node = node.value.value
 
         if not isinstance(call_node, ast.Call):
@@ -1486,387 +1832,24 @@ class ASTParserTorch(ASTParser):
 
         op_type = call_node.func.attr
         op_args = call_node.args
-        tensorop_param = None
-        if op_type == "permute":
-            tensorop_param = self.extract_tensorop_permute(op_args)
-        elif op_type == "cat":
-            tensorop_param = self.extract_tensorop_concatenate(node)
-        elif op_type == "mul" or op_type == "matmul":
-            # Safely get source layers for multiply/matmul operands
-            if (not op_args or len(op_args) < 2 or
-                not isinstance(op_args[0], ast.Name) or not isinstance(op_args[1], ast.Name)):
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: The {op_type} operation has invalid arguments and will be skipped."
-                )
-                return
 
-            left_var = op_args[0].id
-            right_var = op_args[1].id
-
-            if left_var not in self.module_of_output or right_var not in self.module_of_output:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: Cannot find source variables for {op_type} operation. Make sure both operands are defined earlier in the code."
-                )
-                return
-
-            layers_of_tensors = [self.module_of_output[left_var], self.module_of_output[right_var]]
-            tensorop_param = {"tns_type": op_type+"tiply",
-                              "layers_of_tensors": layers_of_tensors}
-        elif op_type == "transpose":
-            transpose_dim = [op_args[i].value for i in range(len(op_args))]
-            # Track which variable this operation is called on (e.g., x.transpose())
-            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
-            if source_var and source_var in self.module_of_output:
-                source_layers = [self.module_of_output[source_var]]
-            elif source_var:
-                source_layers = ['INPUT']
-            else:
-                source_layers = None
-            tensorop_param = {"tns_type": op_type,
-                              "transpose_dim": transpose_dim,
-                              "layers_of_tensors": source_layers}
-        elif op_type == "reshape" or op_type == "view":
-            # Handle variable number of arguments (e.g., b*t, 32 or b, t, 16)
-            # view() is the same as reshape() in PyTorch
-            # For nested calls like x.view(x.size(0), -1), the nested call may have been
-            # processed already by the general nested call handling, creating a temp variable
-            reshape_dim = []
-            for arg in op_args:
-                if isinstance(arg, ast.Call) and hasattr(arg.func, 'attr') and arg.func.attr == 'size':
-                    # This is a nested x.size(dim) call - extract it as a separate operation
-                    if len(arg.args) > 0:
-                        dim_idx = self.param_value(arg.args[0])
-                        source_var = arg.func.value.id if isinstance(arg.func.value, ast.Name) else None
-                        if source_var and source_var in self.module_of_output:
-                            source_layers = [self.module_of_output[source_var]]
-                        elif source_var:
-                            source_layers = ['INPUT']
-                        else:
-                            source_layers = None
-
-                        # Create the shape_dim tensor operation
-                        op_name = f"op_{self.tensor_op_counter}"
-                        shape_tensorop_param = {"tns_type": "shape_dim",
-                                                "reduce_dim": dim_idx,
-                                                "layers_of_tensors": source_layers,
-                                                "name": op_name}
-                        tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
-                        self.buml_model.add_tensor_op(tns_obj)
-                        self.tensor_op_counter += 1
-                        # Use the operation name in reshape_dim - it will be resolved to variable by generator
-                        reshape_dim.append(op_name)
-                    else:
-                        reshape_dim.append(self.param_value(arg))
-                elif isinstance(arg, ast.Name) and arg.id in self.module_of_output:
-                    # This might be a temp variable from nested call handling
-                    # Check if it refers to a tensor operation
-                    layer_name = self.module_of_output[arg.id]
-                    # Check if this is a tensor operation (would have _op suffix in modules_details)
-                    if layer_name.startswith('op_'):
-                        # This is a tensor operation - use its name directly
-                        reshape_dim.append(layer_name)
-                    else:
-                        reshape_dim.append(self.param_value(arg))
-                else:
-                    reshape_dim.append(self.param_value(arg))
-
-            # Track which variable this operation is called on (e.g., x.reshape())
-            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
-            if source_var and source_var in self.module_of_output:
-                source_layers = [self.module_of_output[source_var]]
-            elif source_var:
-                # Variable not in module_of_output means it's the original network input
-                source_layers = ['INPUT']
-            else:
-                source_layers = None
-            tensorop_param = {"tns_type": "reshape",  # Normalize to "reshape"
-                              "reshape_dim": reshape_dim}
-            if source_layers:
-                tensorop_param["layers_of_tensors"] = source_layers
-        elif op_type == "size":
-            # x.size(0) -> tf.shape(x)[0]
-            # Get the dimension argument
-            if len(op_args) > 0:
-                dim_idx = self.param_value(op_args[0])
-            else:
-                # size() without args returns full shape - not commonly used in assignments
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: The size() operation without dimension argument is not fully supported. Specify a dimension for better results."
-                )
-                return
-
-            # Track which variable this operation is called on
-            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
-            if source_var and source_var in self.module_of_output:
-                source_layers = [self.module_of_output[source_var]]
-            elif source_var:
-                source_layers = ['INPUT']
-            else:
-                source_layers = None
-
-            tensorop_param = {"tns_type": "shape_dim",
-                              "reduce_dim": dim_idx,  # Use reduce_dim for consistency with existing code
-                              "layers_of_tensors": source_layers}
-        elif op_type == "mean":
-            # Extract the dim parameter from keywords
-            reduce_dim = None
-            for kw in call_node.keywords:
-                if kw.arg == "dim":
-                    reduce_dim = self.param_value(kw.value)
-            if reduce_dim is None:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: The mean operation requires a dim parameter. Please specify which dimension to reduce."
-                )
-                return
-            # Track which variable this operation is called on
-            # For method calls: x.mean() -> source_var = x
-            # For module calls: torch.mean(x, ...) -> source_var = first argument
-            if isinstance(call_node.func.value, ast.Name):
-                # Check if it's a module call (torch.mean) or method call (x.mean)
-                if call_node.func.value.id in ['torch', 'F', 'nn']:
-                    # Module call: get first argument as source
-                    source_var = op_args[0].id if len(op_args) > 0 and isinstance(op_args[0], ast.Name) else None
-                else:
-                    # Method call: func.value is the source
-                    source_var = call_node.func.value.id
-            else:
-                source_var = None
-
-            if source_var and source_var in self.module_of_output:
-                source_layers = [self.module_of_output[source_var]]
-            elif source_var:
-                # Variable not in module_of_output means it's the original network input
-                source_layers = ['INPUT']
-            else:
-                source_layers = None
-            tensorop_param = {"tns_type": "mean",
-                              "reduce_dim": reduce_dim,
-                              "layers_of_tensors": source_layers}
-        elif op_type == "max":
-            # Extract the dim parameter from keywords
-            reduce_dim = None
-            for kw in call_node.keywords:
-                if kw.arg == "dim":
-                    reduce_dim = self.param_value(kw.value)
-            if reduce_dim is None:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: The max operation requires a dim parameter. Please specify which dimension to reduce."
-                )
-                return
-            # Track which variable this operation is called on
-            # For method calls: x.max() -> source_var = x
-            # For module calls: torch.max(x, ...) -> source_var = first argument
-            if isinstance(call_node.func.value, ast.Name):
-                if call_node.func.value.id in ['torch', 'F', 'nn']:
-                    # Module call: get first argument as source
-                    source_var = op_args[0].id if len(op_args) > 0 and isinstance(op_args[0], ast.Name) else None
-                else:
-                    # Method call: func.value is the source
-                    source_var = call_node.func.value.id
-            else:
-                source_var = None
-
-            if source_var and source_var in self.module_of_output:
-                source_layers = [self.module_of_output[source_var]]
-            elif source_var:
-                # Variable not in module_of_output means it's the original network input
-                source_layers = ['INPUT']
-            else:
-                source_layers = None
-            tensorop_param = {"tns_type": "max",
-                              "reduce_dim": reduce_dim,
-                              "layers_of_tensors": source_layers}
-        elif op_type == "amax":
-            # torch.amax is same as torch.max with dim parameter
-            reduce_dim = None
-            for kw in call_node.keywords:
-                if kw.arg == "dim":
-                    reduce_dim = self.param_value(kw.value)
-            if reduce_dim is None:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: The amax operation requires a dim parameter. Please specify which dimension to reduce."
-                )
-                return
-            # Track which variable this operation is called on
-            # For method calls: x.amax() -> source_var = x
-            # For module calls: torch.amax(x, ...) -> source_var = first argument
-            if isinstance(call_node.func.value, ast.Name):
-                if call_node.func.value.id in ['torch', 'F', 'nn']:
-                    # Module call: get first argument as source
-                    source_var = op_args[0].id if len(op_args) > 0 and isinstance(op_args[0], ast.Name) else None
-                else:
-                    # Method call: func.value is the source
-                    source_var = call_node.func.value.id
-            else:
-                source_var = None
-
-            if source_var and source_var in self.module_of_output:
-                source_layers = [self.module_of_output[source_var]]
-            elif source_var:
-                # Variable not in module_of_output means it's the original network input
-                source_layers = ['INPUT']
-            else:
-                source_layers = None
-            tensorop_param = {"tns_type": "max",
-                              "reduce_dim": reduce_dim,
-                              "layers_of_tensors": source_layers}
-        elif op_type == "squeeze":
-            # Extract the dim parameter - can be positional arg or keyword
-            squeeze_dim = None
-            if len(op_args) > 0:
-                squeeze_dim = self.param_value(op_args[0])
-            else:
-                for kw in call_node.keywords:
-                    if kw.arg == "dim":
-                        squeeze_dim = self.param_value(kw.value)
-            tensorop_param = {"tns_type": "squeeze",
-                              "reduce_dim": squeeze_dim}
-        elif op_type == "unsqueeze":
-            # Extract the dim parameter - can be positional arg or keyword
-            unsqueeze_dim = None
-            if len(op_args) > 0:
-                unsqueeze_dim = self.param_value(op_args[0])
-            else:
-                for kw in call_node.keywords:
-                    if kw.arg == "dim":
-                        unsqueeze_dim = self.param_value(kw.value)
-            tensorop_param = {"tns_type": "unsqueeze",
-                              "reduce_dim": unsqueeze_dim}
-        elif op_type == "normalize":
-            # F.normalize(input, p=2, dim=1) -> L2 normalization
-            # First arg is the input tensor, then parameters
-            norm_dim = None
-
-            # Extract input tensor (first argument)
-            if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
-                source_var = op_args[0].id
-                # Check positional args: normalize(input, p, dim)
-                # Note: p parameter is ignored as TF only supports L2
-                if len(op_args) > 2:
-                    norm_dim = self.param_value(op_args[2])
-            else:
-                source_var = None
-
-            # Check keyword args
-            for kw in call_node.keywords:
-                if kw.arg == "dim":
-                    norm_dim = self.param_value(kw.value)
-                # Note: p parameter is ignored as TF only supports L2
-
-            # Track which variable this operation is called on
-            if source_var and source_var in self.module_of_output:
-                source_layers = [self.module_of_output[source_var]]
-            elif source_var:
-                source_layers = ['INPUT']
-            else:
-                source_layers = None
-
-            tensorop_param = {"tns_type": "normalize",
-                              "reduce_dim": norm_dim,
-                              "layers_of_tensors": source_layers}
-            # Note: TF's l2_normalize only supports L2 normalization
-        elif op_type == "flatten":
-            # x.flatten(start_dim=1) -> create FlattenLayer
-            # Extract start_dim and end_dim parameters
-            start_dim = 1  # Default
-            end_dim = -1   # Default
-
-            if len(op_args) > 0:
-                start_dim = self.param_value(op_args[0])
-            if len(op_args) > 1:
-                end_dim = self.param_value(op_args[1])
-
-            for kw in call_node.keywords:
-                if kw.arg == "start_dim":
-                    start_dim = self.param_value(kw.value)
-                elif kw.arg == "end_dim":
-                    end_dim = self.param_value(kw.value)
-
-            # Track source variable
-            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
-            name_module_input = self.module_of_output.get(source_var, source_var)
-
-            # Create FlattenLayer
-            layer_name = f"flatten_{self.tensor_op_counter}"
-            self.tensor_op_counter += 1
-
-            flatten_params = {
-                "name": layer_name,
-                "start_dim": start_dim,
-                "end_dim": end_dim,
-                "name_module_input": name_module_input
-            }
-
-            flatten_layer = getattr(mm_classes, "FlattenLayer")(**flatten_params)
-            self.buml_model.add_layer(flatten_layer)
-
-            # Track output variable
-            if isinstance(node.targets[0], ast.Name):
-                output_var = node.targets[0].id
-                self.module_of_output[output_var] = layer_name
-
-            return  # Don't create a TensorOp
-        elif op_type == "repeat":
-            # x.repeat(1, t, 1) -> repeats tensor along each dimension
-            # Extract repeat counts for each dimension, resolving variable references
-            repeat_counts = []
-            for arg in op_args:
-                if isinstance(arg, ast.Name):
-                    # Variable reference - resolve to operation name
-                    var_name = arg.id
-                    if var_name in self.module_of_output:
-                        repeat_counts.append(self.module_of_output[var_name])
-                    else:
-                        repeat_counts.append(var_name)
-                else:
-                    repeat_counts.append(self.param_value(arg))
-
-            # Track source variable
-            source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
-            if source_var and source_var in self.module_of_output:
-                source_layers = [self.module_of_output[source_var]]
-            elif source_var:
-                source_layers = ['INPUT']
-            else:
-                source_layers = None
-
-            tensorop_param = {"tns_type": "repeat",
-                              "repeat_dim": repeat_counts,
-                              "layers_of_tensors": source_layers}
-        else:
+        # Dispatch to appropriate handler using mapping
+        handler = self._op_handlers.get(op_type)
+        if not handler:
             self.migration_warnings.append(
                 f"Unrecognized tensor operation '{op_type}'. This operation will be skipped in the migration."
             )
             return
 
+        tensorop_param = handler(call_node, node, op_args)
+
+        # Flatten creates a layer, not a tensorop (special case)
+        if tensorop_param == "flatten_created":
+            return
+
+        # Create and track TensorOp if handler returned params
         if tensorop_param:
-            op_name = f"op_{self.tensor_op_counter}"
-            tensorop_param["name"] = op_name
-            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-            self.buml_model.add_tensor_op(tns_obj)
-            self.tensor_op_counter+=1
-
-            # Check if this tensorop's source variable was saved for residual connection
-            # For method-style calls (x.transpose(), x.permute(), etc.), extract source variable
-            if isinstance(call_node.func, ast.Attribute) and isinstance(call_node.func.value, ast.Name):
-                source_var = call_node.func.value.id
-                if hasattr(self, '_variables_saved_for_residual') and source_var in self._variables_saved_for_residual:
-                    tns_obj.input_reused = True
-                    self._variables_saved_for_residual.discard(source_var)
-
-            # Track tensorop output so activations can detect it
-            # Handle both simple and tuple assignments
-            if isinstance(node.targets[0], ast.Name):
-                output_var = node.targets[0].id
-            elif isinstance(node.targets[0], ast.Tuple):
-                first_elem = node.targets[0].elts[0]
-                output_var = first_elem.id if isinstance(first_elem, ast.Name) else None
-            else:
-                output_var = None
-
-            if output_var:
-                self.module_of_output[output_var] = op_name
-            # Note: inputs_outputs for tensorops handled differently - they use layers_of_tensors
+            self._create_and_track_tensorop(tensorop_param, call_node, node)
 
 
     def extract_tensorop_concatenate(self, node):
