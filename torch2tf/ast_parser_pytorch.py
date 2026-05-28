@@ -394,6 +394,78 @@ class ASTParserTorch(ASTParser):
         chain.reverse()
         return chain
 
+    def _process_nested_call_in_chain(self, call, node):
+        """Extract and process nested call within a chain element."""
+        if not (isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Call)):
+            return
+
+        inner_call = call.args[0]
+        inner_temp = self.TEMP_NESTED_IN_CHAIN.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+        inner_target = ast.Name(id=inner_temp, ctx=ast.Store())
+        inner_node = ast.Assign(targets=[inner_target], value=inner_call)
+        inner_node.lineno = node.lineno
+        inner_node.col_offset = node.col_offset
+
+        self.process_single_call(inner_node)
+        self.previous_assign = inner_node
+        call.args[0] = ast.Name(id=inner_temp, ctx=ast.Load())
+
+    def _link_chain_calls(self, chain, i, temp_name):
+        """Link current chain call to the next via temporary variable."""
+        if i + 1 >= len(chain):
+            return
+
+        next_call = chain[i + 1]
+        next_func_value = next_call.func.value
+
+        if isinstance(next_func_value, ast.Name):
+            # Functional call like F.relu(x) where x is in args[0]
+            if next_call.args:
+                next_call.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+        elif isinstance(next_func_value, ast.Call):
+            # Method call like result.permute(...) where result is func.value
+            next_call.func.value = ast.Name(id=temp_name, ctx=ast.Load())
+
+    def _is_nested_activation(self, call):
+        """Check if this call is an activation on a nested-in-chain temp variable."""
+        if not (isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Name)):
+            return False
+        return call.args[0].id.startswith(self.TEMP_NESTED_IN_CHAIN.split('{')[0])
+
+    def _process_chained_calls(self, node):
+        """Process chained method calls by decomposing and handling each element."""
+        chain = self.decompose_chained_call(node)
+
+        for i, call in enumerate(chain):
+            is_last = (i == len(chain) - 1)
+
+            # Create synthetic node for this chain element
+            if is_last:
+                synthetic_node = ast.Assign(targets=node.targets, value=call)
+            else:
+                temp_name = self.TEMP_CHAIN.format(self.tensor_op_counter, i)
+                temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+                synthetic_node = ast.Assign(targets=[temp_target], value=call)
+                self._link_chain_calls(chain, i, temp_name)
+
+            # Handle nested calls within this chain element
+            self._process_nested_call_in_chain(call, node)
+
+            synthetic_node.lineno = node.lineno
+            synthetic_node.col_offset = node.col_offset
+
+            # Process with nested activation flag if needed
+            is_nested_activ = self._is_nested_activation(call)
+            if is_nested_activ:
+                self.is_processing_nested_outer = True
+
+            self.process_single_call(synthetic_node)
+            self.previous_assign = synthetic_node
+
+            if is_nested_activ:
+                self.is_processing_nested_outer = False
+
     def handle_forward_simple_call(self, node: ast.Assign):
         """
         Processes forward method assignments including chained and nested calls.
@@ -401,110 +473,57 @@ class ASTParserTorch(ASTParser):
         # Handle chained calls (x.method1().method2())
         if isinstance(node.value, ast.Call) and hasattr(node.value.func, 'value'):
             if isinstance(node.value.func.value, ast.Call):
-                chain = self.decompose_chained_call(node)
-                for i, call in enumerate(chain):
-                    is_last = (i == len(chain) - 1)
-                    if is_last:
-                        synthetic_node = ast.Assign(targets=node.targets, value=call)
-                    else:
-                        temp_name = self.TEMP_CHAIN.format(self.tensor_op_counter, i)
-                        temp_target = ast.Name(id=temp_name, ctx=ast.Store())
-                        synthetic_node = ast.Assign(targets=[temp_target], value=call)
-
-                        # Link next call to this temp variable
-                        if i + 1 < len(chain):
-                            next_call = chain[i + 1]
-                            next_func_value = next_call.func.value
-
-                            # Check if next call is functional (F.xxx) or method (x.xxx)
-                            if isinstance(next_func_value, ast.Name):
-                                # Functional call like F.relu(x) where x is in args[0]
-                                if next_call.args:
-                                    next_call.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
-                            elif isinstance(next_func_value, ast.Call):
-                                # Method call like result.permute(...) where result is func.value
-                                next_call.func.value = ast.Name(id=temp_name, ctx=ast.Load())
-
-                    # Check if this call in the chain is nested
-                    if isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Call):
-                        # Nested call within chain: decompose it first
-                        inner_call = call.args[0]
-                        inner_temp = self.TEMP_NESTED_IN_CHAIN.format(self.tensor_op_counter)
-                        self.tensor_op_counter += 1
-                        inner_target = ast.Name(id=inner_temp, ctx=ast.Store())
-                        inner_node = ast.Assign(targets=[inner_target], value=inner_call)
-                        inner_node.lineno = node.lineno
-                        inner_node.col_offset = node.col_offset
-
-                        # Process inner call without nested flag (it's just a layer)
-                        self.process_single_call(inner_node)
-                        self.previous_assign = inner_node
-
-                        # Replace nested call with temp variable
-                        call.args[0] = ast.Name(id=inner_temp, ctx=ast.Load())
-
-                    synthetic_node.lineno = node.lineno
-                    synthetic_node.col_offset = node.col_offset
-
-                    # Mark as nested outer part if this is activation on the inner temp
-                    is_nested_activation = False
-                    if isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Name):
-                        # Check if it starts with the nested-in-chain prefix
-                        if call.args[0].id.startswith(self.TEMP_NESTED_IN_CHAIN.split('{')[0]):
-                            self.is_processing_nested_outer = True
-                            is_nested_activation = True
-
-                    self.process_single_call(synthetic_node)
-                    self.previous_assign = synthetic_node
-
-                    if is_nested_activation:
-                        self.is_processing_nested_outer = False
+                self._process_chained_calls(node)
                 return
 
-        # Handle subscript arguments (e.g., self.fc(h[-1]))
-        # Process subscript before processing the call
-        if isinstance(node.value, ast.Call) and node.value.args:
-            if isinstance(node.value.args[0], ast.Subscript):
-                subscript_node = node.value.args[0]
-                temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
-                self.tensor_op_counter += 1
+        # Handle subscript arguments and nested calls, then process
+        self._handle_subscript_argument(node)
+        is_nested = self._handle_nested_call(node)
 
-                self.handle_subscript_operation(subscript_node, temp_name, node)
-
-                # Replace subscript with temp variable in call
-                node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
-
-        # Handle nested calls (F.relu(self.conv(x)))
-        is_nested_call = False
-        if isinstance(node.value, ast.Call) and node.value.args:
-            if isinstance(node.value.args[0], ast.Call):
-                # Nested call detected: process inner call first
-                inner_call = node.value.args[0]
-                temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
-                self.tensor_op_counter += 1
-                temp_target = ast.Name(id=temp_name, ctx=ast.Store())
-
-                # Create synthetic node for inner call
-                inner_node = ast.Assign(targets=[temp_target], value=inner_call)
-                inner_node.lineno = node.lineno
-                inner_node.col_offset = node.col_offset
-                # Recursively call visit_Assign to handle multi-level nesting
-                self.visit_Assign(inner_node)
-                self.previous_assign = inner_node
-
-                # Replace inner call with temp variable in outer call
-                node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
-                is_nested_call = True
-
-        # Mark if this is a nested call's outer part (activation wrapping layer)
-        if is_nested_call:
+        if is_nested:
             self.is_processing_nested_outer = True
 
         self.process_single_call(node)
         self.previous_assign = node
 
-        if is_nested_call:
+        if is_nested:
             self.is_processing_nested_outer = False
+
+    def _handle_subscript_argument(self, node):
+        """Process subscript arguments in calls (e.g., self.fc(h[-1]))."""
+        if not (isinstance(node.value, ast.Call) and node.value.args):
+            return
+        if not isinstance(node.value.args[0], ast.Subscript):
+            return
+
+        subscript_node = node.value.args[0]
+        temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+
+        self.handle_subscript_operation(subscript_node, temp_name, node)
+        node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+
+    def _handle_nested_call(self, node):
+        """Process nested calls (e.g., F.relu(self.conv(x))). Returns True if nested."""
+        if not (isinstance(node.value, ast.Call) and node.value.args):
+            return False
+        if not isinstance(node.value.args[0], ast.Call):
+            return False
+
+        inner_call = node.value.args[0]
+        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+        temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+
+        inner_node = ast.Assign(targets=[temp_target], value=inner_call)
+        inner_node.lineno = node.lineno
+        inner_node.col_offset = node.col_offset
+
+        self.visit_Assign(inner_node)
+        self.previous_assign = inner_node
+
+        node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+        return True
 
     def process_single_call(self, node: ast.Assign):
         """
