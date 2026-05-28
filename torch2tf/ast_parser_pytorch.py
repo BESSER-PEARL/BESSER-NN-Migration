@@ -49,6 +49,7 @@ class ASTParserTorch(ASTParser):
         self.layer_reuse_count = {}  # {layer_name: reuse_count}
         # Track the output variable of the immediately previous layer
         self.prev_layer_output = None  # str: variable name
+        # Note: migration_warnings inherited from base ASTParser class
 
     def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
         """
@@ -214,22 +215,28 @@ class ASTParserTorch(ASTParser):
                             layer_params['positional_params'] = []
 
                             # Transform and create BUML layer
-                            buml_lyr_type, buml_params = transform_layer(
-                                lyr_type, layer_params, layer_params['name']
-                            )
-                            buml_layer = getattr(mm_classes, buml_lyr_type)(**buml_params)
-                            self.buml_model.add_layer(buml_layer)
+                            try:
+                                buml_lyr_type, buml_params = transform_layer(
+                                    lyr_type, layer_params, layer_params['name']
+                                )
+                                buml_layer = getattr(mm_classes, buml_lyr_type)(**buml_params)
+                                self.buml_model.add_layer(buml_layer)
+                            except ValueError as e:
+                                self.migration_warnings.append(f"Layer '{layer_params['name']}': {str(e)}")
 
                         # Track this multi-layer RNN
                         self.multi_layer_rnns[module_name] = layer_names
                     else:
                         # Single layer - remove num_layers if present
                         lyr_params.pop('num_layers', None)
-                        lyr_type, lyr_params = transform_layer(
-                            lyr_type, lyr_params, module_name
-                        )
-                        buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-                        self.buml_model.add_layer(buml_layer)
+                        try:
+                            lyr_type, lyr_params = transform_layer(
+                                lyr_type, lyr_params, module_name
+                            )
+                            buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+                            self.buml_model.add_layer(buml_layer)
+                        except ValueError as e:
+                            self.migration_warnings.append(f"Layer '{module_name}': {str(e)}")
                 else:
                     self.activation_functions[module_name] = lyr_type
 
@@ -274,14 +281,20 @@ class ASTParserTorch(ASTParser):
 
                         prev_layer_supports_activ = not unsupported
 
-                    if prev_layer_supports_activ:
+                    # Get activation function with validation
+                    actv_func = actv_fun_mapping.get(lyr_type)
+                    if actv_func is None:
+                        self.migration_warnings.append(
+                            f"Unsupported activation function '{lyr_type}'. This activation will be skipped in the migration."
+                        )
+                    elif prev_layer_supports_activ:
                         # Merge with previous layer as activation attribute
-                        subnn.layers[-1].actv_func = actv_fun_mapping[lyr_type]
+                        subnn.layers[-1].actv_func = actv_func
                     else:
                         # Create standalone activation layer
                         actv_params = {
                             "name": f"layer_{layer_id}",
-                            "actv_func": actv_fun_mapping[lyr_type]
+                            "actv_func": actv_func
                         }
                         subnn_layer = getattr(mm_classes, "GeneralLayer")(**actv_params)
                         subnn.add_layer(subnn_layer)
@@ -298,18 +311,21 @@ class ASTParserTorch(ASTParser):
                     else:
                         permute = True
                 else:
-                    lyr_type, lyr_params = transform_layer(
-                        lyr_type, lyr_params
-                    )
+                    try:
+                        lyr_type, lyr_params = transform_layer(
+                            lyr_type, lyr_params
+                        )
 
-                    lyr_params["name"] = f"layer_{layer_id}"
-                    if permute:
-                        lyr_params["permute_in"] = True
-                        permute = False
+                        lyr_params["name"] = f"layer_{layer_id}"
+                        if permute:
+                            lyr_params["permute_in"] = True
+                            permute = False
 
-                    subnn_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-                    subnn.add_layer(subnn_layer)
-                    layer_id+=1
+                        subnn_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+                        subnn.add_layer(subnn_layer)
+                        layer_id+=1
+                    except ValueError as e:
+                        self.migration_warnings.append(f"Sequential layer {layer_id}: {str(e)}")
 
             elif isinstance(elt, ast.Name):
                 subnn_obj = next((obj for obj in self.buml_model.sub_nns if
@@ -470,7 +486,14 @@ class ASTParserTorch(ASTParser):
 
                 # Check if it's an activation function
                 if module_name in actv_fun_mapping:
-                    input_var = node.value.args[0].id
+                    # Safely extract input variable
+                    if not node.value.args or not isinstance(node.value.args[0], ast.Name):
+                        self.migration_warnings.append(
+                            f"Line {node.lineno}: Could not extract input for activation function. Using default input variable 'x'."
+                        )
+                        input_var = "x"
+                    else:
+                        input_var = node.value.args[0].id
                     prev_is_tensorop = False
                     prev_lyr_obj = None
 
@@ -519,16 +542,19 @@ class ASTParserTorch(ASTParser):
                         lyr_params[kw.arg] = self.param_value(kw.value)
 
                     # Transform using existing logic
-                    lyr_type, lyr_params = transform_layer(module_name, lyr_params, synthetic_name)
+                    try:
+                        lyr_type, lyr_params = transform_layer(module_name, lyr_params, synthetic_name)
 
-                    # Create and add layer
-                    lyr_obj = getattr(mm_classes, lyr_type)(**lyr_params)
-                    self.buml_model.add_layer(lyr_obj)
+                        # Create and add layer
+                        lyr_obj = getattr(mm_classes, lyr_type)(**lyr_params)
+                        self.buml_model.add_layer(lyr_obj)
 
-                    # Track inputs/outputs
-                    self.inputs_outputs[synthetic_name] = [node.value.args[0].id, node.targets[0].id]
-                    self.module_of_output[node.targets[0].id] = synthetic_name
-                    self.buml_model.modules.append(lyr_obj)
+                        # Track inputs/outputs
+                        self.inputs_outputs[synthetic_name] = [node.value.args[0].id, node.targets[0].id]
+                        self.module_of_output[node.targets[0].id] = synthetic_name
+                        self.buml_model.modules.append(lyr_obj)
+                    except ValueError as e:
+                        self.migration_warnings.append(f"Functional layer '{synthetic_name}': {str(e)}")
             else:
                 # Unknown functional - treat as tensor op
                 self.extract_tensorop(node)
@@ -603,12 +629,19 @@ class ASTParserTorch(ASTParser):
                                              obj.name == prev_lyr_name), None)
                         if prev_lyr_obj:
                             actv = self.activation_functions[module_name]
-                            prev_lyr_obj.actv_func = actv_fun_mapping[actv]
-                            # Update module_of_output to point to the layer, not the activation
-                            output_var = node.targets[0].id
-                            self.module_of_output[output_var] = prev_lyr_name
-                            # Skip adding activation as separate layer
-                            should_merge = True
+                            actv_func = actv_fun_mapping.get(actv)
+                            if actv_func is None:
+                                self.migration_warnings.append(
+                                    f"Unsupported activation function '{actv}'. This activation will be skipped in the migration."
+                                )
+                                should_merge = False
+                            else:
+                                prev_lyr_obj.actv_func = actv_func
+                                # Update module_of_output to point to the layer, not the activation
+                                output_var = node.targets[0].id
+                                self.module_of_output[output_var] = prev_lyr_name
+                                # Skip adding activation as separate layer
+                                should_merge = True
                         else:
                             should_merge = False
                     else:
@@ -623,17 +656,23 @@ class ASTParserTorch(ASTParser):
                     self.tensor_op_counter += 1
 
                     actv = self.activation_functions[module_name]
-                    actv_lyr = mm_classes.GeneralLayer(
-                        name=unique_name,
-                        actv_func=actv_fun_mapping[actv]
-                    )
-                    self.buml_model.modules.append(actv_lyr)
+                    actv_func = actv_fun_mapping.get(actv)
+                    if actv_func is None:
+                        self.migration_warnings.append(
+                            f"Unsupported activation function '{actv}'. This activation will be skipped in the migration."
+                        )
+                    else:
+                        actv_lyr = mm_classes.GeneralLayer(
+                            name=unique_name,
+                            actv_func=actv_func
+                        )
+                        self.buml_model.modules.append(actv_lyr)
 
-                    # Track inputs/outputs for standalone activation
-                    input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
-                    output_var = node.targets[0].id
-                    self.inputs_outputs[unique_name] = [input_var, output_var]
-                    self.module_of_output[output_var] = unique_name
+                        # Track inputs/outputs for standalone activation
+                        input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
+                        output_var = node.targets[0].id
+                        self.inputs_outputs[unique_name] = [input_var, output_var]
+                        self.module_of_output[output_var] = unique_name
 
             elif not is_subnn_obj:
                 self.is_permute_before_cnn(module_name)
@@ -934,7 +973,9 @@ class ASTParserTorch(ASTParser):
             self.handle_forward_binop(binop_assign)
             left_var = temp_name
         else:
-            print(f"Warning: Unsupported left operand type in BinOp: {type(binop.left).__name__}")
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Binary operation has unsupported left operand type '{type(binop.left).__name__}'. This operation will be skipped."
+            )
             return
 
         # Extract right operand variable
@@ -963,7 +1004,9 @@ class ASTParserTorch(ASTParser):
             self.handle_forward_binop(binop_assign)
             right_var = temp_name
         else:
-            print(f"Warning: Unsupported right operand type in BinOp: {type(binop.right).__name__}")
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Binary operation has unsupported right operand type '{type(binop.right).__name__}'. This operation will be skipped."
+            )
             return
 
         # Determine the operation type
@@ -977,7 +1020,9 @@ class ASTParserTorch(ASTParser):
         tns_type = op_map.get(op_type_name)
 
         if tns_type is None:
-            print(f"Warning: Unsupported binary operation: {op_type_name}")
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unsupported binary operation '{op_type_name}'. Only add, subtract, multiply, and divide are supported."
+            )
             return
 
         # Get the layer/module names that produced these variables
@@ -986,7 +1031,9 @@ class ASTParserTorch(ASTParser):
         right_layer = right_var if isinstance(right_var, (int, float)) else self.module_of_output.get(right_var)
 
         if left_layer is None or right_layer is None:
-            print(f"Warning: Cannot determine source layers for BinOp operands")
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Cannot determine source layers for binary operation. Make sure both operands are defined earlier."
+            )
             return
 
         # Determine if variables are output or hidden for RNNs with return_type="both"
@@ -1165,7 +1212,9 @@ class ASTParserTorch(ASTParser):
             if lyr_obj.return_type != "both":
                 lyr_obj.return_type = "last"
         else:
-            print(f"Warning: Unrecognized subscript pattern on '{subscripted_var}'")
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unrecognized subscript pattern on variable '{subscripted_var}'. This may not migrate correctly."
+            )
 
         # Track the result variable so it can be used in subsequent operations (e.g., concat)
         result_var = node.targets[0].id
@@ -1201,7 +1250,9 @@ class ASTParserTorch(ASTParser):
             self.data_config["test_data"]["path_data"] = path
 
         else:
-            print("Path is not recognised!")
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Could not determine if path is for training or test data. Path will be ignored."
+            )
 
 
     def get_images_attr(self, node: ast.Assign):
@@ -1334,8 +1385,7 @@ class ASTParserTorch(ASTParser):
             tensorop_param["reduce_dim"] = dim_value
 
         tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-        self.buml_model.add_tensor_op(tns_obj)
-        self.buml_model.modules.append(tns_obj)
+        self.buml_model.add_tensor_op(tns_obj)  # Already adds to modules
         self.tensor_op_counter += 1
 
         # Track the intermediate variable
@@ -1373,6 +1423,13 @@ class ASTParserTorch(ASTParser):
         if not isinstance(call_node, ast.Call):
             return
 
+        # Safely extract operation type
+        if not hasattr(call_node.func, 'attr'):
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unknown tensor operation encountered. This operation will be skipped in the migration."
+            )
+            return
+
         op_type = call_node.func.attr
         op_args = call_node.args
         tensorop_param = None
@@ -1381,8 +1438,24 @@ class ASTParserTorch(ASTParser):
         elif op_type == "cat":
             tensorop_param = self.extract_tensorop_concatenate(node)
         elif op_type == "mul" or op_type == "matmul":
-            layers_of_tensors = [self.module_of_output[op_args[0].id],
-                                 self.module_of_output[op_args[1].id]]
+            # Safely get source layers for multiply/matmul operands
+            if (not op_args or len(op_args) < 2 or
+                not isinstance(op_args[0], ast.Name) or not isinstance(op_args[1], ast.Name)):
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: The {op_type} operation has invalid arguments and will be skipped."
+                )
+                return
+
+            left_var = op_args[0].id
+            right_var = op_args[1].id
+
+            if left_var not in self.module_of_output or right_var not in self.module_of_output:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: Cannot find source variables for {op_type} operation. Make sure both operands are defined earlier in the code."
+                )
+                return
+
+            layers_of_tensors = [self.module_of_output[left_var], self.module_of_output[right_var]]
             tensorop_param = {"tns_type": op_type+"tiply",
                               "layers_of_tensors": layers_of_tensors}
         elif op_type == "transpose":
@@ -1463,7 +1536,9 @@ class ASTParserTorch(ASTParser):
                 dim_idx = self.param_value(op_args[0])
             else:
                 # size() without args returns full shape - not commonly used in assignments
-                print(f"Warning: size() without dimension argument - not fully supported")
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: The size() operation without dimension argument is not fully supported. Specify a dimension for better results."
+                )
                 return
 
             # Track which variable this operation is called on
@@ -1485,7 +1560,9 @@ class ASTParserTorch(ASTParser):
                 if kw.arg == "dim":
                     reduce_dim = self.param_value(kw.value)
             if reduce_dim is None:
-                print(f"Warning: mean operation without dim parameter - not supported")
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: The mean operation requires a dim parameter. Please specify which dimension to reduce."
+                )
                 return
             # Track which variable this operation is called on
             # For method calls: x.mean() -> source_var = x
@@ -1518,7 +1595,9 @@ class ASTParserTorch(ASTParser):
                 if kw.arg == "dim":
                     reduce_dim = self.param_value(kw.value)
             if reduce_dim is None:
-                print(f"Warning: max operation without dim parameter - not supported")
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: The max operation requires a dim parameter. Please specify which dimension to reduce."
+                )
                 return
             # Track which variable this operation is called on
             # For method calls: x.max() -> source_var = x
@@ -1550,7 +1629,9 @@ class ASTParserTorch(ASTParser):
                 if kw.arg == "dim":
                     reduce_dim = self.param_value(kw.value)
             if reduce_dim is None:
-                print(f"Warning: amax operation without dim parameter - not supported")
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: The amax operation requires a dim parameter. Please specify which dimension to reduce."
+                )
                 return
             # Track which variable this operation is called on
             # For method calls: x.amax() -> source_var = x
@@ -1703,7 +1784,9 @@ class ASTParserTorch(ASTParser):
                               "repeat_dim": repeat_counts,
                               "layers_of_tensors": source_layers}
         else:
-            print(f"{op_type} is not recognized!")
+            self.migration_warnings.append(
+                f"Unrecognized tensor operation '{op_type}'. This operation will be skipped in the migration."
+            )
             return
 
         if tensorop_param:
@@ -1820,13 +1903,17 @@ class ASTParserTorch(ASTParser):
                             self.module_of_output[temp_name] = layer_name
                             return temp_name
                     else:
-                        print(f"Warning: Layer '{layer_name}' not found in BUML model")
+                        self.migration_warnings.append(
+                            f"Concatenation operation: Layer '{layer_name}' referenced but not found in the model. Check if it was defined earlier."
+                        )
                         return None
                 else:
                     # Method call like x.squeeze(1) - create the operation and return result var
                     result = self.extract_inline_tensorop(arg, node)
                     if result is None:
-                        print(f"Warning: extract_inline_tensorop returned None for {ast.unparse(arg)}")
+                        self.migration_warnings.append(
+                            f"Concatenation operation: Could not process inline operation '{ast.unparse(arg)}'. This argument will be skipped."
+                        )
                         return None
                     return result
             elif isinstance(arg, ast.Subscript):
@@ -1843,7 +1930,9 @@ class ASTParserTorch(ASTParser):
         for arg in ops_args:
             var = extract_var_name_and_create_op(arg)
             if var is None:
-                print(f"Warning: Cannot extract variable from concat argument")
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: Cannot extract variable from concatenation argument. Make sure all concat arguments are valid variables or layer outputs."
+                )
                 return None
             variables.append(var)
 
@@ -2050,6 +2139,15 @@ def transform_layer(lyr_type: str, lyr_params: dict,
     if lyr_type in ["Dropout1d", "Dropout2d", "Dropout3d"]:
         lyr_params["dimension"] = lyr_type[-2]  # Extract '1', '2', or '3'
 
+    # Check if layer type is supported
+    if lyr_type not in layers_mapping:
+        raise ValueError(
+            f"Unsupported layer type '{lyr_type}'. "
+            f"This PyTorch layer is not yet supported in the migration tool. "
+            f"Supported layers: {', '.join(sorted(layers_mapping.keys())[:10])}... "
+            f"(and {len(layers_mapping) - 10} more)"
+        )
+
     lyr_type = layers_mapping[lyr_type]
     return lyr_type, lyr_params
 
@@ -2077,8 +2175,7 @@ def process_params(lyr_type: str, lyr_params: dict):
             # Ignored parameters: actv_func/name handled separately, inplace not needed in TF
             if param in ["actv_func", "name"]:
                 updated_lyr_params[param] = lyr_params[param]
-        else:
-            print(f"parameter {param} of layer {lyr_type} is not found!")
+        # Note: Unknown parameters are silently skipped (not critical for migration)
 
 
     set_static_params(lyr_type, updated_lyr_params, static_params)

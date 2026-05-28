@@ -127,6 +127,19 @@ def transform(args: argparse.Namespace, framework: str,
     extractor.visit(tree)
     buml_model = extractor.buml_model
 
+    # Display any warnings about unsupported features
+    if hasattr(extractor, 'migration_warnings') and extractor.migration_warnings:
+        print("\n" + "="*60)
+        print("MIGRATION WARNINGS")
+        print("="*60)
+        print(f"\nFound {len(extractor.migration_warnings)} issue(s) during migration:\n")
+        for i, warning in enumerate(extractor.migration_warnings, 1):
+            print(f"{i}. {warning}")
+        print("\n" + "="*60)
+        print("The migration will continue, but please review these warnings.")
+        print("Some PyTorch features may not be fully supported in the TensorFlow output.")
+        print("="*60 + "\n")
+
     # If the input_nn_type is sequential, it is processed as a sub_nn.
     # It needs to be removed from sub_nns and the order of modules needs
     # to be corrected.

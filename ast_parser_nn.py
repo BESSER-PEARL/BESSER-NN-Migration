@@ -51,6 +51,8 @@ class ASTParser(ast.NodeVisitor):
         self.tensor_op_counter: int = 1
         self.in_class: bool = False
         self.unprocessed_nodes: list = []
+        # Accumulate warnings about unsupported features
+        self.migration_warnings: list = []
 
 
     def visit_ClassDef(self, node: ast.ClassDef):
@@ -70,10 +72,17 @@ class ASTParser(ast.NodeVisitor):
         """
 
         # Retrieve the name of the model
+        if not node.bases:
+            # Class has no base classes, skip it
+            return
+
         if isinstance(node.bases[0], ast.Attribute):
             base_name = node.bases[0].attr
-        else: #isinstance(node.bases[0], ast.Name):
+        elif isinstance(node.bases[0], ast.Name):
             base_name = node.bases[0].id
+        else:
+            # Unknown base class type
+            return
 
         if base_name == "Model" or base_name == "Module":
             self.buml_model.name = node.name
@@ -128,7 +137,8 @@ class ASTParser(ast.NodeVisitor):
         """
         if self.only_nn is False:
             if (isinstance(node.iter, ast.Name) and
-                  isinstance(node.target, ast.Name)):
+                  isinstance(node.target, ast.Name) and
+                  node.body):
                 if isinstance(node.body[0], ast.Assign):
                     if (node.iter.id == "metrics" and
                         isinstance(node.body[0].value, ast.List)):
@@ -448,7 +458,9 @@ class ASTParser(ast.NodeVisitor):
             op_symbol = op_map.get(type(param.op), '?')
             return f"{left} {op_symbol} {right}"
 
-        print("unhandled type", param)
+        self.migration_warnings.append(
+            f"Unhandled parameter type '{type(param).__name__}'. Parameter value may not be correctly migrated."
+        )
         return param
 
     def extract_layer_params(self, call_node: ast.Call):
@@ -541,7 +553,7 @@ class ASTParser(ast.NodeVisitor):
 
     def handle_outer_simple_assignment(self, node: ast.Assign):
         """
-        It extracts information from simple assignment statements 
+        It extracts information from simple assignment statements
         called outside the NN class.
 
         Parameters:
@@ -549,9 +561,15 @@ class ASTParser(ast.NodeVisitor):
                 statement.
 
         Returns:
-            None, but collects attributes for config and data in 
+            None, but collects attributes for config and data in
                 data_config dict.
         """
+        # Validate node structure before accessing attributes
+        if not (isinstance(node.value, ast.Call) and
+                hasattr(node.value, 'func') and
+                hasattr(node.value.func, 'id')):
+            return
+
         if node.value.func.id == self.buml_model.name:
             self.buml_model.name = node.targets[0].id
         elif node.value.func.id == "classification_report":
@@ -577,7 +595,7 @@ class ASTParser(ast.NodeVisitor):
 
     def handle_outer_constant_assignment(self, node: ast.Assign):
         """
-        It extracts information from constant assignment statements 
+        It extracts information from constant assignment statements
         called outside the NN class.
 
         Parameters:
@@ -585,9 +603,15 @@ class ASTParser(ast.NodeVisitor):
                 statement.
 
         Returns:
-            None, but collects attributes for config and data in 
+            None, but collects attributes for config and data in
                 data_config dict.
         """
+        # Validate node structure
+        if not (node.targets and
+                isinstance(node.targets[0], ast.Name) and
+                isinstance(node.value, ast.Constant)):
+            return
+
         if node.targets[0].id == "batch_size":
             self.data_config["config"]["batch_size"] = node.value.value
         elif node.targets[0].id == "train_path":
@@ -605,7 +629,7 @@ class ASTParser(ast.NodeVisitor):
 
     def handle_outer_tuple_assignment(self, node: ast.Assign):
         """
-        It extracts information from tuple assignment statements 
+        It extracts information from tuple assignment statements
         called outside the NN class.
 
         Parameters:
@@ -613,9 +637,15 @@ class ASTParser(ast.NodeVisitor):
                 statement.
 
         Returns:
-            None, but collects images_size attribute in 
+            None, but collects images_size attribute in
                 data_config dict.
         """
+        # Validate node structure
+        if not (node.targets and
+                isinstance(node.targets[0], ast.Name) and
+                isinstance(node.value, (ast.Tuple, ast.List))):
+            return
+
         if node.targets[0].id.lower() == "image_size":
             size = [i.value for i in node.value.elts]
             self.data_config["train_data"]["images_size"] = size
@@ -638,7 +668,7 @@ class ASTParser(ast.NodeVisitor):
     def get_params_from_optimizer(self, node: ast.Assign):
         """
         It extracts information related to the optimizer.
-        
+
         Parameters:
             node (ast.Assign): The AST node representing an assignment
                 statement.
@@ -646,6 +676,12 @@ class ASTParser(ast.NodeVisitor):
         Returns:
             None, but collects attributes for config in data_config dict.
         """
+        # Validate node structure
+        if not (isinstance(node.value, ast.Call) and
+                hasattr(node.value, 'func') and
+                hasattr(node.value.func, 'attr')):
+            return
+
         self.data_config["config"]["optimizer"] = node.value.func.attr.lower()
         keywords = node.value.keywords
         learning_rate = next(
