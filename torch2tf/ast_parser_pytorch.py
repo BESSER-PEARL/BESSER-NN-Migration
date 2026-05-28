@@ -31,8 +31,18 @@ class ASTParserTorch(ASTParser):
             its configuration and dataset.
         activation_functions (dict): it keeps track of the activation
             function of layers. Keys are layer names and values are
-            activation function names.        
+            activation function names.
     """
+
+    # Temporary variable name patterns
+    TEMP_SUBSCRIPT_OP = "_subscript_op_{}"
+    TEMP_CHAIN = "_chain_temp_{}_{}"
+    TEMP_NESTED_IN_CHAIN = "_nested_in_chain_{}"
+    TEMP_SUBSCRIPT = "_subscript_temp_{}"
+    TEMP_NESTED = "_nested_temp_{}"
+    TEMP_MLRNN = "_mlrnn_{}_{}"
+    TEMP_BINOP = "_binop_temp_{}"
+    TEMP_INLINE = "_inline_{}_{}"
 
     def __init__(self, input_nn_type: str, only_nn: bool):
         super().__init__(input_nn_type, only_nn)
@@ -129,7 +139,7 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but adds TensorOp to BUML model
         """
-        op_name = f"_subscript_op_{self.tensor_op_counter}"
+        op_name = self.TEMP_SUBSCRIPT_OP.format(self.tensor_op_counter)
         self.tensor_op_counter += 1
 
         # Resolve variable aliases to find the actual source
@@ -397,7 +407,7 @@ class ASTParserTorch(ASTParser):
                     if is_last:
                         synthetic_node = ast.Assign(targets=node.targets, value=call)
                     else:
-                        temp_name = f"_chain_temp_{self.tensor_op_counter}_{i}"
+                        temp_name = self.TEMP_CHAIN.format(self.tensor_op_counter, i)
                         temp_target = ast.Name(id=temp_name, ctx=ast.Store())
                         synthetic_node = ast.Assign(targets=[temp_target], value=call)
 
@@ -419,7 +429,7 @@ class ASTParserTorch(ASTParser):
                     if isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Call):
                         # Nested call within chain: decompose it first
                         inner_call = call.args[0]
-                        inner_temp = f"_nested_in_chain_{self.tensor_op_counter}"
+                        inner_temp = self.TEMP_NESTED_IN_CHAIN.format(self.tensor_op_counter)
                         self.tensor_op_counter += 1
                         inner_target = ast.Name(id=inner_temp, ctx=ast.Store())
                         inner_node = ast.Assign(targets=[inner_target], value=inner_call)
@@ -439,7 +449,8 @@ class ASTParserTorch(ASTParser):
                     # Mark as nested outer part if this is activation on the inner temp
                     is_nested_activation = False
                     if isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Name):
-                        if call.args[0].id.startswith('_nested_in_chain_'):
+                        # Check if it starts with the nested-in-chain prefix
+                        if call.args[0].id.startswith(self.TEMP_NESTED_IN_CHAIN.split('{')[0]):
                             self.is_processing_nested_outer = True
                             is_nested_activation = True
 
@@ -455,7 +466,7 @@ class ASTParserTorch(ASTParser):
         if isinstance(node.value, ast.Call) and node.value.args:
             if isinstance(node.value.args[0], ast.Subscript):
                 subscript_node = node.value.args[0]
-                temp_name = f"_subscript_temp_{self.tensor_op_counter}"
+                temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
                 self.tensor_op_counter += 1
 
                 self.handle_subscript_operation(subscript_node, temp_name, node)
@@ -469,7 +480,7 @@ class ASTParserTorch(ASTParser):
             if isinstance(node.value.args[0], ast.Call):
                 # Nested call detected: process inner call first
                 inner_call = node.value.args[0]
-                temp_name = f"_nested_temp_{self.tensor_op_counter}"
+                temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
                 self.tensor_op_counter += 1
                 temp_target = ast.Name(id=temp_name, ctx=ast.Store())
 
@@ -830,7 +841,7 @@ class ASTParserTorch(ASTParser):
 
             else:
                 # Intermediate layer - simple call storing to temp variable
-                temp_var = f"_mlrnn_{module_name}_{i}"
+                temp_var = self.TEMP_MLRNN.format(module_name, i)
                 self.inputs_outputs[layer_name] = [current_input, temp_var]
                 self.module_of_output[temp_var] = layer_name
 
@@ -989,7 +1000,7 @@ class ASTParserTorch(ASTParser):
             left_var = self.extract_inline_tensorop(binop.left, node)
         elif isinstance(binop.left, ast.Subscript):
             # Handle subscript like out[:, -1, :]
-            temp_name = f"_subscript_temp_{self.tensor_op_counter}"
+            temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
             self.tensor_op_counter += 1
             self.handle_subscript_operation(binop.left, temp_name, node)
             left_var = temp_name
@@ -998,7 +1009,7 @@ class ASTParserTorch(ASTParser):
             left_var = binop.left.value if isinstance(binop.left, ast.Constant) else binop.left.n
         elif isinstance(binop.left, ast.BinOp):
             # Handle nested binop like (x1 + x2) + x3
-            temp_name = f"_binop_temp_{self.tensor_op_counter}"
+            temp_name = self.TEMP_BINOP.format(self.tensor_op_counter)
             self.tensor_op_counter += 1
             temp_target = ast.Name(id=temp_name, ctx=ast.Store())
             binop_assign = ast.Assign(targets=[temp_target], value=binop.left)
@@ -1020,7 +1031,7 @@ class ASTParserTorch(ASTParser):
             right_var = self.extract_inline_tensorop(binop.right, node)
         elif isinstance(binop.right, ast.Subscript):
             # Handle subscript like out[:, -1, :]
-            temp_name = f"_subscript_temp_{self.tensor_op_counter}"
+            temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
             self.tensor_op_counter += 1
             self.handle_subscript_operation(binop.right, temp_name, node)
             right_var = temp_name
@@ -1029,7 +1040,7 @@ class ASTParserTorch(ASTParser):
             right_var = binop.right.value if isinstance(binop.right, ast.Constant) else binop.right.n
         elif isinstance(binop.right, ast.BinOp):
             # Handle nested binop like x1 + (x2 + x3)
-            temp_name = f"_binop_temp_{self.tensor_op_counter}"
+            temp_name = self.TEMP_BINOP.format(self.tensor_op_counter)
             self.tensor_op_counter += 1
             temp_target = ast.Name(id=temp_name, ctx=ast.Store())
             binop_assign = ast.Assign(targets=[temp_target], value=binop.right)
@@ -1384,7 +1395,7 @@ class ASTParserTorch(ASTParser):
             return base_var
 
         # Create intermediate variable name
-        intermediate_var = f"_inline_{op_type}_{self.tensor_op_counter}"
+        intermediate_var = self.TEMP_INLINE.format(op_type, self.tensor_op_counter)
 
         # Get the layer/module that produced the base variable
         base_layer = self.module_of_output.get(base_var)
@@ -1438,16 +1449,6 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but populates the buml model.
         """
-        # Handle both simple assignments (x = ...) and tuple assignments (x, _ = ...)
-        if isinstance(node.targets[0], ast.Name):
-            target_var = node.targets[0].id
-        elif isinstance(node.targets[0], ast.Tuple):
-            # Tuple assignment - use the first element (e.g., max_pool, _ = x.max())
-            first_elem = node.targets[0].elts[0]
-            target_var = first_elem.id if isinstance(first_elem, ast.Name) else "?"
-        else:
-            target_var = "?"
-
         # Handle .values attribute accessor (e.g., x.max(dim=1).values)
         call_node = node.value
         if isinstance(node.value, ast.Attribute) and node.value.attr == 'values':
@@ -1715,15 +1716,13 @@ class ASTParserTorch(ASTParser):
         elif op_type == "normalize":
             # F.normalize(input, p=2, dim=1) -> L2 normalization
             # First arg is the input tensor, then parameters
-            norm_p = 2  # Default to L2
             norm_dim = None
 
             # Extract input tensor (first argument)
             if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
                 source_var = op_args[0].id
                 # Check positional args: normalize(input, p, dim)
-                if len(op_args) > 1:
-                    norm_p = self.param_value(op_args[1])
+                # Note: p parameter is ignored as TF only supports L2
                 if len(op_args) > 2:
                     norm_dim = self.param_value(op_args[2])
             else:
@@ -1731,10 +1730,9 @@ class ASTParserTorch(ASTParser):
 
             # Check keyword args
             for kw in call_node.keywords:
-                if kw.arg == "p":
-                    norm_p = self.param_value(kw.value)
-                elif kw.arg == "dim":
+                if kw.arg == "dim":
                     norm_dim = self.param_value(kw.value)
+                # Note: p parameter is ignored as TF only supports L2
 
             # Track which variable this operation is called on
             if source_var and source_var in self.module_of_output:
@@ -1747,8 +1745,7 @@ class ASTParserTorch(ASTParser):
             tensorop_param = {"tns_type": "normalize",
                               "reduce_dim": norm_dim,
                               "layers_of_tensors": source_layers}
-            # Note: norm_p is typically 2 for L2 normalization
-            # TF's l2_normalize only supports L2, so we'll use that
+            # Note: TF's l2_normalize only supports L2 normalization
         elif op_type == "flatten":
             # x.flatten(start_dim=1) -> create FlattenLayer
             # Extract start_dim and end_dim parameters
@@ -1916,7 +1913,7 @@ class ASTParserTorch(ASTParser):
                             self.buml_model.modules.append(reuse_layer)
 
                             # Create temp variable for this use
-                            temp_name = f"_nested_temp_{self.tensor_op_counter}"
+                            temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
                             self.tensor_op_counter += 1
                             self.module_of_output[temp_name] = reuse_layer.name
                             return temp_name
@@ -1932,7 +1929,7 @@ class ASTParserTorch(ASTParser):
                             self.buml_model.modules.append(layer_obj)
 
                             # Create temp variable for the layer's output
-                            temp_name = f"_nested_temp_{self.tensor_op_counter}"
+                            temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
                             self.tensor_op_counter += 1
                             self.module_of_output[temp_name] = layer_name
                             return temp_name
@@ -1952,7 +1949,7 @@ class ASTParserTorch(ASTParser):
                     return result
             elif isinstance(arg, ast.Subscript):
                 # Subscript like h_n[-2] - create subscript TensorOp
-                temp_name = f"_subscript_temp_{self.tensor_op_counter}"
+                temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
                 self.tensor_op_counter += 1
                 self.handle_subscript_operation(arg, temp_name, node)
                 return temp_name
