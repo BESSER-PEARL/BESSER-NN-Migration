@@ -1186,44 +1186,46 @@ class ASTParserTorch(ASTParser):
         if output_var:
             self.module_of_output[output_var] = op_name
 
-    def _handle_functional_activation(self, node, module_name):
-        """Handle functional API activation functions."""
-        # Extract input variable
+    def _extract_activation_input_var(self, node):
+        """Extract input variable from activation function call."""
         if not node.value.args or not isinstance(node.value.args[0], ast.Name):
             self.migration_warnings.append(
                 f"Line {node.lineno}: Could not extract input for activation function. Using default input variable 'x'."
             )
-            input_var = "x"
+            return "x"
+        return node.value.args[0].id
+
+    def _check_prev_is_tensorop(self, input_var):
+        """Check if previous module is a TensorOp. Returns (is_tensorop, prev_lyr_obj, prev_lyr_name)."""
+        if input_var not in self.module_of_output:
+            return False, None, None
+
+        prev_lyr_name = self.module_of_output[input_var]
+        prev_lyr_obj = self._get_module_by_name(prev_lyr_name)
+        prev_cls = prev_lyr_obj.__class__.__name__ if prev_lyr_obj else "None"
+        is_tensorop = prev_lyr_obj and prev_cls == "TensorOp"
+        return is_tensorop, prev_lyr_obj, prev_lyr_name
+
+    def _create_standalone_functional_activation(self, node, module_name, input_var):
+        """Create standalone activation layer for functional API."""
+        actv_lyr_name = f"activ_{module_name}_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+        actv_lyr = mm_classes.GeneralLayer(name=actv_lyr_name, actv_func=actv_fun_mapping[module_name])
+        self.buml_model.add_layer(actv_lyr)
+        self.buml_model.modules.append(actv_lyr)
+
+        output_var = node.targets[0].id
+        self.inputs_outputs[actv_lyr_name] = [input_var, output_var]
+        self.module_of_output[output_var] = actv_lyr_name
+
+    def _handle_functional_activation(self, node, module_name):
+        """Handle functional API activation functions."""
+        input_var = self._extract_activation_input_var(node)
+        is_tensorop, prev_lyr_obj, prev_lyr_name = self._check_prev_is_tensorop(input_var)
+
+        if is_tensorop:
+            self._create_standalone_functional_activation(node, module_name, input_var)
         else:
-            input_var = node.value.args[0].id
-
-        prev_is_tensorop = False
-        prev_lyr_obj = None
-
-        # Check if previous module is a TensorOp
-        if input_var in self.module_of_output:
-            prev_lyr_name = self.module_of_output[input_var]
-            prev_lyr_obj = self._get_module_by_name(prev_lyr_name)
-            prev_cls = prev_lyr_obj.__class__.__name__ if prev_lyr_obj else "None"
-            if prev_lyr_obj and prev_cls == "TensorOp":
-                prev_is_tensorop = True
-
-        if prev_is_tensorop:
-            # Create standalone activation layer
-            actv_lyr_name = f"activ_{module_name}_{self.tensor_op_counter}"
-            self.tensor_op_counter += 1
-            actv_lyr = mm_classes.GeneralLayer(
-                name=actv_lyr_name,
-                actv_func=actv_fun_mapping[module_name]
-            )
-            self.buml_model.add_layer(actv_lyr)
-            self.buml_model.modules.append(actv_lyr)
-
-            output_var = node.targets[0].id
-            self.inputs_outputs[actv_lyr_name] = [input_var, output_var]
-            self.module_of_output[output_var] = actv_lyr_name
-        else:
-            # Attach activation to previous layer
             if prev_lyr_obj:
                 prev_lyr_obj.actv_func = actv_fun_mapping[module_name]
                 if hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer:
@@ -1624,8 +1626,8 @@ class ASTParserTorch(ASTParser):
 
         return {"tns_type": "normalize", "reduce_dim": norm_dim, "layers_of_tensors": source_layers}
 
-    def _extract_op_flatten(self, call_node, node, op_args):
-        """Extract flatten operation and create FlattenLayer (not a TensorOp)."""
+    def _extract_flatten_dims(self, op_args, keywords):
+        """Extract start_dim and end_dim from flatten operation."""
         start_dim = 1
         end_dim = -1
 
@@ -1634,11 +1636,29 @@ class ASTParserTorch(ASTParser):
         if len(op_args) > 1:
             end_dim = self.param_value(op_args[1])
 
-        for kw in call_node.keywords:
+        for kw in keywords:
             if kw.arg == "start_dim":
                 start_dim = self.param_value(kw.value)
             elif kw.arg == "end_dim":
                 end_dim = self.param_value(kw.value)
+
+        return start_dim, end_dim
+
+    def _create_flatten_layer(self, layer_name, start_dim, end_dim, name_module_input):
+        """Create FlattenLayer with given parameters."""
+        flatten_params = {
+            "name": layer_name,
+            "start_dim": start_dim,
+            "end_dim": end_dim,
+            "name_module_input": name_module_input
+        }
+        flatten_layer = getattr(mm_classes, "FlattenLayer")(**flatten_params)
+        self.buml_model.add_layer(flatten_layer)
+        return flatten_layer
+
+    def _extract_op_flatten(self, call_node, node, op_args):
+        """Extract flatten operation and create FlattenLayer (not a TensorOp)."""
+        start_dim, end_dim = self._extract_flatten_dims(op_args, call_node.keywords)
 
         source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
         name_module_input = self.module_of_output.get(source_var, source_var)
@@ -1646,21 +1666,13 @@ class ASTParserTorch(ASTParser):
         layer_name = f"flatten_{self.tensor_op_counter}"
         self.tensor_op_counter += 1
 
-        flatten_params = {
-            "name": layer_name,
-            "start_dim": start_dim,
-            "end_dim": end_dim,
-            "name_module_input": name_module_input
-        }
-
-        flatten_layer = getattr(mm_classes, "FlattenLayer")(**flatten_params)
-        self.buml_model.add_layer(flatten_layer)
+        self._create_flatten_layer(layer_name, start_dim, end_dim, name_module_input)
 
         if isinstance(node.targets[0], ast.Name):
             output_var = node.targets[0].id
             self.module_of_output[output_var] = layer_name
 
-        return "flatten_created"  # Special marker to skip TensorOp creation
+        return "flatten_created"
 
     def _extract_op_repeat(self, call_node, op_args):
         """Extract repeat operation parameters."""
