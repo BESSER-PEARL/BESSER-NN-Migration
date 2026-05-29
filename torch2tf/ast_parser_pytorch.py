@@ -1083,6 +1083,32 @@ class ASTParserTorch(ASTParser):
                         self.buml_model.modules.pop()
 
 
+    def _extract_inline_base_var(self, call_node, parent_node):
+        """Extract base variable from inline operation, handling chained calls."""
+        if isinstance(call_node.func.value, ast.Name):
+            return call_node.func.value.id
+        elif isinstance(call_node.func.value, ast.Call):
+            return self.extract_inline_tensorop(call_node.func.value, parent_node)
+        else:
+            if hasattr(call_node.func, 'value') and hasattr(call_node.func.value, 'id'):
+                return call_node.func.value.id
+            return "x"
+
+    def _extract_inline_op_params(self, call_node, op_type):
+        """Extract operation parameters for inline TensorOp."""
+        if op_type == 'repeat':
+            repeat_counts = [self.param_value(arg) for arg in call_node.args]
+            return {"repeat_dim": repeat_counts}
+        else:
+            dim_value = None
+            if len(call_node.args) > 0:
+                dim_value = self.param_value(call_node.args[0])
+            else:
+                for kw in call_node.keywords:
+                    if kw.arg == "dim":
+                        dim_value = self.param_value(kw.value)
+            return {"reduce_dim": dim_value}
+
     def extract_inline_tensorop(self, call_node: ast.Call, parent_node: ast.Assign):
         """
         Extracts inline tensor operations like x.unsqueeze(1) or x.squeeze(1)
@@ -1095,73 +1121,32 @@ class ASTParserTorch(ASTParser):
         Returns:
             str: The name of the intermediate variable created
         """
-        # Check if it's a method call
         if not isinstance(call_node.func, ast.Attribute):
             return "x"
 
         op_type = call_node.func.attr
+        base_var = self._extract_inline_base_var(call_node, parent_node)
 
-        # Check if it's a method call on a variable or on another call (chained)
-        if isinstance(call_node.func.value, ast.Name):
-            base_var = call_node.func.value.id
-        elif isinstance(call_node.func.value, ast.Call):
-            # Chained call like h.unsqueeze(1).squeeze(1)
-            # Recursively process the inner call first
-            base_var = self.extract_inline_tensorop(call_node.func.value, parent_node)
-        else:
-            # Not a simple method call, return default
-            if hasattr(call_node.func, 'value') and hasattr(call_node.func.value, 'id'):
-                return call_node.func.value.id
-            return "x"
-
-        # Only handle squeeze/unsqueeze/repeat for now
-        # Layer calls (self.layer_name(...)) should be handled by the caller
         if op_type not in ['squeeze', 'unsqueeze', 'repeat']:
-            # If this is a layer call (base_var == 'self'), signal to caller
             if base_var == 'self':
-                return None  # Signal that this needs special handling
+                return None
             return base_var
 
-        # Create intermediate variable name
-        intermediate_var = self.TEMP_INLINE.format(op_type, self.tensor_op_counter)
-
-        # Get the layer/module that produced the base variable
         base_layer = self.module_of_output.get(base_var)
         if base_layer is None:
-            # If not tracked, just return the base variable
             return base_var
 
-        # Create tensor operation with layers_of_tensors to track the source
+        intermediate_var = self.TEMP_INLINE.format(op_type, self.tensor_op_counter)
         tensorop_param = {
             "tns_type": op_type,
-            "layers_of_tensors": [base_layer],  # Track which layer this operates on
+            "layers_of_tensors": [base_layer],
             "name": f"op_{self.tensor_op_counter}"
         }
-
-        # Extract parameters based on operation type
-        if op_type == 'repeat':
-            # repeat takes multiple arguments (one per dimension)
-            # e.g., .repeat(1, t, 1) means repeat 1x along dim0, t times along dim1, 1x along dim2
-            repeat_counts = []
-            for arg in call_node.args:
-                repeat_counts.append(self.param_value(arg))
-            tensorop_param["repeat_dim"] = repeat_counts
-        else:
-            # squeeze/unsqueeze take a single dimension parameter
-            dim_value = None
-            if len(call_node.args) > 0:
-                dim_value = self.param_value(call_node.args[0])
-            else:
-                for kw in call_node.keywords:
-                    if kw.arg == "dim":
-                        dim_value = self.param_value(kw.value)
-            tensorop_param["reduce_dim"] = dim_value
+        tensorop_param.update(self._extract_inline_op_params(call_node, op_type))
 
         tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-        self.buml_model.add_tensor_op(tns_obj)  # Already adds to modules
+        self.buml_model.add_tensor_op(tns_obj)
         self.tensor_op_counter += 1
-
-        # Track the intermediate variable
         self.module_of_output[intermediate_var] = tensorop_param["name"]
 
         return intermediate_var
@@ -1748,59 +1733,63 @@ class ASTParserTorch(ASTParser):
             self._create_and_track_tensorop(tensorop_param, call_node, node)
 
 
+    def _handle_layer_reuse_in_concat(self, layer_obj, arg, layer_name):
+        """Handle layer reuse in concatenation."""
+        import copy
+        self.layer_reuse_count[layer_name] = self.layer_reuse_count.get(layer_name, 0) + 1
+        use_count = self.layer_reuse_count[layer_name]
+
+        reuse_layer = copy.copy(layer_obj)
+        reuse_layer.name = f"{layer_name}_use_{use_count}"
+        reuse_layer.input_reused = True
+
+        if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+            input_var = arg.args[0].id
+            if input_var in self.module_of_output:
+                reuse_layer.name_module_input = self.module_of_output[input_var]
+
+        self.buml_model.modules.append(reuse_layer)
+        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+        self.module_of_output[temp_name] = reuse_layer.name
+        return temp_name
+
+    def _handle_first_layer_use_in_concat(self, layer_obj, arg, layer_name):
+        """Handle first layer use in concatenation."""
+        if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+            input_var = arg.args[0].id
+            if input_var in self.module_of_output:
+                layer_obj.name_module_input = self.module_of_output[input_var]
+                layer_obj.input_reused = True
+
+        self.buml_model.modules.append(layer_obj)
+        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+        self.module_of_output[temp_name] = layer_name
+        return temp_name
+
     def _extract_concat_arg_variable(self, arg, node):
         """Extract variable name from concatenation argument, handling layer calls and inline ops."""
         if isinstance(arg, ast.Name):
             return arg.id
         elif isinstance(arg, ast.Call):
-            # Check if it's a layer call (self.layer_name(...))
             if (isinstance(arg.func, ast.Attribute) and
                 isinstance(arg.func.value, ast.Name) and
                 arg.func.value.id == 'self'):
                 layer_name = arg.func.attr
                 layer_obj = next((lyr for lyr in self.buml_model.layers if lyr.name == layer_name), None)
 
-                if layer_obj:
-                    # Handle layer reuse
-                    if layer_obj in self.buml_model.modules:
-                        self.layer_reuse_count[layer_name] = self.layer_reuse_count.get(layer_name, 0) + 1
-                        use_count = self.layer_reuse_count[layer_name]
-
-                        import copy
-                        reuse_layer = copy.copy(layer_obj)
-                        reuse_layer.name = f"{layer_name}_use_{use_count}"
-                        reuse_layer.input_reused = True
-
-                        if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
-                            input_var = arg.args[0].id
-                            if input_var in self.module_of_output:
-                                reuse_layer.name_module_input = self.module_of_output[input_var]
-
-                        self.buml_model.modules.append(reuse_layer)
-                        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
-                        self.tensor_op_counter += 1
-                        self.module_of_output[temp_name] = reuse_layer.name
-                        return temp_name
-                    else:
-                        # First use
-                        if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
-                            input_var = arg.args[0].id
-                            if input_var in self.module_of_output:
-                                layer_obj.name_module_input = self.module_of_output[input_var]
-                                layer_obj.input_reused = True
-
-                        self.buml_model.modules.append(layer_obj)
-                        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
-                        self.tensor_op_counter += 1
-                        self.module_of_output[temp_name] = layer_name
-                        return temp_name
-                else:
+                if not layer_obj:
                     self.migration_warnings.append(
                         f"Concatenation operation: Layer '{layer_name}' referenced but not found in the model. Check if it was defined earlier."
                     )
                     return None
+
+                if layer_obj in self.buml_model.modules:
+                    return self._handle_layer_reuse_in_concat(layer_obj, arg, layer_name)
+                else:
+                    return self._handle_first_layer_use_in_concat(layer_obj, arg, layer_name)
             else:
-                # Method call like x.squeeze(1)
                 result = self.extract_inline_tensorop(arg, node)
                 if result is None:
                     self.migration_warnings.append(
