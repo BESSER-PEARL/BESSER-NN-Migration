@@ -567,6 +567,38 @@ class ASTParserTorch(ASTParser):
         else:
             self.extract_tensorop(node)
 
+    def _process_last_layer_tuple(self, node, layer_name, current_input):
+        """Process last layer with tuple assignment in multi-layer RNN."""
+        self._extract_tuple_target_vars(node, layer_name)
+        rnn_out = self._determine_rnn_return_type(node, layer_name)
+        self.inputs_outputs[layer_name] = [current_input, rnn_out]
+
+        lyr_obj = self._get_layer_by_name(layer_name)
+        if lyr_obj:
+            self.buml_model.modules.append(lyr_obj)
+
+    def _process_last_layer_simple(self, node, layer_name, current_input):
+        """Process last layer with simple assignment in multi-layer RNN."""
+        output_var = node.targets[0].id
+        self.inputs_outputs[layer_name] = [current_input, output_var]
+        self.module_of_output[output_var] = layer_name
+
+        lyr_obj = self._get_layer_by_name(layer_name)
+        if lyr_obj:
+            self.buml_model.modules.append(lyr_obj)
+
+    def _process_intermediate_layer(self, module_name, layer_name, current_input, i):
+        """Process intermediate layer in multi-layer RNN."""
+        temp_var = self.TEMP_MLRNN.format(module_name, i)
+        self.inputs_outputs[layer_name] = [current_input, temp_var]
+        self.module_of_output[temp_var] = layer_name
+
+        module_obj = self._get_layer_by_name(layer_name)
+        if module_obj:
+            self.buml_model.modules.append(module_obj)
+
+        return temp_var
+
     def expand_multi_layer_rnn_call(self, node: ast.Assign, module_name: str, is_tuple: bool):
         """
         Expand a multi-layer RNN call into sequential calls to individual layers.
@@ -578,86 +610,22 @@ class ASTParserTorch(ASTParser):
           - out, h = self.gru_layer_2(temp_1)
         """
         layer_names = self.multi_layer_rnns[module_name]
+        current_input = self._extract_rnn_input_arg(node)
 
-        # Get the input variable from the original call
-        input_arg = node.value.args[0]
-        if isinstance(input_arg, ast.Name):
-            current_input = input_arg.id
-        elif isinstance(input_arg, ast.Call):
-            current_input = self.extract_inline_tensorop(input_arg, node)
-        else:
-            current_input = "x"
-
-        # Process each layer in the stack
         for i, layer_name in enumerate(layer_names):
             is_last_layer = (i == len(layer_names) - 1)
 
             if is_last_layer:
-                # Last layer - modify the original node and let the normal processing handle it
                 node.value.func.attr = layer_name
                 if i > 0:
-                    # Update input to use temp var from previous layer
                     node.value.args[0] = ast.Name(id=current_input, ctx=ast.Load())
 
-                # Now process this node with normal logic (no recursion since we're using layer_name not module_name)
                 if is_tuple:
-                    # Manually inline the tuple assignment logic to avoid recursion
-                    var1 = node.targets[0].elts[0].id if not isinstance(node.targets[0].elts[0], ast.Tuple) else None
-                    var2 = node.targets[0].elts[1].id if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0].id
-
-                    if var1 and var1 != "_":
-                        self.rnn_output_vars[layer_name] = var1
-                        self.module_of_output[var1] = layer_name
-                    if var2 and var2 != "_":
-                        self.rnn_hidden_vars[layer_name] = var2
-                        self.module_of_output[var2] = layer_name
-
-                    first_elem = node.targets[0].elts[0]
-                    second_elem = node.targets[0].elts[1] if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0]
-                    first_is_underscore = isinstance(first_elem, ast.Name) and first_elem.id == "_"
-                    second_is_underscore = isinstance(second_elem, ast.Name) and second_elem.id == "_"
-
-                    lyr_obj = self._get_layer_by_name(layer_name)
-
-                    if first_is_underscore and not second_is_underscore:
-                        rnn_out = node.targets[0].elts[1].id if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0].id
-                        if lyr_obj:
-                            lyr_obj.return_type = "hidden"
-                    elif not first_is_underscore and second_is_underscore:
-                        rnn_out = node.targets[0].elts[0].id
-                        if lyr_obj:
-                            lyr_obj.return_type = "full"
-                    else:
-                        rnn_out = node.targets[0].elts[0].id
-                        if lyr_obj:
-                            lyr_obj.return_type = "both"
-
-                    self.inputs_outputs[layer_name] = [current_input, rnn_out]
-
-                    if lyr_obj:
-                        self.buml_model.modules.append(lyr_obj)
+                    self._process_last_layer_tuple(node, layer_name, current_input)
                 else:
-                    # Simple call
-                    output_var = node.targets[0].id
-                    self.inputs_outputs[layer_name] = [current_input, output_var]
-                    self.module_of_output[output_var] = layer_name
-
-                    lyr_obj = self._get_layer_by_name(layer_name)
-                    if lyr_obj:
-                        self.buml_model.modules.append(lyr_obj)
-
+                    self._process_last_layer_simple(node, layer_name, current_input)
             else:
-                # Intermediate layer - simple call storing to temp variable
-                temp_var = self.TEMP_MLRNN.format(module_name, i)
-                self.inputs_outputs[layer_name] = [current_input, temp_var]
-                self.module_of_output[temp_var] = layer_name
-
-                # Add layer to modules
-                module_obj = self._get_layer_by_name(layer_name)
-                if module_obj:
-                    self.buml_model.modules.append(module_obj)
-
-                current_input = temp_var
+                current_input = self._process_intermediate_layer(module_name, layer_name, current_input, i)
 
     def _extract_tuple_target_vars(self, node, module_name):
         """Extract and track output/hidden variables from tuple assignment targets."""
