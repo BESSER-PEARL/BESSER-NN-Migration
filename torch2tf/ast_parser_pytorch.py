@@ -878,6 +878,28 @@ class ASTParserTorch(ASTParser):
                         # Mark that this layer's input should be preserved (residual connection)
                         layer_obj.input_reused = True
 
+    def _extract_tuple_var_names(self, tuple_target):
+        """Extract variable names from tuple unpacking target."""
+        var_names = []
+        for elt in tuple_target.elts:
+            if isinstance(elt, ast.Name):
+                var_names.append(elt.id)
+            else:
+                var_names.append('_')
+        return var_names
+
+    def _create_shape_dim_tensorop(self, var_name, idx, source_module):
+        """Create TensorOp for shape dimension extraction."""
+        tensorop_param = {
+            "name": var_name,
+            "tns_type": "shape_dim",
+            "layers_of_tensors": [source_module],
+            "reduce_dim": idx
+        }
+        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        self.buml_model.add_tensor_op(tns_obj)
+        self.module_of_output[var_name] = var_name
+
     def handle_forward_shape_unpacking(self, node: ast.Assign):
         """
         Handle tuple unpacking of shape attributes (e.g., b, t, _ = x.shape).
@@ -889,43 +911,19 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but creates TensorOps for shape dimension extraction.
         """
-        # Extract the tuple elements (variable names)
         tuple_target = node.targets[0]
-        var_names = []
-        for elt in tuple_target.elts:
-            if isinstance(elt, ast.Name):
-                var_names.append(elt.id)
-            else:
-                var_names.append('_')  # Placeholder for unused variables
+        var_names = self._extract_tuple_var_names(tuple_target)
 
-        # Extract the source variable (e.g., 'x' from 'x.shape')
         if isinstance(node.value.value, ast.Name):
             source_var = node.value.value.id
             attr_name = node.value.attr
 
-            # Only handle .shape attribute
             if attr_name == 'shape':
-                # Resolve source variable to its producing module
-                # If source_var is in module_of_output, use that module as the source
-                # Otherwise, use source_var directly (will be treated as INPUT by generator)
                 source_module = self.module_of_output.get(source_var, source_var)
 
-                # Create a TensorOp for each non-underscore variable
                 for idx, var_name in enumerate(var_names):
-                    if var_name != '_':  # Skip underscore placeholders
-                        # Use the variable name directly as the TensorOp name
-                        # This ensures the generated code uses the correct variable names
-                        tensorop_param = {
-                            "name": var_name,
-                            "tns_type": "shape_dim",
-                            "layers_of_tensors": [source_module],  # Resolved source module
-                            "reduce_dim": idx  # Dimension index
-                        }
-                        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-                        self.buml_model.add_tensor_op(tns_obj)
-
-                        # Track the output variable
-                        self.module_of_output[var_name] = var_name
+                    if var_name != '_':
+                        self._create_shape_dim_tensorop(var_name, idx, source_module)
 
     def _handle_non_rnn_slicing(self, node, subscripted_var, result_var):
         """Create subscript TensorOp for non-RNN slicing operations."""
@@ -1431,46 +1429,46 @@ class ASTParserTorch(ASTParser):
             source_layers = None
         return {"tns_type": "transpose", "transpose_dim": transpose_dim, "layers_of_tensors": source_layers}
 
+    def _extract_source_layers(self, var_node):
+        """Extract source layers from variable node."""
+        if not isinstance(var_node, ast.Name):
+            return None
+
+        source_var = var_node.id
+        if source_var in self.module_of_output:
+            return [self.module_of_output[source_var]]
+        else:
+            return ['INPUT']
+
+    def _process_reshape_arg(self, arg):
+        """Process single reshape argument, handling .size() calls and variables."""
+        if isinstance(arg, ast.Call) and hasattr(arg.func, 'attr') and arg.func.attr == 'size':
+            if len(arg.args) > 0:
+                dim_idx = self.param_value(arg.args[0])
+                source_layers = self._extract_source_layers(arg.func.value) if hasattr(arg.func, 'value') else None
+
+                op_name = f"op_{self.tensor_op_counter}"
+                shape_tensorop_param = {"tns_type": "shape_dim", "reduce_dim": dim_idx,
+                                       "layers_of_tensors": source_layers, "name": op_name}
+                tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+                self.buml_model.add_tensor_op(tns_obj)
+                self.tensor_op_counter += 1
+                return op_name
+            else:
+                return self.param_value(arg)
+        elif isinstance(arg, ast.Name) and arg.id in self.module_of_output:
+            layer_name = self.module_of_output[arg.id]
+            if layer_name.startswith('op_'):
+                return layer_name
+            else:
+                return self.param_value(arg)
+        else:
+            return self.param_value(arg)
+
     def _extract_op_reshape(self, call_node, node, op_args):
         """Extract reshape/view operation parameters."""
-        reshape_dim = []
-        for arg in op_args:
-            if isinstance(arg, ast.Call) and hasattr(arg.func, 'attr') and arg.func.attr == 'size':
-                if len(arg.args) > 0:
-                    dim_idx = self.param_value(arg.args[0])
-                    source_var = arg.func.value.id if isinstance(arg.func.value, ast.Name) else None
-                    if source_var and source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var:
-                        source_layers = ['INPUT']
-                    else:
-                        source_layers = None
-
-                    op_name = f"op_{self.tensor_op_counter}"
-                    shape_tensorop_param = {"tns_type": "shape_dim", "reduce_dim": dim_idx,
-                                           "layers_of_tensors": source_layers, "name": op_name}
-                    tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
-                    self.buml_model.add_tensor_op(tns_obj)
-                    self.tensor_op_counter += 1
-                    reshape_dim.append(op_name)
-                else:
-                    reshape_dim.append(self.param_value(arg))
-            elif isinstance(arg, ast.Name) and arg.id in self.module_of_output:
-                layer_name = self.module_of_output[arg.id]
-                if layer_name.startswith('op_'):
-                    reshape_dim.append(layer_name)
-                else:
-                    reshape_dim.append(self.param_value(arg))
-            else:
-                reshape_dim.append(self.param_value(arg))
-
-        source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
-        if source_var and source_var in self.module_of_output:
-            source_layers = [self.module_of_output[source_var]]
-        elif source_var:
-            source_layers = ['INPUT']
-        else:
-            source_layers = None
+        reshape_dim = [self._process_reshape_arg(arg) for arg in op_args]
+        source_layers = self._extract_source_layers(call_node.func.value) if hasattr(call_node.func, 'value') else None
 
         tensorop_param = {"tns_type": "reshape", "reshape_dim": reshape_dim}
         if source_layers:
