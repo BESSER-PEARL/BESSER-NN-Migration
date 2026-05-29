@@ -1254,53 +1254,61 @@ class ASTParserTorch(ASTParser):
         except ValueError as e:
             self.migration_warnings.append(f"Functional layer '{synthetic_name}': {str(e)}")
 
+    def _try_merge_activation(self, node, module_name):
+        """Try to merge activation into previous layer. Returns (merged, prev_lyr_name)."""
+        if hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer:
+            return False, None
+
+        if not (self.previous_assign and isinstance(self.previous_assign.value, ast.Call)):
+            return False, None
+
+        if not hasattr(self.previous_assign.value.func, 'attr'):
+            return False, None
+
+        prev_lyr_name = self.previous_assign.value.func.attr
+        prev_lyr_obj = self._get_module_by_name(prev_lyr_name)
+        if not prev_lyr_obj:
+            return False, None
+
+        actv = self.activation_functions[module_name]
+        actv_func = actv_fun_mapping.get(actv)
+        if actv_func is None:
+            self.migration_warnings.append(
+                f"Unsupported activation function '{actv}'. This activation will be skipped in the migration."
+            )
+            return False, None
+
+        prev_lyr_obj.actv_func = actv_func
+        output_var = node.targets[0].id
+        self.module_of_output[output_var] = prev_lyr_name
+        return True, prev_lyr_name
+
+    def _create_standalone_activation(self, node, module_name):
+        """Create standalone activation layer."""
+        unique_name = f"{module_name}_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+
+        actv = self.activation_functions[module_name]
+        actv_func = actv_fun_mapping.get(actv)
+        if actv_func is None:
+            self.migration_warnings.append(
+                f"Unsupported activation function '{actv}'. This activation will be skipped in the migration."
+            )
+            return
+
+        actv_lyr = mm_classes.GeneralLayer(name=unique_name, actv_func=actv_func)
+        self.buml_model.modules.append(actv_lyr)
+
+        input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
+        output_var = node.targets[0].id
+        self.inputs_outputs[unique_name] = [input_var, output_var]
+        self.module_of_output[output_var] = unique_name
+
     def _handle_module_activation(self, node, module_name):
         """Handle module API activation functions with merge logic."""
-        should_merge = not (hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer)
-
-        if should_merge and self.previous_assign and isinstance(self.previous_assign.value, ast.Call):
-            if hasattr(self.previous_assign.value.func, 'attr'):
-                prev_lyr_name = self.previous_assign.value.func.attr
-                prev_lyr_obj = self._get_module_by_name(prev_lyr_name)
-                if prev_lyr_obj:
-                    actv = self.activation_functions[module_name]
-                    actv_func = actv_fun_mapping.get(actv)
-                    if actv_func is None:
-                        self.migration_warnings.append(
-                            f"Unsupported activation function '{actv}'. This activation will be skipped in the migration."
-                        )
-                        should_merge = False
-                    else:
-                        prev_lyr_obj.actv_func = actv_func
-                        output_var = node.targets[0].id
-                        self.module_of_output[output_var] = prev_lyr_name
-                        should_merge = True
-                else:
-                    should_merge = False
-            else:
-                should_merge = False
-        else:
-            should_merge = False
-
-        # Create standalone activation if not merged
-        if not should_merge:
-            unique_name = f"{module_name}_{self.tensor_op_counter}"
-            self.tensor_op_counter += 1
-
-            actv = self.activation_functions[module_name]
-            actv_func = actv_fun_mapping.get(actv)
-            if actv_func is None:
-                self.migration_warnings.append(
-                    f"Unsupported activation function '{actv}'. This activation will be skipped in the migration."
-                )
-            else:
-                actv_lyr = mm_classes.GeneralLayer(name=unique_name, actv_func=actv_func)
-                self.buml_model.modules.append(actv_lyr)
-
-                input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
-                output_var = node.targets[0].id
-                self.inputs_outputs[unique_name] = [input_var, output_var]
-                self.module_of_output[output_var] = unique_name
+        merged, _ = self._try_merge_activation(node, module_name)
+        if not merged:
+            self._create_standalone_activation(node, module_name)
 
     def _handle_module_layer_reuse(self, node, module_name, module_obj):
         """Handle layer reuse by creating synthetic copy."""
@@ -1320,59 +1328,53 @@ class ASTParserTorch(ASTParser):
         self.buml_model.layers.append(synthetic_module)
         self.buml_model.modules.append(synthetic_module)
 
-    def _process_module_api(self, node, module_name):
-        """Process module API calls (self.layer)."""
-        # Check multi-layer RNN
-        if module_name in self.multi_layer_rnns:
-            self.expand_multi_layer_rnn_call(node, module_name, is_tuple=False)
+    def _detect_parallel_operations(self, module_obj, input_var):
+        """Detect and mark parallel operations and TensorOp usage."""
+        if not (module_obj and input_var in self.module_of_output):
             return
 
-        # Extract input variable
-        input_arg = node.value.args[0]
-        if isinstance(input_arg, ast.Name):
-            input_var = input_arg.id
-        elif isinstance(input_arg, ast.Call):
-            input_var = self.extract_inline_tensorop(input_arg, node)
-        else:
-            input_var = "x"
+        source_module = self.module_of_output[input_var]
+        if source_module.startswith("op_"):
+            module_obj.input_reused = True
+            if self.prev_layer_output and input_var != self.prev_layer_output:
+                module_obj.name_module_input = source_module
+        elif self.prev_layer_output and input_var != self.prev_layer_output:
+            module_obj.input_reused = True
 
-        self.inputs_outputs[module_name] = [input_var, node.targets[0].id]
-        self.module_of_output[node.targets[0].id] = module_name
-
-        # Detect parallel operations and TensorOp usage
-        module_obj = self._get_layer_by_name(module_name)
-        if module_obj and input_var in self.module_of_output:
-            source_module = self.module_of_output[input_var]
-            if source_module.startswith("op_"):
-                module_obj.input_reused = True
-                if self.prev_layer_output and input_var != self.prev_layer_output:
-                    module_obj.name_module_input = source_module
-            elif self.prev_layer_output and input_var != self.prev_layer_output:
-                module_obj.input_reused = True
-
-        self.prev_layer_output = node.targets[0].id
-
-        # Check residual connection
+    def _check_residual_connection(self, module_obj, input_var):
+        """Check and mark residual connections."""
         if hasattr(self, '_variables_saved_for_residual') and input_var in self._variables_saved_for_residual:
             if module_obj:
                 module_obj.input_reused = True
             self._variables_saved_for_residual.discard(input_var)
 
+    def _process_module_api(self, node, module_name):
+        """Process module API calls (self.layer)."""
+        if module_name in self.multi_layer_rnns:
+            self.expand_multi_layer_rnn_call(node, module_name, is_tuple=False)
+            return
+
+        input_var = self._extract_rnn_input_arg(node)
+        self.inputs_outputs[module_name] = [input_var, node.targets[0].id]
+        self.module_of_output[node.targets[0].id] = module_name
+
+        module_obj = self._get_layer_by_name(module_name)
+        self._detect_parallel_operations(module_obj, input_var)
+        self.prev_layer_output = node.targets[0].id
+        self._check_residual_connection(module_obj, input_var)
+
         is_subnn_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
-        # Handle activation functions
         if module_name in self.activation_functions:
             self._handle_module_activation(node, module_name)
         elif not is_subnn_obj:
             self.is_permute_before_cnn(module_name)
 
-        # Handle non-activation layers
         if module_name not in self.activation_functions:
             module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
             if not module_obj:
                 module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
-            # Handle layer reuse
             if module_obj and module_obj in self.buml_model.modules:
                 self._handle_module_layer_reuse(node, module_name, module_obj)
             elif module_obj:
