@@ -659,6 +659,53 @@ class ASTParserTorch(ASTParser):
 
                 current_input = temp_var
 
+    def _extract_tuple_target_vars(self, node, module_name):
+        """Extract and track output/hidden variables from tuple assignment targets."""
+        var1 = node.targets[0].elts[0].id if not isinstance(node.targets[0].elts[0], ast.Tuple) else None
+        var2 = node.targets[0].elts[1].id if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0].id
+
+        if var1 and var1 != "_":
+            self.rnn_output_vars[module_name] = var1
+            self.module_of_output[var1] = module_name
+        if var2 and var2 != "_":
+            self.rnn_hidden_vars[module_name] = var2
+            self.module_of_output[var2] = module_name
+
+    def _determine_rnn_return_type(self, node, module_name):
+        """Determine RNN return type and main output variable based on underscore pattern."""
+        first_elem = node.targets[0].elts[0]
+        second_elem = node.targets[0].elts[1] if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0]
+
+        first_is_underscore = isinstance(first_elem, ast.Name) and first_elem.id == "_"
+        second_is_underscore = isinstance(second_elem, ast.Name) and second_elem.id == "_"
+
+        lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
+
+        if first_is_underscore and not second_is_underscore:
+            rnn_out = node.targets[0].elts[1].elts[0].id if isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].id
+            if lyr_obj:
+                lyr_obj.return_type = "hidden"
+        elif not first_is_underscore and second_is_underscore:
+            rnn_out = node.targets[0].elts[0].id
+            if lyr_obj:
+                lyr_obj.return_type = "full"
+        else:
+            rnn_out = node.targets[0].elts[0].id
+            if lyr_obj:
+                lyr_obj.return_type = "both"
+
+        return rnn_out
+
+    def _extract_rnn_input_arg(self, node):
+        """Extract input argument from RNN call, handling both variables and inline operations."""
+        input_arg = node.value.args[0]
+        if isinstance(input_arg, ast.Name):
+            return input_arg.id
+        elif isinstance(input_arg, ast.Call):
+            return self.extract_inline_tensorop(input_arg, node)
+        else:
+            return "x"
+
     def handle_forward_tuple_assignment(self, node: ast.Assign):
         """
         It handles rnn tuple assignments such as
@@ -674,10 +721,7 @@ class ASTParserTorch(ASTParser):
         # Check if this is a method call (e.g., x.max(dim=1)) vs module call (e.g., self.rnn(x))
         if hasattr(node.value.func, 'value') and isinstance(node.value.func.value, ast.Name):
             caller_id = node.value.func.value.id
-            # If caller is not "self", it's a method call on a tensor - handle as TensorOp
             if caller_id != "self":
-                # This is a method call like x.max(dim=1) that returns a tuple
-                # Extract the first value and handle as TensorOp
                 self.extract_tensorop(node)
                 return
 
@@ -688,69 +732,20 @@ class ASTParserTorch(ASTParser):
             self.expand_multi_layer_rnn_call(node, module_name, is_tuple=True)
             return
 
-        # Track both variables (output and hidden) for later slicing operations
-        var1 = node.targets[0].elts[0].id if not isinstance(node.targets[0].elts[0], ast.Tuple) else None
-        var2 = node.targets[0].elts[1].id if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0].id
+        # Extract and track tuple target variables
+        self._extract_tuple_target_vars(node, module_name)
 
-        # For RNNs: var1 is typically output sequence, var2 is hidden state
-        # Track which variable is which for this RNN module
-        if var1 and var1 != "_":
-            self.rnn_output_vars[module_name] = var1
-            self.module_of_output[var1] = module_name
-        if var2 and var2 != "_":
-            self.rnn_hidden_vars[module_name] = var2
-            self.module_of_output[var2] = module_name
+        # Determine return type and main output variable
+        rnn_out = self._determine_rnn_return_type(node, module_name)
 
-        # Determine which is the main output for inputs_outputs tracking
-        # Determine return_type based on which elements are used
-        first_elem = node.targets[0].elts[0]
-        second_elem = node.targets[0].elts[1] if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0]
+        # Extract input argument
+        rnn_in = self._extract_rnn_input_arg(node)
 
-        first_is_underscore = isinstance(first_elem, ast.Name) and first_elem.id == "_"
-        second_is_underscore = isinstance(second_elem, ast.Name) and second_elem.id == "_"
-
-        lyr_obj = next((obj for obj in self.buml_model.layers if
-                        obj.name == module_name), None)
-
-        if first_is_underscore and not second_is_underscore:
-            # Only hidden state is used: _, h = rnn(x)
-            if isinstance(node.targets[0].elts[1], ast.Tuple):
-                rnn_out = node.targets[0].elts[1].elts[0].id
-            else:
-                rnn_out = node.targets[0].elts[1].id
-            if lyr_obj:
-                lyr_obj.return_type = "hidden"
-        elif not first_is_underscore and second_is_underscore:
-            # Only output sequence is used: out, _ = rnn(x)
-            rnn_out = node.targets[0].elts[0].id
-            if lyr_obj:
-                lyr_obj.return_type = "full"
-        else:
-            # Both are used: out, h = rnn(x)
-            rnn_out = node.targets[0].elts[0].id
-            if lyr_obj:
-                lyr_obj.return_type = "both"
-
-        # Extract input variable - handle both simple variables and method calls
-        input_arg = node.value.args[0]
-        if isinstance(input_arg, ast.Name):
-            # Simple variable: x
-            rnn_in = input_arg.id
-        elif isinstance(input_arg, ast.Call):
-            # Method call: x.unsqueeze(1) or x.squeeze(1)
-            # Create a synthetic intermediate operation
-            rnn_in = self.extract_inline_tensorop(input_arg, node)
-        else:
-            # Fallback
-            rnn_in = "x"
-
+        # Update tracking structures
         self.inputs_outputs[module_name] = [rnn_in, rnn_out]
-
-        module_obj = next((obj for obj in self.buml_model.layers if
-                           obj.name == module_name), None)
+        module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
         if not module_obj:
-            module_obj = next((obj for obj in self.buml_model.sub_nns if
-                               obj.name == module_name), None)
+            module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
         self.buml_model.modules.append(module_obj)
         self.previous_assign = node
 
