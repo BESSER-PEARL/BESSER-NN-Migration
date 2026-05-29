@@ -959,6 +959,43 @@ class ASTParserTorch(ASTParser):
                         # Track the output variable
                         self.module_of_output[var_name] = var_name
 
+    def _handle_non_rnn_slicing(self, node, subscripted_var, result_var):
+        """Create subscript TensorOp for non-RNN slicing operations."""
+        subscript_pattern = self.extract_subscript_pattern(node.value)
+        self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
+        self.previous_assign = node
+
+    def _update_hidden_as_output(self, lyr_obj, prev_module_name):
+        """Update layer to use hidden state as primary output."""
+        lyr_obj.use_hidden_as_output = True
+        if prev_module_name in self.rnn_hidden_vars:
+            hidden_var = self.rnn_hidden_vars[prev_module_name]
+            if prev_module_name in self.inputs_outputs:
+                self.inputs_outputs[prev_module_name][1] = hidden_var
+
+    def _determine_rnn_slice_return_type(self, node, lyr_obj, prev_module_name, subscripted_var, result_var):
+        """Determine RNN return type based on slicing pattern."""
+        if isinstance(node.value.slice, ast.UnaryOp):
+            has_output = prev_module_name in self.rnn_output_vars
+            has_hidden = prev_module_name in self.rnn_hidden_vars
+
+            if has_output and has_hidden:
+                lyr_obj.return_type = "both"
+                self._update_hidden_as_output(lyr_obj, prev_module_name)
+            else:
+                lyr_obj.return_type = "hidden"
+        elif isinstance(node.value.slice, ast.Tuple) and len(node.value.slice.elts) == 3:
+            if lyr_obj.return_type == "full":
+                self._handle_non_rnn_slicing(node, subscripted_var, result_var)
+                return True
+            if lyr_obj.return_type != "both":
+                lyr_obj.return_type = "last"
+        else:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unrecognized subscript pattern on variable '{subscripted_var}'. This may not migrate correctly."
+            )
+        return False
+
     def handle_forward_slicing(self, node: ast.Assign):
         """
         It handles rnn slicing calls such as 'x = x[:, -1, :]' or 'h = h[-1]'
@@ -970,86 +1007,29 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but populates the BUML model.
         """
-        # Get the variable being subscripted (e.g., 'h1' from 'h1[-1]')
         subscripted_var = node.value.value.id
         result_var = node.targets[0].id
 
         # Look up which module produced this variable
-        if subscripted_var in self.module_of_output:
-            prev_module_name = self.module_of_output[subscripted_var]
-
-            # Try to find the layer object
-            lyr_obj = next((obj for obj in self.buml_model.layers if
-                            obj.name == prev_module_name), None)
-
-            # If layer found and is RNN, handle RNN-specific slicing
-            if lyr_obj and hasattr(lyr_obj, 'return_type'):
-                # RNN layer - continue with RNN-specific processing below
-                pass
-            else:
-                # Not an RNN layer - create subscript TensorOp
-                result_var = node.targets[0].id
-                subscript_pattern = self.extract_subscript_pattern(node.value)
-                self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
-                self.previous_assign = node
-                return
-        else:
-            # Variable not in module_of_output - likely an input parameter or undefined
-            # Create subscript TensorOp (create_subscript_tensorop handles unknown vars)
-            result_var = node.targets[0].id
-            subscript_pattern = self.extract_subscript_pattern(node.value)
-            self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
-            self.previous_assign = node
+        if subscripted_var not in self.module_of_output:
+            self._handle_non_rnn_slicing(node, subscripted_var, result_var)
             return
 
-        # Determine the return type based on slicing pattern
-        if isinstance(node.value.slice, ast.UnaryOp):
-            # Pattern: h[-1] means extracting last layer's hidden state
-            # Check if BOTH output and hidden were captured (not underscore)
-            has_output = prev_module_name in self.rnn_output_vars
-            has_hidden = prev_module_name in self.rnn_hidden_vars
+        prev_module_name = self.module_of_output[subscripted_var]
+        lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == prev_module_name), None)
 
-            if has_output and has_hidden:
-                # Both output and hidden were captured - need "both"
-                lyr_obj.return_type = "both"
-                # Mark that hidden state is the primary output since code explicitly extracted h[-1]
-                lyr_obj.use_hidden_as_output = True
-                # Update inputs_outputs to use hidden variable as primary output
-                if prev_module_name in self.rnn_hidden_vars:
-                    hidden_var = self.rnn_hidden_vars[prev_module_name]
-                    if prev_module_name in self.inputs_outputs:
-                        # Update the output variable (second element) to be the hidden variable
-                        self.inputs_outputs[prev_module_name][1] = hidden_var
-            else:
-                # Only hidden was captured
-                lyr_obj.return_type = "hidden"
-        elif isinstance(node.value.slice, ast.Tuple) and len(node.value.slice.elts) == 3:
-            # Pattern: out[:, -1, :] means extracting last timestep from sequence
-            # Check if this is extracting from an already-returned output
-            # If the RNN already has return_sequences=True, create a subscript TensorOp instead
-            if lyr_obj.return_type == "full":
-                # RNN returns full sequence, create subscript TensorOp to extract last timestep
-                subscript_pattern = self.extract_subscript_pattern(node.value)
-                self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
-                self.previous_assign = node
-                return
-            # Don't overwrite "both" if it was already set from a previous slicing operation
-            if lyr_obj.return_type != "both":
-                lyr_obj.return_type = "last"
-        else:
-            self.migration_warnings.append(
-                f"Line {node.lineno}: Unrecognized subscript pattern on variable '{subscripted_var}'. This may not migrate correctly."
-            )
+        # If not an RNN layer, handle as regular subscript
+        if not lyr_obj or not hasattr(lyr_obj, 'return_type'):
+            self._handle_non_rnn_slicing(node, subscripted_var, result_var)
+            return
 
-        # Track the result variable so it can be used in subsequent operations (e.g., concat)
-        result_var = node.targets[0].id
+        # Determine RNN return type based on slice pattern
+        if self._determine_rnn_slice_return_type(node, lyr_obj, prev_module_name, subscripted_var, result_var):
+            return
+
+        # Track the result variable and alias
         self.module_of_output[result_var] = prev_module_name
-
-        # IMPORTANT: Track which actual variable this sliced result came from
-        # This is crucial for correct concat operations
-        # e.g., h1_last = h1[-1] means h1_last is an alias for h1
         self.variable_aliases[result_var] = subscripted_var
-
         self.previous_assign = node
 
 
