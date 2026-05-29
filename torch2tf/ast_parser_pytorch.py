@@ -222,10 +222,60 @@ class ASTParserTorch(ASTParser):
 
         self.previous_assign = subscript_assign
 
+    def _create_rnn_layer_params(self, lyr_params, i, num_layers, module_name, original_return_type):
+        """Create parameters for individual RNN layer in multi-layer stack."""
+        layer_params = lyr_params.copy()
+        layer_params.pop('num_layers', None)
+        layer_params['name'] = f"{module_name}_layer_{i}"
+
+        if i > 0:
+            layer_params['input_size'] = lyr_params['hidden_size']
+
+        if i < num_layers - 1:
+            layer_params['return_type'] = 'full'
+        else:
+            layer_params['return_type'] = original_return_type
+
+        layer_params['positional_params'] = []
+        return layer_params
+
+    def _add_rnn_layer(self, lyr_type, layer_params):
+        """Transform and add a single RNN layer to BUML model."""
+        try:
+            buml_lyr_type, buml_params = transform_layer(lyr_type, layer_params, layer_params['name'])
+            buml_layer = getattr(mm_classes, buml_lyr_type)(**buml_params)
+            self.buml_model.add_layer(buml_layer)
+        except ValueError as e:
+            self.migration_warnings.append(f"Layer '{layer_params['name']}': {str(e)}")
+
+    def _create_multi_layer_rnn(self, lyr_type, lyr_params, module_name):
+        """Create multiple BUML layers for stacked RNN."""
+        process_positional_params(lyr_type, lyr_params, pos_params)
+        num_layers = lyr_params.get('num_layers', 1)
+        original_return_type = lyr_params.get('return_type', 'full')
+        layer_names = []
+
+        for i in range(num_layers):
+            layer_params = self._create_rnn_layer_params(lyr_params, i, num_layers, module_name, original_return_type)
+            layer_names.append(layer_params['name'])
+            self._add_rnn_layer(lyr_type, layer_params)
+
+        self.multi_layer_rnns[module_name] = layer_names
+
+    def _create_single_layer(self, lyr_type, lyr_params, module_name):
+        """Create single BUML layer."""
+        lyr_params.pop('num_layers', None)
+        try:
+            lyr_type, lyr_params = transform_layer(lyr_type, lyr_params, module_name)
+            buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+            self.buml_model.add_layer(buml_layer)
+        except ValueError as e:
+            self.migration_warnings.append(f"Layer '{module_name}': {str(e)}")
+
     def handle_init(self, node: ast.Assign):
         """
-        It retrieves the sub_nn layers, adds their activation functions 
-        as parameters and stores them in the 'sub_nn' dict. It also 
+        It retrieves the sub_nn layers, adds their activation functions
+        as parameters and stores them in the 'sub_nn' dict. It also
         retreives the layers and their parameters and stores them in
         the 'layers' dict.
 
@@ -237,78 +287,83 @@ class ASTParserTorch(ASTParser):
             None, but populates the BUML model.
         """
         module_name = node.targets[0].attr
-        if (isinstance(node.value, ast.Call) and
-            isinstance(node.value.func, ast.Attribute)):
-            # Checks if it is a Sequential or any NN layer
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute):
             module_type = node.value.func.attr
             if module_type == "Sequential":
                 self.handle_sequential_layers(node, module_name)
             else:
                 lyr_type, lyr_params = self.extract_layer(node.value)
                 if lyr_type not in actv_fun_mapping:
-                    # Check if this is a multi-layer RNN (num_layers > 1)
                     num_layers = lyr_params.get('num_layers', 1)
                     is_rnn = lyr_type in ['RNN', 'LSTM', 'GRU']
 
                     if is_rnn and num_layers > 1:
-                        # Process positional params first so we can access named params
-                        process_positional_params(lyr_type, lyr_params, pos_params)
-
-                        # Create multiple BUML layers for stacked RNN
-                        layer_names = []
-                        original_return_type = lyr_params.get('return_type', 'full')
-
-                        for i in range(num_layers):
-                            layer_params = lyr_params.copy()
-                            # Remove num_layers from params as BUML doesn't support it
-                            layer_params.pop('num_layers', None)
-
-                            # Update layer name
-                            layer_params['name'] = f"{module_name}_layer_{i}"
-                            layer_names.append(layer_params['name'])
-
-                            # First layer keeps input_size, others use hidden_size as input
-                            if i > 0:
-                                layer_params['input_size'] = lyr_params['hidden_size']
-
-                            # All layers except last must return full sequence
-                            if i < num_layers - 1:
-                                layer_params['return_type'] = 'full'
-                            else:
-                                layer_params['return_type'] = original_return_type
-
-                            # Add empty positional_params for transform_layer
-                            layer_params['positional_params'] = []
-
-                            # Transform and create BUML layer
-                            try:
-                                buml_lyr_type, buml_params = transform_layer(
-                                    lyr_type, layer_params, layer_params['name']
-                                )
-                                buml_layer = getattr(mm_classes, buml_lyr_type)(**buml_params)
-                                self.buml_model.add_layer(buml_layer)
-                            except ValueError as e:
-                                self.migration_warnings.append(f"Layer '{layer_params['name']}': {str(e)}")
-
-                        # Track this multi-layer RNN
-                        self.multi_layer_rnns[module_name] = layer_names
+                        self._create_multi_layer_rnn(lyr_type, lyr_params, module_name)
                     else:
-                        # Single layer - remove num_layers if present
-                        lyr_params.pop('num_layers', None)
-                        try:
-                            lyr_type, lyr_params = transform_layer(
-                                lyr_type, lyr_params, module_name
-                            )
-                            buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-                            self.buml_model.add_layer(buml_layer)
-                        except ValueError as e:
-                            self.migration_warnings.append(f"Layer '{module_name}': {str(e)}")
+                        self._create_single_layer(lyr_type, lyr_params, module_name)
                 else:
                     self.activation_functions[module_name] = lyr_type
 
-        # Used to get the proper order from forward the method
         self.buml_model.modules.clear()
 
+
+    def _check_prev_layer_supports_activation(self, subnn):
+        """Check if previous layer in sequential supports activation functions."""
+        if not subnn.layers:
+            return False
+
+        prev_layer = subnn.layers[-1]
+        prev_layer_class = prev_layer.__class__.__name__
+        prev_layer_parent = prev_layer.__class__.mro()[1].__name__
+
+        unsupported = prev_layer_parent in ["NormalizationLayer", "LayerModifier"] or \
+                     prev_layer_class in ["EmbeddingLayer", "PoolingLayer", "FlattenLayer"]
+
+        return not unsupported
+
+    def _handle_activation_layer(self, subnn, lyr_type, layer_id):
+        """Handle activation function in sequential model."""
+        actv_func = actv_fun_mapping.get(lyr_type)
+        if actv_func is None:
+            self.migration_warnings.append(
+                f"Unsupported activation function '{lyr_type}'. This activation will be skipped in the migration."
+            )
+            return layer_id
+
+        if self._check_prev_layer_supports_activation(subnn):
+            subnn.layers[-1].actv_func = actv_func
+            return layer_id
+        else:
+            actv_params = {"name": f"layer_{layer_id}", "actv_func": actv_func}
+            subnn_layer = getattr(mm_classes, "GeneralLayer")(**actv_params)
+            subnn.add_layer(subnn_layer)
+            return layer_id + 1
+
+    def _handle_permute_layer(self, subnn):
+        """Handle Permute operation in sequential model."""
+        last_lyr = subnn.layers[-1] if subnn.layers else None
+
+        if last_lyr is not None:
+            last_lyr_type = subnn.layers[-1].__class__.__name__
+            if last_lyr_type in cnn_layers:
+                subnn.layers[-1].permute_out = True
+                return False
+        return True
+
+    def _handle_regular_sequential_layer(self, subnn, lyr_type, lyr_params, layer_id, permute):
+        """Handle regular layer in sequential model."""
+        try:
+            lyr_type, lyr_params = transform_layer(lyr_type, lyr_params)
+            lyr_params["name"] = f"layer_{layer_id}"
+            if permute:
+                lyr_params["permute_in"] = True
+
+            subnn_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+            subnn.add_layer(subnn_layer)
+            return layer_id + 1, False
+        except ValueError as e:
+            self.migration_warnings.append(f"Sequential layer {layer_id}: {str(e)}")
+            return layer_id, permute
 
     def handle_sequential_layers(self, node: ast.Assign, seq_name: str):
         """
@@ -327,75 +382,20 @@ class ASTParserTorch(ASTParser):
         subnn: NN = NN(name=seq_name)
         layer_id = 1
         permute = False
-        # Extracts layers within Sequential
+
         for elt in node.value.args:
             if isinstance(elt, ast.Call):
                 lyr_type, lyr_params = self.extract_layer(elt)
 
                 if lyr_type in actv_fun_mapping:
-                    # Check if previous layer supports activation functions
-                    # Using same logic as generator's add_separate_activation_if_needed
-                    prev_layer_supports_activ = False
-                    if subnn.layers:
-                        prev_layer = subnn.layers[-1]
-                        prev_layer_class = prev_layer.__class__.__name__
-                        prev_layer_parent = prev_layer.__class__.mro()[1].__name__
-
-                        # Layers that DON'T support activation (same as generator logic)
-                        unsupported = prev_layer_parent in ["NormalizationLayer", "LayerModifier"] or \
-                                     prev_layer_class in ["EmbeddingLayer", "PoolingLayer", "FlattenLayer"]
-
-                        prev_layer_supports_activ = not unsupported
-
-                    # Get activation function with validation
-                    actv_func = actv_fun_mapping.get(lyr_type)
-                    if actv_func is None:
-                        self.migration_warnings.append(
-                            f"Unsupported activation function '{lyr_type}'. This activation will be skipped in the migration."
-                        )
-                    elif prev_layer_supports_activ:
-                        # Merge with previous layer as activation attribute
-                        subnn.layers[-1].actv_func = actv_func
-                    else:
-                        # Create standalone activation layer
-                        actv_params = {
-                            "name": f"layer_{layer_id}",
-                            "actv_func": actv_func
-                        }
-                        subnn_layer = getattr(mm_classes, "GeneralLayer")(**actv_params)
-                        subnn.add_layer(subnn_layer)
-                        layer_id += 1
+                    layer_id = self._handle_activation_layer(subnn, lyr_type, layer_id)
                 elif lyr_type == "Permute":
-                    last_lyr = subnn.layers[-1] if subnn.layers else None
-
-                    if last_lyr is not None:
-                        last_lyr_type = subnn.layers[-1].__class__.__name__
-                        if last_lyr_type in cnn_layers:
-                            subnn.layers[-1].permute_out = True
-                        else:
-                            permute = True
-                    else:
-                        permute = True
+                    permute = self._handle_permute_layer(subnn)
                 else:
-                    try:
-                        lyr_type, lyr_params = transform_layer(
-                            lyr_type, lyr_params
-                        )
-
-                        lyr_params["name"] = f"layer_{layer_id}"
-                        if permute:
-                            lyr_params["permute_in"] = True
-                            permute = False
-
-                        subnn_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-                        subnn.add_layer(subnn_layer)
-                        layer_id+=1
-                    except ValueError as e:
-                        self.migration_warnings.append(f"Sequential layer {layer_id}: {str(e)}")
+                    layer_id, permute = self._handle_regular_sequential_layer(subnn, lyr_type, lyr_params, layer_id, permute)
 
             elif isinstance(elt, ast.Name):
-                subnn_obj = next((obj for obj in self.buml_model.sub_nns if
-                                  obj.name == elt.id), None)
+                subnn_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == elt.id), None)
                 subnn.add_sub_nn(subnn_obj)
 
         self.buml_model.add_sub_nn(subnn)
