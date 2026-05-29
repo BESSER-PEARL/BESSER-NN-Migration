@@ -785,6 +785,51 @@ class ASTParserTorch(ASTParser):
 
         self.previous_assign = node
 
+    def _extract_binop_operand(self, operand, node, side):
+        """Extract variable from binary operation operand (left or right)."""
+        if isinstance(operand, ast.Name):
+            return operand.id
+        elif isinstance(operand, ast.Call):
+            return self.extract_inline_tensorop(operand, node)
+        elif isinstance(operand, ast.Subscript):
+            temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
+            self.tensor_op_counter += 1
+            self.handle_subscript_operation(operand, temp_name, node)
+            return temp_name
+        elif isinstance(operand, (ast.Constant, ast.Num)):
+            return operand.value if isinstance(operand, ast.Constant) else operand.n
+        elif isinstance(operand, ast.BinOp):
+            temp_name = self.TEMP_BINOP.format(self.tensor_op_counter)
+            self.tensor_op_counter += 1
+            temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+            binop_assign = ast.Assign(targets=[temp_target], value=operand)
+            binop_assign.lineno = node.lineno
+            binop_assign.col_offset = node.col_offset
+            self.handle_forward_binop(binop_assign)
+            return temp_name
+        else:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Binary operation has unsupported {side} operand type '{type(operand).__name__}'. This operation will be skipped."
+            )
+            return None
+
+    def _determine_binop_var_types(self, left_layer, right_layer, left_var, right_var):
+        """Determine var types (output/hidden) for RNN operands."""
+        actual_left_var = self.variable_aliases.get(left_var, left_var) if isinstance(left_var, str) else left_var
+        actual_right_var = self.variable_aliases.get(right_var, right_var) if isinstance(right_var, str) else right_var
+
+        var_types = []
+        for lyr_name, actual_var in zip([left_layer, right_layer], [actual_left_var, actual_right_var]):
+            if isinstance(lyr_name, (int, float)):
+                var_types.append("output")
+            elif lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
+                var_types.append("hidden")
+            elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
+                var_types.append("output")
+            else:
+                var_types.append("output")
+        return var_types
+
     def handle_forward_binop(self, node: ast.Assign):
         """
         It handles binary operations such as 'x = a + b' or 'x = a.squeeze(1) + b'
@@ -799,66 +844,13 @@ class ASTParserTorch(ASTParser):
         """
         binop = node.value
 
-        # Extract left operand variable
-        if isinstance(binop.left, ast.Name):
-            left_var = binop.left.id
-        elif isinstance(binop.left, ast.Call):
-            # Extract inline operation like x.squeeze(1)
-            left_var = self.extract_inline_tensorop(binop.left, node)
-        elif isinstance(binop.left, ast.Subscript):
-            # Handle subscript like out[:, -1, :]
-            temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
-            self.tensor_op_counter += 1
-            self.handle_subscript_operation(binop.left, temp_name, node)
-            left_var = temp_name
-        elif isinstance(binop.left, (ast.Constant, ast.Num)):
-            # Handle constant operand
-            left_var = binop.left.value if isinstance(binop.left, ast.Constant) else binop.left.n
-        elif isinstance(binop.left, ast.BinOp):
-            # Handle nested binop like (x1 + x2) + x3
-            temp_name = self.TEMP_BINOP.format(self.tensor_op_counter)
-            self.tensor_op_counter += 1
-            temp_target = ast.Name(id=temp_name, ctx=ast.Store())
-            binop_assign = ast.Assign(targets=[temp_target], value=binop.left)
-            binop_assign.lineno = node.lineno
-            binop_assign.col_offset = node.col_offset
-            self.handle_forward_binop(binop_assign)
-            left_var = temp_name
-        else:
-            self.migration_warnings.append(
-                f"Line {node.lineno}: Binary operation has unsupported left operand type '{type(binop.left).__name__}'. This operation will be skipped."
-            )
+        # Extract operands
+        left_var = self._extract_binop_operand(binop.left, node, "left")
+        if left_var is None:
             return
 
-        # Extract right operand variable
-        if isinstance(binop.right, ast.Name):
-            right_var = binop.right.id
-        elif isinstance(binop.right, ast.Call):
-            # Extract inline operation
-            right_var = self.extract_inline_tensorop(binop.right, node)
-        elif isinstance(binop.right, ast.Subscript):
-            # Handle subscript like out[:, -1, :]
-            temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
-            self.tensor_op_counter += 1
-            self.handle_subscript_operation(binop.right, temp_name, node)
-            right_var = temp_name
-        elif isinstance(binop.right, (ast.Constant, ast.Num)):
-            # Handle constant operand
-            right_var = binop.right.value if isinstance(binop.right, ast.Constant) else binop.right.n
-        elif isinstance(binop.right, ast.BinOp):
-            # Handle nested binop like x1 + (x2 + x3)
-            temp_name = self.TEMP_BINOP.format(self.tensor_op_counter)
-            self.tensor_op_counter += 1
-            temp_target = ast.Name(id=temp_name, ctx=ast.Store())
-            binop_assign = ast.Assign(targets=[temp_target], value=binop.right)
-            binop_assign.lineno = node.lineno
-            binop_assign.col_offset = node.col_offset
-            self.handle_forward_binop(binop_assign)
-            right_var = temp_name
-        else:
-            self.migration_warnings.append(
-                f"Line {node.lineno}: Binary operation has unsupported right operand type '{type(binop.right).__name__}'. This operation will be skipped."
-            )
+        right_var = self._extract_binop_operand(binop.right, node, "right")
+        if right_var is None:
             return
 
         # Determine the operation type
@@ -889,21 +881,7 @@ class ASTParserTorch(ASTParser):
             return
 
         # Determine if variables are output or hidden for RNNs with return_type="both"
-        # Resolve aliases first
-        actual_left_var = self.variable_aliases.get(left_var, left_var) if isinstance(left_var, str) else left_var
-        actual_right_var = self.variable_aliases.get(right_var, right_var) if isinstance(right_var, str) else right_var
-
-        var_types = []
-        for lyr_name, actual_var in zip([left_layer, right_layer], [actual_left_var, actual_right_var]):
-            # Skip type checking for constant values
-            if isinstance(lyr_name, (int, float)):
-                var_types.append("output")  # Constants don't have type, use default
-            elif lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
-                var_types.append("hidden")
-            elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
-                var_types.append("output")
-            else:
-                var_types.append("output")  # Default
+        var_types = self._determine_binop_var_types(left_layer, right_layer, left_var, right_var)
 
         # Create TensorOp for the binary operation
         tensorop_param = {
