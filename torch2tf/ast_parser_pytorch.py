@@ -837,6 +837,40 @@ class ASTParserTorch(ASTParser):
                 var_types.append("output")
         return var_types
 
+    def visit_AugAssign(self, node: ast.AugAssign):
+        """
+        Handle augmented assignment (in-place operations like +=, -=, *=, /=, //=).
+        Converts them to regular assignment: x += y becomes x = x + y
+
+        Parameters:
+            node (ast.AugAssign): The augmented assignment node
+
+        Returns:
+            None, processes the converted assignment
+        """
+        # Convert AugAssign to regular Assign
+        # x += y  -->  x = x + y
+
+        # Create a BinOp node: x + y
+        binop = ast.BinOp(
+            left=ast.Name(id=node.target.id, ctx=ast.Load()),
+            op=node.op,  # Reuse the same operator (+, -, *, /, //, etc.)
+            right=node.value
+        )
+
+        # Create an Assign node: x = (x + y)
+        assign = ast.Assign(
+            targets=[node.target],
+            value=binop
+        )
+
+        # Copy line number info for error reporting
+        assign.lineno = node.lineno
+        assign.col_offset = node.col_offset
+
+        # Process as regular assignment
+        self.visit_Assign(assign)
+
     def handle_forward_binop(self, node: ast.Assign):
         """
         It handles binary operations such as 'x = a + b' or 'x = a.squeeze(1) + b'
@@ -865,14 +899,15 @@ class ASTParserTorch(ASTParser):
             'Add': 'binop_add',
             'Sub': 'binop_subtract',
             'Mult': 'binop_multiply',
-            'Div': 'binop_divide'
+            'Div': 'binop_divide',
+            'FloorDiv': 'binop_floor_divide'
         }
         op_type_name = binop.op.__class__.__name__
         tns_type = op_map.get(op_type_name)
 
         if tns_type is None:
             self.migration_warnings.append(
-                f"Line {node.lineno}: Unsupported binary operation '{op_type_name}'. Only add, subtract, multiply, and divide are supported."
+                f"Line {node.lineno}: Unsupported binary operation '{op_type_name}'. Only add, subtract, multiply, divide, and floor divide are supported."
             )
             return
 
