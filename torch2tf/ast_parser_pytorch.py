@@ -655,7 +655,7 @@ class ASTParserTorch(ASTParser):
         first_is_underscore = isinstance(first_elem, ast.Name) and first_elem.id == "_"
         second_is_underscore = isinstance(second_elem, ast.Name) and second_elem.id == "_"
 
-        lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
+        lyr_obj = self._get_layer_by_name(module_name)
 
         if first_is_underscore and not second_is_underscore:
             rnn_out = node.targets[0].elts[1].elts[0].id if isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].id
@@ -758,7 +758,7 @@ class ASTParserTorch(ASTParser):
 
         # Update tracking structures
         self.inputs_outputs[module_name] = [rnn_in, rnn_out]
-        module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
+        module_obj = self._get_layer_by_name(module_name)
         if not module_obj:
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
         self.buml_model.modules.append(module_obj)
@@ -1064,7 +1064,7 @@ class ASTParserTorch(ASTParser):
             return
 
         prev_module_name = self.module_of_output[subscripted_var]
-        lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == prev_module_name), None)
+        lyr_obj = self._get_layer_by_name(prev_module_name)
 
         # If not an RNN layer, handle as regular subscript
         if not lyr_obj or not hasattr(lyr_obj, 'return_type'):
@@ -1142,8 +1142,7 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but populates the buml model.
         """
-        lyr_obj = next((obj for obj in self.buml_model.layers if
-                        obj.name == lyr_name), None)
+        lyr_obj = self._get_layer_by_name(lyr_name)
         lyr_type = lyr_obj.__class__.__name__
         if (lyr_type in cnn_layers and len(self.buml_model.tensor_ops)!=0):
 
@@ -1457,7 +1456,7 @@ class ASTParserTorch(ASTParser):
             self.is_permute_before_cnn(module_name)
 
         if module_name not in self.activation_functions:
-            module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
+            module_obj = self._get_layer_by_name(module_name)
             if not module_obj:
                 module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
@@ -1989,7 +1988,7 @@ class ASTParserTorch(ASTParser):
                 hasattr(self.previous_assign.value, 'func') and
                 hasattr(self.previous_assign.value.func, 'attr')):
                 prev_lyr_name = self.previous_assign.value.func.attr
-                lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == prev_lyr_name), None)
+                lyr_obj = self._get_layer_by_name(prev_lyr_name)
                 if lyr_obj:
                     lyr_obj.return_type = "hidden"
 
