@@ -1702,6 +1702,30 @@ class ASTParserTorch(ASTParser):
 
         return {"tns_type": "repeat", "repeat_dim": repeat_counts, "layers_of_tensors": source_layers}
 
+    def _get_call_node_from_value(self, node_value):
+        """Handle .values attribute accessor and return call node."""
+        if isinstance(node_value, ast.Attribute) and node_value.attr == 'values':
+            return node_value.value
+        return node_value
+
+    def _extract_op_type_and_args(self, call_node, node):
+        """Extract operation type and arguments from call node."""
+        if not hasattr(call_node.func, 'attr'):
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unknown tensor operation encountered. This operation will be skipped in the migration."
+            )
+            return None, None
+        return call_node.func.attr, call_node.args
+
+    def _get_op_handler(self, op_type, node):
+        """Get operation handler from mapping."""
+        handler = self._op_handlers.get(op_type)
+        if not handler:
+            self.migration_warnings.append(
+                f"Unrecognized tensor operation '{op_type}'. This operation will be skipped in the migration."
+            )
+        return handler
+
     def extract_tensorop(self, node: ast.Assign):
         """
         It extracts the tensorop name and its parameters.
@@ -1713,39 +1737,24 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but populates the buml model.
         """
-        # Handle .values attribute accessor (e.g., x.max(dim=1).values)
-        call_node = node.value
-        if isinstance(node.value, ast.Attribute) and node.value.attr == 'values':
-            call_node = node.value.value
+        call_node = self._get_call_node_from_value(node.value)
 
         if not isinstance(call_node, ast.Call):
             return
 
-        # Safely extract operation type
-        if not hasattr(call_node.func, 'attr'):
-            self.migration_warnings.append(
-                f"Line {node.lineno}: Unknown tensor operation encountered. This operation will be skipped in the migration."
-            )
+        op_type, op_args = self._extract_op_type_and_args(call_node, node)
+        if op_type is None:
             return
 
-        op_type = call_node.func.attr
-        op_args = call_node.args
-
-        # Dispatch to appropriate handler using mapping
-        handler = self._op_handlers.get(op_type)
+        handler = self._get_op_handler(op_type, node)
         if not handler:
-            self.migration_warnings.append(
-                f"Unrecognized tensor operation '{op_type}'. This operation will be skipped in the migration."
-            )
             return
 
         tensorop_param = handler(call_node, node, op_args)
 
-        # Flatten creates a layer, not a tensorop (special case)
         if tensorop_param == "flatten_created":
             return
 
-        # Create and track TensorOp if handler returned params
         if tensorop_param:
             self._create_and_track_tensorop(tensorop_param, call_node, node)
 
@@ -1874,6 +1883,40 @@ class ASTParserTorch(ASTParser):
                 var_types.append("output")
         return var_types
 
+    def _update_prev_layer_return_type_if_subscript(self, ops_args):
+        """Update previous layer return_type if first arg is subscript."""
+        if isinstance(ops_args[0], ast.Subscript):
+            if (self.previous_assign and
+                hasattr(self.previous_assign, 'value') and
+                isinstance(self.previous_assign.value, ast.Call) and
+                hasattr(self.previous_assign.value, 'func') and
+                hasattr(self.previous_assign.value.func, 'attr')):
+                prev_lyr_name = self.previous_assign.value.func.attr
+                lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == prev_lyr_name), None)
+                if lyr_obj:
+                    lyr_obj.return_type = "hidden"
+
+    def _extract_concat_variables(self, ops_args, node):
+        """Extract all variables from concatenation arguments."""
+        variables = []
+        for arg in ops_args:
+            var = self._extract_concat_arg_variable(arg, node)
+            if var is None:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: Cannot extract variable from concatenation argument. Make sure all concat arguments are valid variables or layer outputs."
+                )
+                return None
+            variables.append(var)
+        return variables
+
+    def _resolve_concat_variables(self, variables):
+        """Resolve variable aliases to actual variables."""
+        actual_vars = []
+        for var in variables:
+            actual_var = var if var in self.module_of_output else self.variable_aliases.get(var, var)
+            actual_vars.append(actual_var)
+        return actual_vars
+
     def extract_tensorop_concatenate(self, node):
         """
         It extracts the concatenate tensorop information.
@@ -1887,43 +1930,20 @@ class ASTParserTorch(ASTParser):
         """
         ops_args = node.value.args[0].elts
 
-        # Update previous layer return_type if first arg is subscript
-        if isinstance(ops_args[0], ast.Subscript):
-            if (self.previous_assign and
-                hasattr(self.previous_assign, 'value') and
-                isinstance(self.previous_assign.value, ast.Call) and
-                hasattr(self.previous_assign.value, 'func') and
-                hasattr(self.previous_assign.value.func, 'attr')):
-                prev_lyr_name = self.previous_assign.value.func.attr
-                lyr_obj = next((obj for obj in self.buml_model.layers if obj.name == prev_lyr_name), None)
-                if lyr_obj:
-                    lyr_obj.return_type = "hidden"
+        self._update_prev_layer_return_type_if_subscript(ops_args)
 
-        # Extract all variables from concatenation arguments
-        variables = []
-        for arg in ops_args:
-            var = self._extract_concat_arg_variable(arg, node)
-            if var is None:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: Cannot extract variable from concatenation argument. Make sure all concat arguments are valid variables or layer outputs."
-                )
-                return None
-            variables.append(var)
+        variables = self._extract_concat_variables(ops_args, node)
+        if variables is None:
+            return None
 
-        # Resolve aliases
-        actual_vars = []
-        for var in variables:
-            actual_var = var if var in self.module_of_output else self.variable_aliases.get(var, var)
-            actual_vars.append(actual_var)
+        actual_vars = self._resolve_concat_variables(variables)
 
         layers_of_tensors = [self.module_of_output[actual_var] for actual_var in actual_vars]
         cat_dim = self.param_value(node.value.keywords[0].value)
 
-        # Check for bidirectional RNN pattern
         if self._check_bidirectional_rnn_concat(ops_args, layers_of_tensors, node):
             return None
 
-        # Determine var types for RNNs
         var_types = self._determine_rnn_var_types(layers_of_tensors, actual_vars)
 
         return {
