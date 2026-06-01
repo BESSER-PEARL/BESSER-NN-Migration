@@ -82,6 +82,9 @@ class ASTParserTorch(ASTParser):
             "normalize": lambda cn, n, args: self._extract_op_normalize(cn, args),
             "flatten": lambda cn, n, args: self._extract_op_flatten(cn, n, args),
             "repeat": lambda cn, n, args: self._extract_op_repeat(cn, args),
+            "interpolate": lambda cn, n, args: self._extract_op_interpolate(cn, n, args),
+            "pad": lambda cn, n, args: self._extract_op_pad(cn, n, args),
+            "dropout": lambda cn, n, args: self._extract_op_dropout(cn, n, args),
         }
 
     def _add_layer_with_tracking(self, layer_obj):
@@ -2077,6 +2080,77 @@ class ASTParserTorch(ASTParser):
         permute_dim = self._extract_permute_dimensions(ops_args)
         return {"tns_type": "permute", "permute_dim": permute_dim}
 
+    def _extract_op_interpolate(self, call_node, node, ops_args):
+        """Extract F.interpolate operation parameters."""
+        size = None
+        scale_factor = None
+        mode = 'nearest'
+
+        # Extract from keywords
+        for kw in call_node.keywords:
+            if kw.arg == 'size':
+                if isinstance(kw.value, ast.Constant):
+                    size = kw.value.value
+                elif isinstance(kw.value, (ast.Tuple, ast.List)):
+                    size = tuple(elt.value if isinstance(elt, ast.Constant) else None
+                               for elt in kw.value.elts)
+            elif kw.arg == 'scale_factor':
+                if isinstance(kw.value, ast.Constant):
+                    scale_factor = kw.value.value
+            elif kw.arg == 'mode':
+                if isinstance(kw.value, ast.Constant):
+                    mode = kw.value.value
+
+        return {
+            "tns_type": "interpolate",
+            "interpolate_size": size,
+            "interpolate_scale": scale_factor,
+            "interpolate_mode": mode
+        }
+
+    def _extract_op_pad(self, call_node, node, ops_args):
+        """Extract F.pad operation parameters."""
+        pad = None
+        mode = 'constant'
+        value = 0
+
+        # Second positional arg is pad tuple (first is input)
+        if len(ops_args) > 1:
+            pad_arg = ops_args[1]
+            if isinstance(pad_arg, (ast.Tuple, ast.List)):
+                pad = tuple(elt.value if isinstance(elt, ast.Constant) else 0
+                          for elt in pad_arg.elts)
+
+        # Extract from keywords
+        for kw in call_node.keywords:
+            if kw.arg == 'mode':
+                if isinstance(kw.value, ast.Constant):
+                    mode = kw.value.value
+            elif kw.arg == 'value':
+                if isinstance(kw.value, ast.Constant):
+                    value = kw.value.value
+
+        return {
+            "tns_type": "pad",
+            "pad_amount": pad,
+            "pad_mode": mode,
+            "pad_value": value
+        }
+
+    def _extract_op_dropout(self, call_node, node, ops_args):
+        """Extract F.dropout operation parameters."""
+        p = 0.5
+
+        # Extract from keywords
+        for kw in call_node.keywords:
+            if kw.arg == 'p':
+                if isinstance(kw.value, ast.Constant):
+                    p = kw.value.value
+
+        return {
+            "tns_type": "dropout",
+            "dropout_rate": p
+        }
 
     def handle_outer_attribute_assignment(self, node: ast.Assign):
         """
