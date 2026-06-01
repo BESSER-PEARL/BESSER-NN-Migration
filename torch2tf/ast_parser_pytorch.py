@@ -1798,6 +1798,37 @@ class ASTParserTorch(ASTParser):
         self.module_of_output[temp_name] = layer_name
         return temp_name
 
+    def _extract_layer_call_variable(self, arg, layer_name):
+        """Extract variable from layer call in concatenation."""
+        layer_obj = next((lyr for lyr in self.buml_model.layers if lyr.name == layer_name), None)
+
+        if not layer_obj:
+            self.migration_warnings.append(
+                f"Concatenation operation: Layer '{layer_name}' referenced but not found in the model. Check if it was defined earlier."
+            )
+            return None
+
+        if layer_obj in self.buml_model.modules:
+            return self._handle_layer_reuse_in_concat(layer_obj, arg, layer_name)
+        else:
+            return self._handle_first_layer_use_in_concat(layer_obj, arg, layer_name)
+
+    def _extract_inline_call_variable(self, arg, node):
+        """Extract variable from inline operation call in concatenation."""
+        result = self.extract_inline_tensorop(arg, node)
+        if result is None:
+            self.migration_warnings.append(
+                f"Concatenation operation: Could not process inline operation '{ast.unparse(arg)}'. This argument will be skipped."
+            )
+        return result
+
+    def _extract_subscript_variable(self, arg, node):
+        """Extract variable from subscript operation in concatenation."""
+        temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+        self.handle_subscript_operation(arg, temp_name, node)
+        return temp_name
+
     def _extract_concat_arg_variable(self, arg, node):
         """Extract variable name from concatenation argument, handling layer calls and inline ops."""
         if isinstance(arg, ast.Name):
@@ -1806,32 +1837,11 @@ class ASTParserTorch(ASTParser):
             if (isinstance(arg.func, ast.Attribute) and
                 isinstance(arg.func.value, ast.Name) and
                 arg.func.value.id == 'self'):
-                layer_name = arg.func.attr
-                layer_obj = next((lyr for lyr in self.buml_model.layers if lyr.name == layer_name), None)
-
-                if not layer_obj:
-                    self.migration_warnings.append(
-                        f"Concatenation operation: Layer '{layer_name}' referenced but not found in the model. Check if it was defined earlier."
-                    )
-                    return None
-
-                if layer_obj in self.buml_model.modules:
-                    return self._handle_layer_reuse_in_concat(layer_obj, arg, layer_name)
-                else:
-                    return self._handle_first_layer_use_in_concat(layer_obj, arg, layer_name)
+                return self._extract_layer_call_variable(arg, arg.func.attr)
             else:
-                result = self.extract_inline_tensorop(arg, node)
-                if result is None:
-                    self.migration_warnings.append(
-                        f"Concatenation operation: Could not process inline operation '{ast.unparse(arg)}'. This argument will be skipped."
-                    )
-                    return None
-                return result
+                return self._extract_inline_call_variable(arg, node)
         elif isinstance(arg, ast.Subscript):
-            temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
-            self.tensor_op_counter += 1
-            self.handle_subscript_operation(arg, temp_name, node)
-            return temp_name
+            return self._extract_subscript_variable(arg, node)
         else:
             return None
 
@@ -1964,6 +1974,16 @@ class ASTParserTorch(ASTParser):
         }
 
 
+    def _extract_permute_dimensions(self, ops_args):
+        """Extract permute dimensions from operation arguments."""
+        permute_dim = []
+        for arg in ops_args:
+            if isinstance(arg, ast.Constant):
+                permute_dim.append(arg.value)
+            elif isinstance(arg, ast.Num):  # Python < 3.8
+                permute_dim.append(arg.n)
+        return permute_dim
+
     def extract_tensorop_permute(self, ops_args):
         """
         It extracts the permute tensorop information.
@@ -1971,33 +1991,17 @@ class ASTParserTorch(ASTParser):
         Returns:
             The tensorop parameters.
         """
-        tensorop_param = None
         modules = self.buml_model.modules
         prev_module = modules[-1] if modules else None
+
         if isinstance(prev_module, Layer):
             lyr_type = prev_module.__class__.__name__
             if lyr_type in cnn_layers:
                 prev_module.permute_out = True
-            else:
-                # Not a CNN layer, create tensorop
-                permute_dim = []
-                for arg in ops_args:
-                    if isinstance(arg, ast.Constant):
-                        permute_dim.append(arg.value)
-                    elif isinstance(arg, ast.Num):  # Python < 3.8
-                        permute_dim.append(arg.n)
-                tensorop_param = {"tns_type": "permute",
-                                  "permute_dim": permute_dim}
-        else:
-            permute_dim = []
-            for arg in ops_args:
-                if isinstance(arg, ast.Constant):
-                    permute_dim.append(arg.value)
-                elif isinstance(arg, ast.Num):  # Python < 3.8
-                    permute_dim.append(arg.n)
-            tensorop_param = {"tns_type": "permute",
-                              "permute_dim": permute_dim}
-        return tensorop_param
+                return None
+
+        permute_dim = self._extract_permute_dimensions(ops_args)
+        return {"tns_type": "permute", "permute_dim": permute_dim}
 
 
     def handle_outer_attribute_assignment(self, node: ast.Assign):
