@@ -670,14 +670,53 @@ class ASTParserTorch(ASTParser):
         return rnn_out
 
     def _extract_rnn_input_arg(self, node):
-        """Extract input argument from RNN call, handling both variables and inline operations."""
+        """Extract input argument from RNN call, handling both variables and inline operations.
+
+        Also detects and handles initial hidden state parameter (h0) for seq2seq/decoder patterns.
+        Returns: input_var (str)
+        Side effect: Sets self._current_rnn_has_initial_state if h0 is provided
+        """
+        if not node.value.args:
+            return "x"
+
+        # Extract first argument (input sequence)
         input_arg = node.value.args[0]
         if isinstance(input_arg, ast.Name):
-            return input_arg.id
+            input_var = input_arg.id
         elif isinstance(input_arg, ast.Call):
-            return self.extract_inline_tensorop(input_arg, node)
+            input_var = self.extract_inline_tensorop(input_arg, node)
         else:
-            return "x"
+            input_var = "x"
+
+        # Check for second argument (initial hidden state)
+        if len(node.value.args) > 1:
+            hidden_arg = node.value.args[1]
+            if isinstance(hidden_arg, ast.Name):
+                # Simple case: rnn(x, h0)
+                self._current_rnn_initial_hidden = hidden_arg.id
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: RNN called with initial hidden state '{hidden_arg.id}'. "
+                    f"This is supported for seq2seq/decoder patterns. The hidden state will be "
+                    f"passed as input to the TensorFlow RNN layer."
+                )
+            elif isinstance(hidden_arg, ast.Tuple):
+                # LSTM case: rnn(x, (h0, c0))
+                self._current_rnn_initial_hidden = "tuple_state"
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: LSTM called with initial hidden and cell states. "
+                    f"Both states will be passed to the TensorFlow LSTM layer."
+                )
+            else:
+                # Complex expression
+                self._current_rnn_initial_hidden = None
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: RNN called with complex initial hidden state expression. "
+                    f"This may not migrate correctly - manual review recommended."
+                )
+        else:
+            self._current_rnn_initial_hidden = None
+
+        return input_var
 
     def handle_forward_tuple_assignment(self, node: ast.Assign):
         """
