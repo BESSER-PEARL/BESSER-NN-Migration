@@ -1143,6 +1143,8 @@ class ASTParserTorch(ASTParser):
             None, but populates the buml model.
         """
         lyr_obj = self._get_layer_by_name(lyr_name)
+        if not lyr_obj:
+            return
         lyr_type = lyr_obj.__class__.__name__
         if (lyr_type in cnn_layers and len(self.buml_model.tensor_ops)!=0):
 
