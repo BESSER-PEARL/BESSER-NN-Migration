@@ -1154,6 +1154,23 @@ class ASTParserTorch(ASTParser):
 
         return intermediate_var
 
+    def _check_and_mark_residual_input(self, tns_obj, call_node):
+        """Check if tensorop's input is saved for residual connection and mark it."""
+        if isinstance(call_node.func, ast.Attribute) and isinstance(call_node.func.value, ast.Name):
+            source_var = call_node.func.value.id
+            if hasattr(self, '_variables_saved_for_residual') and source_var in self._variables_saved_for_residual:
+                tns_obj.input_reused = True
+                self._variables_saved_for_residual.discard(source_var)
+
+    def _extract_output_var_from_target(self, target):
+        """Extract output variable from assignment target."""
+        if isinstance(target, ast.Name):
+            return target.id
+        elif isinstance(target, ast.Tuple):
+            first_elem = target.elts[0]
+            return first_elem.id if isinstance(first_elem, ast.Name) else None
+        return None
+
     def _create_and_track_tensorop(self, tensorop_param, call_node, node):
         """
         Create TensorOp object and track its output.
@@ -1172,22 +1189,9 @@ class ASTParserTorch(ASTParser):
         self.buml_model.add_tensor_op(tns_obj)
         self.tensor_op_counter += 1
 
-        # Check if this tensorop's source variable was saved for residual connection
-        if isinstance(call_node.func, ast.Attribute) and isinstance(call_node.func.value, ast.Name):
-            source_var = call_node.func.value.id
-            if hasattr(self, '_variables_saved_for_residual') and source_var in self._variables_saved_for_residual:
-                tns_obj.input_reused = True
-                self._variables_saved_for_residual.discard(source_var)
+        self._check_and_mark_residual_input(tns_obj, call_node)
 
-        # Track tensorop output - handle both simple and tuple assignments
-        if isinstance(node.targets[0], ast.Name):
-            output_var = node.targets[0].id
-        elif isinstance(node.targets[0], ast.Tuple):
-            first_elem = node.targets[0].elts[0]
-            output_var = first_elem.id if isinstance(first_elem, ast.Name) else None
-        else:
-            output_var = None
-
+        output_var = self._extract_output_var_from_target(node.targets[0])
         if output_var:
             self.module_of_output[output_var] = op_name
 
@@ -1831,6 +1835,31 @@ class ASTParserTorch(ASTParser):
         else:
             return None
 
+    def _is_bidirectional_hidden_rnn(self, source_layer):
+        """Check if layer is a bidirectional RNN with hidden return type."""
+        return (source_layer and
+                hasattr(source_layer, 'bidirectional') and source_layer.bidirectional and
+                hasattr(source_layer, 'return_type') and source_layer.return_type == 'hidden')
+
+    def _extract_subscript_indices(self, ops_args):
+        """Extract indices from subscript operations."""
+        indices = []
+        for arg in ops_args:
+            if isinstance(arg.slice, ast.UnaryOp) and isinstance(arg.slice.op, ast.USub):
+                indices.append(-arg.slice.operand.value)
+            elif isinstance(arg.slice, ast.Constant):
+                indices.append(arg.slice.value)
+            else:
+                return None
+        return indices
+
+    def _handle_bidirectional_concat_output(self, node, source_layer_name):
+        """Track output variable for bidirectional concat."""
+        output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
+        if output_var:
+            self.module_of_output[output_var] = source_layer_name
+        return output_var is not None
+
     def _check_bidirectional_rnn_concat(self, ops_args, layers_of_tensors, node):
         """Check if this is a bidirectional RNN concatenation pattern and handle it."""
         if not (len(ops_args) == 2 and len(set(layers_of_tensors)) == 1):
@@ -1839,35 +1868,16 @@ class ASTParserTorch(ASTParser):
         source_layer_name = layers_of_tensors[0]
         source_layer = self._get_layer_by_name(source_layer_name)
 
-        if not (source_layer and
-                hasattr(source_layer, 'bidirectional') and source_layer.bidirectional and
-                hasattr(source_layer, 'return_type') and source_layer.return_type == 'hidden'):
+        if not self._is_bidirectional_hidden_rnn(source_layer):
             return False
 
-        # Case 1: Inline subscripts like torch.cat([h[-2], h[-1]])
         if all(isinstance(arg, ast.Subscript) for arg in ops_args):
-            indices = []
-            for arg in ops_args:
-                if isinstance(arg.slice, ast.UnaryOp) and isinstance(arg.slice.op, ast.USub):
-                    indices.append(-arg.slice.operand.value)
-                elif isinstance(arg.slice, ast.Constant):
-                    indices.append(arg.slice.value)
-                else:
-                    indices = None
-                    break
-
+            indices = self._extract_subscript_indices(ops_args)
             if indices and set(indices) == {-2, -1}:
-                output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
-                if output_var:
-                    self.module_of_output[output_var] = source_layer_name
-                return True
+                return self._handle_bidirectional_concat_output(node, source_layer_name)
 
-        # Case 2: Variables from subscripts
         elif all(isinstance(arg, ast.Name) for arg in ops_args):
-            output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
-            if output_var:
-                self.module_of_output[output_var] = source_layer_name
-            return True
+            return self._handle_bidirectional_concat_output(node, source_layer_name)
 
         return False
 
