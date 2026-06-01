@@ -316,6 +316,11 @@ class ASTParser(ast.NodeVisitor):
               isinstance(node.value, ast.Call)):
             self.handle_forward_tuple_assignment(node)
 
+        #Forward binary operations
+        elif (isinstance(node.targets[0], ast.Name) and
+              isinstance(node.value, ast.BinOp)):
+            self.handle_forward_binop(node)
+
         #Forward shape unpacking (e.g., b, t, _ = x.shape)
         elif (isinstance(node.targets[0], ast.Tuple) and
               isinstance(node.value, ast.Attribute)):

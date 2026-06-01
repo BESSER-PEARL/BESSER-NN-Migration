@@ -71,16 +71,22 @@ def infer_batchnorm_params(buml_model):
 class ASTParserTF(ASTParser):
     """
     Class visiting and parsing TensorFlow code AST
-    
+
     Attributes:
         input_nn_type (str): The type of the nn input architecture.
         only_nn (str): Whether to process only the model definition or also
             its configuration and dataset.
-        padding_amount (int | None): It  keeps track of padding in 
-            ZeroPadding layer. In TF, padding is added to conv layers 
-            using a separate layer, but in PyTorch it is defined as an 
+        padding_amount (int | None): It  keeps track of padding in
+            ZeroPadding layer. In TF, padding is added to conv layers
+            using a separate layer, but in PyTorch it is defined as an
             attribute of the conv layer.
     """
+
+    # Template names for temporary variables
+    TEMP_SUBSCRIPT_OP = "_subscript_op_{}"
+    TEMP_SUBSCRIPT = "_subscript_temp_{}"
+    TEMP_BINOP = "_binop_temp_{}"
+    TEMP_INLINE = "_inline_{}_{}"
 
     def __init__(self, input_nn_type: str, only_nn:bool):
         super().__init__(input_nn_type, only_nn)
@@ -89,6 +95,403 @@ class ASTParserTF(ASTParser):
         # Track RNN output vs hidden variables separately
         self.rnn_output_vars = {}  # {module_name: output_var}
         self.rnn_hidden_vars = {}  # {module_name: hidden_var}
+        # Track variable aliases and layer lookups
+        self.variable_aliases = {}  # {alias_var: source_var}
+        self.layer_by_name = {}  # {layer_name: layer_obj} for O(1) lookup
+
+    def _get_layer_by_name(self, layer_name):
+        """Get layer by name using O(1) lookup, fallback to linear search if not in dict."""
+        if layer_name in self.layer_by_name:
+            return self.layer_by_name[layer_name]
+        # Fallback to linear search and update dict (for layers added before tracking)
+        layer_obj = next((obj for obj in self.buml_model.layers if obj.name == layer_name), None)
+        if layer_obj:
+            self.layer_by_name[layer_name] = layer_obj
+        return layer_obj
+
+    def visit_AugAssign(self, node: ast.AugAssign):
+        """
+        Handle augmented assignment (in-place operations like +=, -=, *=, /=, //=).
+        Converts them to regular assignment: x += y becomes x = x + y
+
+        This enables support for residual connections and other in-place operations.
+        """
+        # Only process if we're inside a class definition
+        if not self.in_class:
+            return
+
+        # Create BinOp node: x + y
+        binop = ast.BinOp(
+            left=ast.Name(id=node.target.id, ctx=ast.Load()),
+            op=node.op,
+            right=node.value
+        )
+
+        # Create Assign node: x = (x + y)
+        assign = ast.Assign(targets=[node.target], value=binop)
+        assign.lineno = node.lineno
+        assign.col_offset = node.col_offset
+
+        # Process as regular assignment
+        self.visit_Assign(assign)
+
+    def handle_forward_binop(self, node: ast.Assign):
+        """
+        Handle binary operations in forward method (e.g., x + y, x * 2, a // b).
+        Creates TensorOp objects for arithmetic operations.
+        """
+        binop_node = node.value
+        op_type = binop_node.op.__class__.__name__
+
+        # Map Python AST op types to BUML tns_type
+        op_map = {
+            'Add': 'binop_add',
+            'Sub': 'binop_subtract',
+            'Mult': 'binop_multiply',
+            'Div': 'binop_divide',
+            'FloorDiv': 'binop_floor_divide'
+        }
+
+        if op_type not in op_map:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unsupported binary operation '{op_type}'. This operation will be skipped."
+            )
+            return
+
+        tns_type = op_map[op_type]
+
+        # Extract operands (variable names or constant values)
+        left_var = self._extract_binop_operand(binop_node.left, node, "left")
+        right_var = self._extract_binop_operand(binop_node.right, node, "right")
+
+        if left_var is None or right_var is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Could not extract operands for binary operation. Operation skipped."
+            )
+            return
+
+        # Get the layer/module names that produced these variables
+        # For constants (float/int), we use the value directly instead of a layer name
+        left_layer = left_var if isinstance(left_var, (int, float)) else self.module_of_output.get(left_var)
+        right_layer = right_var if isinstance(right_var, (int, float)) else self.module_of_output.get(right_var)
+
+        if left_layer is None or right_layer is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Cannot determine source layers for binary operation. Make sure both operands are defined earlier."
+            )
+            return
+
+        # Determine if variables are output or hidden for RNNs with return_type="both"
+        var_types = self._determine_binop_var_types(left_layer, right_layer, left_var, right_var)
+
+        # Create TensorOp
+        target_var = node.targets[0].id
+        tensorop_param = {
+            "name": f"_op_{self.tensor_op_counter}",
+            "tns_type": tns_type,
+            "layers_of_tensors": [left_layer, right_layer],
+            "actual_vars": var_types  # Track which component (output/hidden) each refers to
+        }
+        self.tensor_op_counter += 1
+
+        try:
+            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+            self.buml_model.add_tensor_op(tns_obj)
+            self.module_of_output[target_var] = tensorop_param["name"]
+
+            # Update prev_layer_output for TensorOps
+            self.prev_layer_output = target_var
+
+            # Mark source layers for residual connections
+            # When we have x = a + b where a and b are from different layers,
+            # mark both source layers so their inputs are preserved
+            if tns_type == "binop_add" and isinstance(left_layer, str) and isinstance(right_layer, str):
+                for layer_name in [left_layer, right_layer]:
+                    if layer_name and not isinstance(layer_name, (int, float)):
+                        layer_obj = self._get_layer_by_name(layer_name)
+                        if layer_obj:
+                            layer_obj.input_reused = True
+
+        except Exception as e:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Failed to create binary operation TensorOp: {str(e)}"
+            )
+
+    def _determine_binop_var_types(self, left_layer, right_layer, left_var, right_var):
+        """Determine var types (output/hidden) for RNN operands."""
+        actual_left_var = self.variable_aliases.get(left_var, left_var) if isinstance(left_var, str) else left_var
+        actual_right_var = self.variable_aliases.get(right_var, right_var) if isinstance(right_var, str) else right_var
+
+        var_types = []
+        for lyr_name, actual_var in zip([left_layer, right_layer], [actual_left_var, actual_right_var]):
+            if isinstance(lyr_name, (int, float)):
+                var_types.append("output")
+            elif lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
+                var_types.append("hidden")
+            elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
+                var_types.append("output")
+            else:
+                var_types.append("output")
+        return var_types
+
+    def _extract_binop_operand(self, operand_node, node, side):
+        """
+        Extract operand from binary operation. Handles:
+        - Variable names (ast.Name)
+        - Numeric constants (ast.Constant, ast.Num)
+        - Inline tensor operations (ast.Call) - e.g., x.squeeze(0)
+        - Subscript operations (ast.Subscript) - e.g., x[:, -1]
+        - Nested binary operations (ast.BinOp) - e.g., (a + b)
+
+        Parameters:
+            operand_node: AST node representing the operand
+            node: Parent assignment node (for line number tracking)
+            side: "left" or "right" (for warning messages)
+
+        Returns:
+            str or number: Variable name, numeric constant, or temp variable name
+        """
+        if isinstance(operand_node, ast.Name):
+            # Variable reference
+            return operand_node.id
+        elif isinstance(operand_node, ast.Constant):
+            # Numeric constant
+            return operand_node.value
+        elif isinstance(operand_node, ast.Num):  # Python 3.7 compatibility
+            return operand_node.n
+        elif isinstance(operand_node, ast.Call):
+            # Inline tensor operation (e.g., x.squeeze(0))
+            return self.extract_inline_tensorop(operand_node, node)
+        elif isinstance(operand_node, ast.Subscript):
+            # Subscript operation (e.g., x[:, -1])
+            temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
+            self.tensor_op_counter += 1
+            self.handle_subscript_operation(operand_node, temp_name, node)
+            return temp_name
+        elif isinstance(operand_node, ast.BinOp):
+            # Nested binary operation - recursively handle it
+            temp_name = self.TEMP_BINOP.format(self.tensor_op_counter)
+            self.tensor_op_counter += 1
+            temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+            binop_assign = ast.Assign(targets=[temp_target], value=operand_node)
+            binop_assign.lineno = node.lineno
+            binop_assign.col_offset = node.col_offset
+            self.handle_forward_binop(binop_assign)
+            return temp_name
+        else:
+            # Unsupported operand type
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unsupported operand type '{operand_node.__class__.__name__}' on {side} side of binary operation."
+            )
+            return None
+
+    def extract_inline_tensorop(self, call_node: ast.Call, parent_node: ast.Assign):
+        """
+        Extracts inline tensor operations like x.unsqueeze(1) or x.squeeze(1)
+        and creates a synthetic intermediate operation.
+
+        Parameters:
+            call_node (ast.Call): The inline method call node
+            parent_node (ast.Assign): The parent assignment node
+
+        Returns:
+            str: The name of the intermediate variable created
+        """
+        if not isinstance(call_node.func, ast.Attribute):
+            return "x"
+
+        op_type = call_node.func.attr
+        base_var = self._extract_inline_base_var(call_node, parent_node)
+
+        if op_type not in ['squeeze', 'unsqueeze', 'repeat']:
+            if base_var == 'self':
+                return None
+            return base_var
+
+        base_layer = self.module_of_output.get(base_var)
+        if base_layer is None:
+            return base_var
+
+        intermediate_var = self.TEMP_INLINE.format(op_type, self.tensor_op_counter)
+        tensorop_param = {
+            "tns_type": op_type,
+            "layers_of_tensors": [base_layer],
+            "name": f"op_{self.tensor_op_counter}"
+        }
+        tensorop_param.update(self._extract_inline_op_params(call_node, op_type))
+
+        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        self.buml_model.add_tensor_op(tns_obj)
+        self.tensor_op_counter += 1
+        self.module_of_output[intermediate_var] = tensorop_param["name"]
+
+        return intermediate_var
+
+    def _extract_inline_base_var(self, call_node, parent_node):
+        """Extract base variable from inline operation, handling chained calls."""
+        if isinstance(call_node.func.value, ast.Name):
+            return call_node.func.value.id
+        elif isinstance(call_node.func.value, ast.Call):
+            return self.extract_inline_tensorop(call_node.func.value, parent_node)
+        else:
+            if hasattr(call_node.func, 'value') and hasattr(call_node.func.value, 'id'):
+                return call_node.func.value.id
+            return "x"
+
+    def _extract_inline_op_params(self, call_node, op_type):
+        """Extract operation parameters for inline TensorOp."""
+        if op_type == 'repeat':
+            repeat_counts = [self.param_value(arg) for arg in call_node.args]
+            return {"repeat_dim": repeat_counts}
+        else:
+            dim_value = None
+            if len(call_node.args) > 0:
+                dim_value = self.param_value(call_node.args[0])
+            else:
+                for kw in call_node.keywords:
+                    if kw.arg == "dim":
+                        dim_value = self.param_value(kw.value)
+            return {"reduce_dim": dim_value}
+
+    def handle_subscript_operation(self, subscript_node: ast.Subscript, temp_name: str, node: ast.Assign):
+        """
+        Unified handler for subscript operations - detects RNN vs non-RNN and handles accordingly.
+
+        Parameters:
+            subscript_node (ast.Subscript): The subscript AST node
+            temp_name (str): The temporary variable name for the result
+            node (ast.Assign): The parent assignment node
+
+        Returns:
+            None, but creates TensorOp or sets RNN return_type
+        """
+        subscripted_var = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else None
+        subscript_assign = self._create_temp_assignment(temp_name, subscript_node, node)
+
+        if self._is_rnn_subscript(subscripted_var):
+            self.handle_forward_slicing(subscript_assign)
+        else:
+            subscript_pattern = self.extract_subscript_pattern(subscript_node)
+            self.create_subscript_tensorop(subscripted_var, subscript_pattern, temp_name)
+
+        self.previous_assign = subscript_assign
+
+    def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
+        """
+        Extract the subscript/slice pattern from an AST Subscript node as a string.
+
+        Parameters:
+            subscript_node (ast.Subscript): The AST subscript node
+
+        Returns:
+            str: String representation of the subscript pattern (e.g., "[-1]", "[:, -1, :]")
+        """
+        def slice_to_string(slice_node):
+            if isinstance(slice_node, ast.Slice):
+                lower = ast.unparse(slice_node.lower) if slice_node.lower else ""
+                upper = ast.unparse(slice_node.upper) if slice_node.upper else ""
+                step = ast.unparse(slice_node.step) if slice_node.step else ""
+                if step:
+                    return f"{lower}:{upper}:{step}"
+                else:
+                    return f"{lower}:{upper}" if lower or upper else ":"
+            elif isinstance(slice_node, ast.Tuple):
+                # Multi-dimensional slicing like [:, -1, :]
+                elements = [slice_to_string(elt) for elt in slice_node.elts]
+                return ", ".join(elements)
+            else:
+                # Single index like -1 or 0
+                return ast.unparse(slice_node)
+
+        pattern = slice_to_string(subscript_node.slice)
+        return f"[{pattern}]"
+
+    def _resolve_variable_alias(self, var):
+        """Resolve variable aliases to find the actual source."""
+        resolved_var = var
+        while resolved_var in self.variable_aliases:
+            resolved_var = self.variable_aliases[resolved_var]
+        return resolved_var
+
+    def _create_subscript_op(self, op_name, source_module, subscript_pattern):
+        """Create subscript TensorOp object."""
+        return mm_classes.TensorOp(
+            name=op_name,
+            tns_type='subscript',
+            layers_of_tensors=[source_module],
+            subscript_indices=subscript_pattern
+        )
+
+    def create_subscript_tensorop(self, source_var: str, subscript_pattern: str, output_var: str):
+        """
+        Create a subscript TensorOp for general slicing operations.
+
+        Parameters:
+            source_var (str): The variable being subscripted
+            subscript_pattern (str): The subscript pattern as a string (e.g., "[-1]")
+            output_var (str): The output variable name
+
+        Returns:
+            None, but adds TensorOp to BUML model
+        """
+        op_name = self.TEMP_SUBSCRIPT_OP.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+
+        resolved_var = self._resolve_variable_alias(source_var)
+        source_module = self.module_of_output.get(resolved_var, resolved_var)
+
+        subscript_op = self._create_subscript_op(op_name, source_module, subscript_pattern)
+        self.buml_model.modules.append(subscript_op)
+        self.inputs_outputs[op_name] = [resolved_var, output_var]
+        self.module_of_output[output_var] = op_name
+
+    def _is_rnn_subscript(self, subscripted_var):
+        """Check if subscript is on an RNN layer."""
+        if not (subscripted_var and subscripted_var in self.module_of_output):
+            return False
+
+        src_module = self.module_of_output[subscripted_var]
+        src_layer = self._get_layer_by_name(src_module)
+        return src_layer and hasattr(src_layer, 'return_type')
+
+    def _create_temp_assignment(self, temp_name, subscript_node, node):
+        """Create temporary assignment node for subscript operation."""
+        temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+        subscript_assign = ast.Assign(targets=[temp_target], value=subscript_node)
+        subscript_assign.lineno = node.lineno
+        subscript_assign.col_offset = node.col_offset
+        return subscript_assign
+
+    def handle_forward_variable_assignment(self, node: ast.Assign):
+        """
+        Handle simple variable assignments like inp = x or r = x (residual).
+        Tracks variable aliasing and marks source as reused for later operations.
+
+        Parameters:
+            node (ast.Assign): The AST node representing the assignment
+
+        Returns:
+            None, but updates tracking dictionaries
+        """
+        target_var = node.targets[0].id
+        source_var = node.value.id
+
+        # If source is tracked in module_of_output, propagate it to target
+        if source_var in self.module_of_output:
+            source_module = self.module_of_output[source_var]
+            self.module_of_output[target_var] = source_module
+
+            # Track that this variable has been saved for later use (residual connection)
+            # The NEXT operation that modifies source_var should use a new output variable
+            # We'll set a flag that the next layer/op processing can check
+            if not hasattr(self, '_variables_saved_for_residual'):
+                self._variables_saved_for_residual = set()
+            self._variables_saved_for_residual.add(source_var)
+        else:
+            # Source is not tracked, mark as network input with special marker
+            self.module_of_output[target_var] = 'INPUT'
+
+        self.previous_assign = node
 
     def handle_init(self, node: ast.Assign):
         """
