@@ -234,6 +234,32 @@ class ASTParserTF(ASTParser):
                 var_types.append("output")
         return var_types
 
+    def _determine_concat_var_types(self, lyr1, lyr2, var1, var2):
+        """Determine var types (output/hidden) for RNN concatenation operands."""
+        # Resolve variable aliases
+        actual_var1 = self.variable_aliases.get(var1, var1)
+        actual_var2 = self.variable_aliases.get(var2, var2)
+
+        var_types = []
+
+        # Check first variable
+        if lyr1 in self.rnn_hidden_vars and actual_var1 == self.rnn_hidden_vars[lyr1]:
+            var_types.append("hidden")
+        elif lyr1 in self.rnn_output_vars and actual_var1 == self.rnn_output_vars[lyr1]:
+            var_types.append("output")
+        else:
+            var_types.append("output")  # Default to output
+
+        # Check second variable
+        if lyr2 in self.rnn_hidden_vars and actual_var2 == self.rnn_hidden_vars[lyr2]:
+            var_types.append("hidden")
+        elif lyr2 in self.rnn_output_vars and actual_var2 == self.rnn_output_vars[lyr2]:
+            var_types.append("output")
+        else:
+            var_types.append("output")  # Default to output
+
+        return var_types
+
     def _extract_binop_operand(self, operand_node, node, side):
         """
         Extract operand from binary operation. Handles:
@@ -998,9 +1024,16 @@ class ASTParserTF(ASTParser):
                 if lyr1 != lyr2:
                     layers_of_tensors = [lyr1, lyr2]
                     cat_dim = self.param_value(node.value.keywords[0].value)
+
+                    # Track RNN variable types (output vs hidden)
+                    var1 = op_args[0].id
+                    var2 = op_args[1].id
+                    var_types = self._determine_concat_var_types(lyr1, lyr2, var1, var2)
+
                     tensorop_param = {"tns_type": "concatenate",
                                       "layers_of_tensors": layers_of_tensors,
-                                      "concatenate_dim": cat_dim}
+                                      "concatenate_dim": cat_dim,
+                                      "actual_vars": var_types}
         elif op_type == "matmul" or op_type == "multiply":
             op_type = "matmultiply" if op_type == "matmul" else "multiply"
             layers_of_tensors = [self.module_of_output[op_args[0].id],
