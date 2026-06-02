@@ -20,7 +20,7 @@ layers_mapping = {
     "Flatten": "FlattenLayer", "Dense": "LinearLayer",
     "Embedding": "EmbeddingLayer", "BatchNormalization": "BatchNormLayer",
     "LayerNormalization": "LayerNormLayer", "Dropout": "DropoutLayer",
-    "RNN": "SimpleRNNLayer", "LSTM": "LSTMLayer", "GRU": "GRULayer",
+    "SimpleRNN": "SimpleRNNLayer", "LSTM": "LSTMLayer", "GRU": "GRULayer",
 }
 
 params_mapping = {

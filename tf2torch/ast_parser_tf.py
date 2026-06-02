@@ -493,6 +493,211 @@ class ASTParserTF(ASTParser):
 
         self.previous_assign = node
 
+    def handle_forward_tuple_assignment(self, node: ast.Assign):
+        """
+        Handle RNN tuple assignments such as:
+        - out, h = self.rnn(x)  # SimpleRNN/GRU with return_state=True
+        - out, h, c = self.lstm(x)  # LSTM with return_state=True
+
+        Parameters:
+            node (ast.Assign): The AST node representing the tuple assignment
+
+        Returns:
+            None, but populates the BUML model and tracks RNN variables
+        """
+        # Check if this is a method call (e.g., x.max(dim=1)) vs module call (e.g., self.rnn(x))
+        if hasattr(node.value.func, 'value') and isinstance(node.value.func.value, ast.Name):
+            caller_id = node.value.func.value.id
+            if caller_id != "self":
+                self.extract_tensorop(node)
+                return
+
+        module_name = node.value.func.attr
+
+        # Extract and track tuple target variables
+        self._extract_tuple_target_vars(node, module_name)
+
+        # Determine main output variable
+        rnn_out = self._determine_rnn_output_var(node)
+
+        # Extract input argument
+        rnn_in = self._extract_rnn_input_arg(node)
+
+        # Update tracking structures
+        self.inputs_outputs[module_name] = [rnn_in, rnn_out]
+        module_obj = self._get_layer_by_name(module_name)
+        if not module_obj:
+            module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
+
+        if module_obj:
+            self.buml_model.modules.append(module_obj)
+
+        self.previous_assign = node
+
+    def _extract_tuple_target_vars(self, node, module_name):
+        """Extract and track output/hidden variables from tuple assignment targets."""
+        # Handle cases like:
+        # out, h = self.rnn(x)  # 2 elements
+        # out, h, c = self.lstm(x)  # 3 elements (LSTM)
+
+        num_targets = len(node.targets[0].elts)
+
+        if num_targets == 2:
+            # SimpleRNN or GRU: out, h = self.rnn(x)
+            var1 = node.targets[0].elts[0].id if isinstance(node.targets[0].elts[0], ast.Name) else None
+            var2 = node.targets[0].elts[1].id if isinstance(node.targets[0].elts[1], ast.Name) else None
+
+            if var1 and var1 != "_":
+                self.rnn_output_vars[module_name] = var1
+                self.module_of_output[var1] = module_name
+            if var2 and var2 != "_":
+                self.rnn_hidden_vars[module_name] = var2
+                self.module_of_output[var2] = module_name
+
+        elif num_targets == 3:
+            # LSTM: out, h, c = self.lstm(x)
+            var1 = node.targets[0].elts[0].id if isinstance(node.targets[0].elts[0], ast.Name) else None
+            var2 = node.targets[0].elts[1].id if isinstance(node.targets[0].elts[1], ast.Name) else None
+            var3 = node.targets[0].elts[2].id if isinstance(node.targets[0].elts[2], ast.Name) else None
+
+            if var1 and var1 != "_":
+                self.rnn_output_vars[module_name] = var1
+                self.module_of_output[var1] = module_name
+            if var2 and var2 != "_":
+                self.rnn_hidden_vars[module_name] = var2
+                self.module_of_output[var2] = module_name
+            if var3 and var3 != "_":
+                # Track cell state for LSTM
+                self.module_of_output[var3] = module_name
+
+    def _determine_rnn_output_var(self, node):
+        """Determine which variable holds the main RNN output."""
+        # In TensorFlow, the first element is always the output sequence
+        # Second (and third for LSTM) are hidden states
+        first_elem = node.targets[0].elts[0]
+
+        if isinstance(first_elem, ast.Name) and first_elem.id != "_":
+            return first_elem.id
+        else:
+            # If first element is _, check second element (hidden state becomes output)
+            if len(node.targets[0].elts) > 1:
+                second_elem = node.targets[0].elts[1]
+                if isinstance(second_elem, ast.Name) and second_elem.id != "_":
+                    return second_elem.id
+
+        return "x"  # Fallback
+
+    def _extract_rnn_input_arg(self, node):
+        """
+        Extract input argument from RNN call, handling both variables and inline operations.
+
+        Also detects initial hidden state parameter for seq2seq/decoder patterns.
+        Returns: input_var (str)
+        Side effect: May add migration warnings for initial states
+        """
+        if not node.value.args:
+            return "x"
+
+        # Extract first argument (input sequence)
+        input_arg = node.value.args[0]
+        if isinstance(input_arg, ast.Name):
+            input_var = input_arg.id
+        elif isinstance(input_arg, ast.Call):
+            input_var = self.extract_inline_tensorop(input_arg, node)
+        else:
+            input_var = "x"
+
+        # Check for second argument (initial hidden state)
+        # In TensorFlow Keras, initial_state parameter is typically passed as keyword argument
+        # But we check positional args too for completeness
+        if len(node.value.args) > 1:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: RNN called with additional positional arguments. "
+                f"TensorFlow Keras RNNs typically use initial_state as a keyword argument. "
+                f"Manual review recommended."
+            )
+
+        return input_var
+
+    def handle_forward_slicing(self, node: ast.Assign):
+        """
+        Handle slicing operations such as:
+        - x = out[:, -1]  # Last timestep of RNN output
+        - x = out[:, -1, :]  # Last timestep with explicit feature dimension
+        - x = tensor[0]  # Regular tensor slicing
+
+        Parameters:
+            node (ast.Assign): The AST node representing the slicing assignment
+
+        Returns:
+            None, but populates the BUML model
+        """
+        if not isinstance(node.value.value, ast.Name):
+            # Complex subscript base, handle as regular subscript
+            subscripted_var = None
+        else:
+            subscripted_var = node.value.value.id
+
+        result_var = node.targets[0].id
+
+        # Look up which module produced this variable
+        if not subscripted_var or subscripted_var not in self.module_of_output:
+            self._handle_non_rnn_slicing(node, subscripted_var, result_var)
+            return
+
+        prev_module_name = self.module_of_output[subscripted_var]
+        lyr_obj = self._get_layer_by_name(prev_module_name)
+
+        # If not an RNN layer, handle as regular subscript
+        if not lyr_obj or not hasattr(lyr_obj, 'return_type'):
+            self._handle_non_rnn_slicing(node, subscripted_var, result_var)
+            return
+
+        # For RNN layers, determine if this is a timestep selection
+        if self._is_timestep_selection(node):
+            # This might indicate we need return_type='last'
+            # But in TensorFlow, return_type is already set during layer creation
+            # We just create the subscript TensorOp
+            self._handle_non_rnn_slicing(node, subscripted_var, result_var)
+        else:
+            # Regular slicing on RNN output
+            self._handle_non_rnn_slicing(node, subscripted_var, result_var)
+
+        # Track the result variable
+        self.module_of_output[result_var] = prev_module_name
+        self.variable_aliases[result_var] = subscripted_var
+        self.previous_assign = node
+
+    def _handle_non_rnn_slicing(self, node, subscripted_var, result_var):
+        """Create subscript TensorOp for non-RNN or regular slicing operations."""
+        subscript_pattern = self.extract_subscript_pattern(node.value)
+        self.create_subscript_tensorop(subscripted_var if subscripted_var else "unknown",
+                                      subscript_pattern, result_var)
+
+    def _is_timestep_selection(self, node):
+        """Check if this is a timestep selection pattern like [:, -1] or [:, -1, :]."""
+        slice_node = node.value.slice
+
+        # Check for patterns like [:, -1] or [:, -1, :]
+        if isinstance(slice_node, ast.Tuple):
+            # Multi-dimensional slicing
+            for i, elt in enumerate(slice_node.elts):
+                if isinstance(elt, ast.UnaryOp) and isinstance(elt.op, ast.USub):
+                    # Negative index like -1
+                    if isinstance(elt.operand, ast.Constant) and elt.operand.value == 1:
+                        return True
+                elif isinstance(elt, ast.Constant) and elt.value == -1:
+                    return True
+
+        # Single dimension slicing like [-1]
+        if isinstance(slice_node, ast.UnaryOp) and isinstance(slice_node.op, ast.USub):
+            if isinstance(slice_node.operand, ast.Constant) and slice_node.operand.value == 1:
+                return True
+        elif isinstance(slice_node, ast.Constant) and slice_node.value == -1:
+            return True
+
+        return False
+
     def handle_init(self, node: ast.Assign):
         """
         It retrieves the sub_nn layers and stores them in the 'sub_nn' 
@@ -1055,13 +1260,16 @@ def process_params(lyr_type: str, lyr_params: dict):
         param = "out_features" if lyr_type == "Dense" else "hidden_size"
         updated_lyr_params[param] = lyr_params["units"]
 
+    # Track return_sequences and return_state to determine return_type
+    has_return_sequences = lyr_params.get("return_sequences", False)
+    has_return_state = lyr_params.get("return_state", False)
+
     for param in lyr_params:
         if param == "activation":
             updated_lyr_params["actv_func"] = lyr_params[param]
-        elif param == "return_sequences" and lyr_params[param] is True:
-            updated_lyr_params["return_type"] = "full"
-        elif param == "return_state" and lyr_params[param] is True:
-            updated_lyr_params["return_type"] = "hidden"
+        elif param in ["return_sequences", "return_state"]:
+            # Skip these, handled below to determine return_type
+            pass
         elif param in params_mapping:
             param_name = params_mapping[param]
             updated_lyr_params[param_name] = lyr_params[param]
@@ -1070,8 +1278,16 @@ def process_params(lyr_type: str, lyr_params: dict):
         else:
             print(f"parameter {param} of layer {lyr_type} is not found!")
 
-    if "return_type" not in updated_lyr_params and lyr_type in rnn_layers:
-        updated_lyr_params["return_type"] = "last"
+    # Determine return_type based on return_sequences and return_state
+    if lyr_type in rnn_layers:
+        if has_return_sequences and has_return_state:
+            updated_lyr_params["return_type"] = "both"
+        elif has_return_sequences:
+            updated_lyr_params["return_type"] = "full"
+        elif has_return_state:
+            updated_lyr_params["return_type"] = "hidden"
+        else:
+            updated_lyr_params["return_type"] = "last"
 
     set_static_params(lyr_type, updated_lyr_params, static_params)
 
