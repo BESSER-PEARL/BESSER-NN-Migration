@@ -1039,7 +1039,8 @@ class ASTParserTF(ASTParser):
             if node.value.func.value.id == "self":
                 module_name = node.value.func.attr
                 #populate inputs_outputs and module_of_output
-                self.inputs_outputs[module_name] = [node.value.args[0].id,
+                input_var = node.value.args[0].id if node.value.args else "x"
+                self.inputs_outputs[module_name] = [input_var,
                                                     node.targets[0].id]
                 self.module_of_output[node.targets[0].id] = module_name
                 module_obj = next((obj for obj in self.buml_model.layers if
@@ -1048,6 +1049,15 @@ class ASTParserTF(ASTParser):
                     subnns = self.buml_model.sub_nns
                     module_obj = next((obj for obj in subnns if
                                        obj.name == module_name), None)
+
+                # Set name_module_input to track which module produced the input
+                if module_obj and input_var in self.module_of_output:
+                    module_obj.name_module_input = self.module_of_output[input_var]
+                    # For RNN hidden states, mark that we need the hidden output not sequence output
+                    source_module = self.module_of_output[input_var]
+                    if source_module in self.rnn_hidden_vars and self.rnn_hidden_vars[source_module] == input_var:
+                        # Set a flag to indicate this layer uses RNN hidden state
+                        module_obj.use_rnn_hidden = True
 
                 self.buml_model.modules.append(module_obj)
             else:
@@ -1235,6 +1245,29 @@ class ASTParserTF(ASTParser):
             tensorop_param = {
                 "tns_type": "mean",
                 "reduce_dim": reduce_dim,
+                "layers_of_tensors": source_layers
+            }
+        elif op_type == "zeros_like":
+            # Extract source variable
+            if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
+                source_var = op_args[0].id
+                if source_var in self.module_of_output:
+                    source_layers = [self.module_of_output[source_var]]
+                elif source_var == 'x':
+                    source_layers = ['INPUT']
+                else:
+                    self.migration_warnings.append(
+                        f"Line {node.lineno}: zeros_like source variable '{source_var}' not found."
+                    )
+                    return None
+            else:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: zeros_like requires an input tensor."
+                )
+                return None
+
+            tensorop_param = {
+                "tns_type": "zeros_like",
                 "layers_of_tensors": source_layers
             }
         else:
