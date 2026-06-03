@@ -87,6 +87,7 @@ class ASTParserTF(ASTParser):
     TEMP_SUBSCRIPT = "_subscript_temp_{}"
     TEMP_BINOP = "_binop_temp_{}"
     TEMP_INLINE = "_inline_{}_{}"
+    TEMP_NESTED = "_nested_temp_{}"
 
     def __init__(self, input_nn_type: str, only_nn:bool):
         super().__init__(input_nn_type, only_nn)
@@ -98,6 +99,7 @@ class ASTParserTF(ASTParser):
         # Track variable aliases and layer lookups
         self.variable_aliases = {}  # {alias_var: source_var}
         self.layer_by_name = {}  # {layer_name: layer_obj} for O(1) lookup
+        self.layer_reuse_count = {}  # {layer_name: reuse_count} for layer reuse tracking
 
     def _get_layer_by_name(self, layer_name):
         """Get layer by name using O(1) lookup, fallback to linear search if not in dict."""
@@ -259,6 +261,130 @@ class ASTParserTF(ASTParser):
             var_types.append("output")  # Default to output
 
         return var_types
+
+    def _determine_rnn_var_types_multi(self, layers_of_tensors, actual_vars):
+        """Determine var types for N RNN concatenation operands."""
+        var_types = []
+        for lyr_name, actual_var in zip(layers_of_tensors, actual_vars):
+            if lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
+                var_types.append("hidden")
+            elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
+                var_types.append("output")
+            else:
+                var_types.append("output")
+        return var_types
+
+    def _handle_layer_reuse_in_concat(self, layer_obj, arg, layer_name):
+        """Handle layer reuse in concatenation."""
+        import copy
+        self.layer_reuse_count[layer_name] = self.layer_reuse_count.get(layer_name, 0) + 1
+        use_count = self.layer_reuse_count[layer_name]
+
+        reuse_layer = copy.copy(layer_obj)
+        reuse_layer.name = f"{layer_name}_use_{use_count}"
+        reuse_layer.input_reused = True
+
+        if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+            input_var = arg.args[0].id
+            if input_var in self.module_of_output:
+                reuse_layer.name_module_input = self.module_of_output[input_var]
+
+        self.buml_model.modules.append(reuse_layer)
+        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+        self.module_of_output[temp_name] = reuse_layer.name
+        return temp_name
+
+    def _handle_first_layer_use_in_concat(self, layer_obj, arg, layer_name):
+        """Handle first layer use in concatenation."""
+        if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+            input_var = arg.args[0].id
+            if input_var in self.module_of_output:
+                layer_obj.name_module_input = self.module_of_output[input_var]
+                layer_obj.input_reused = True
+
+        self.buml_model.modules.append(layer_obj)
+        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+        self.module_of_output[temp_name] = layer_name
+        return temp_name
+
+    def _extract_layer_call_variable(self, arg, layer_name):
+        """Extract variable from layer call in concatenation - returns INLINE_CALL marker."""
+        # Get input variable
+        if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+            input_var = arg.args[0].id
+        else:
+            input_var = "x"
+
+        # Check if layer exists
+        layer_obj = next((lyr for lyr in self.buml_model.layers if lyr.name == layer_name), None)
+        if not layer_obj:
+            self.migration_warnings.append(
+                f"Concatenation operation: Layer '{layer_name}' referenced but not found in model."
+            )
+            return None
+
+        # Add layer to modules so it appears in __init__
+        # Mark as inline_only so it's not executed separately in forward
+        if layer_obj not in self.buml_model.modules:
+            layer_obj.inline_only = True  # Flag for generator
+            self.buml_model.modules.append(layer_obj)
+
+        return f"INLINE_CALL:{layer_name}:{input_var}"
+
+    def _extract_inline_call_variable(self, arg, node):
+        """Extract variable from inline operation call in concatenation."""
+        result = self.extract_inline_tensorop(arg, node)
+        if result is None:
+            self.migration_warnings.append(
+                f"Concatenation operation: Could not process inline operation."
+            )
+        return result
+
+    def _extract_subscript_variable(self, arg, node):
+        """Extract variable from subscript operation in concatenation."""
+        temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+        self.handle_subscript_operation(arg, temp_name, node)
+        return temp_name
+
+    def _extract_concat_arg_variable(self, arg, node):
+        """Extract variable name from concatenation argument, handling layer calls and inline ops."""
+        if isinstance(arg, ast.Name):
+            return arg.id
+        elif isinstance(arg, ast.Call):
+            if (isinstance(arg.func, ast.Attribute) and
+                isinstance(arg.func.value, ast.Name) and
+                arg.func.value.id == 'self'):
+                return self._extract_layer_call_variable(arg, arg.func.attr)
+            else:
+                return self._extract_inline_call_variable(arg, node)
+        elif isinstance(arg, ast.Subscript):
+            return self._extract_subscript_variable(arg, node)
+        else:
+            return None
+
+    def _extract_concat_variables(self, ops_args, node):
+        """Extract all variables from concatenation arguments."""
+        variables = []
+        for arg in ops_args:
+            var = self._extract_concat_arg_variable(arg, node)
+            if var is None:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: Cannot extract variable from concatenation argument."
+                )
+                return None
+            variables.append(var)
+        return variables
+
+    def _resolve_concat_variables(self, variables):
+        """Resolve variable aliases to actual variables."""
+        actual_vars = []
+        for var in variables:
+            actual_var = var if var in self.module_of_output else self.variable_aliases.get(var, var)
+            actual_vars.append(actual_var)
+        return actual_vars
 
     def _extract_binop_operand(self, operand_node, node, side):
         """
@@ -1016,24 +1142,42 @@ class ASTParserTF(ASTParser):
         op_args = node.value.args
         tensorop_param = None
         if op_type == "concat":
-            op_args = node.value.args[0].elts
-            if (op_args[0].id in self.module_of_output and
-                op_args[1].id in self.module_of_output):
-                lyr1 = self.module_of_output[op_args[0].id]
-                lyr2 = self.module_of_output[op_args[1].id]
-                if lyr1 != lyr2:
-                    layers_of_tensors = [lyr1, lyr2]
-                    cat_dim = self.param_value(node.value.keywords[0].value)
+            ops_args = node.value.args[0].elts
 
-                    # Track RNN variable types (output vs hidden)
-                    var1 = op_args[0].id
-                    var2 = op_args[1].id
-                    var_types = self._determine_concat_var_types(lyr1, lyr2, var1, var2)
+            # Extract variables (handles subscripts, calls, N-args)
+            variables = self._extract_concat_variables(ops_args, node)
+            if variables is None:
+                return None
 
-                    tensorop_param = {"tns_type": "concatenate",
-                                      "layers_of_tensors": layers_of_tensors,
-                                      "concatenate_dim": cat_dim,
-                                      "actual_vars": var_types}
+            # Resolve aliases
+            actual_vars = self._resolve_concat_variables(variables)
+
+            # Get source layers
+            layers_of_tensors = []
+            for var in actual_vars:
+                # Handle inline layer call markers
+                if isinstance(var, str) and var.startswith("INLINE_CALL:"):
+                    layers_of_tensors.append(var)  # Pass marker directly
+                elif var in self.module_of_output:
+                    layers_of_tensors.append(self.module_of_output[var])
+                else:
+                    self.migration_warnings.append(
+                        f"Line {node.lineno}: Variable '{var}' not found in module outputs."
+                    )
+                    return None
+
+            # Get concatenation dimension
+            cat_dim = self.param_value(node.value.keywords[0].value)
+
+            # Track RNN var types for N variables
+            var_types = self._determine_rnn_var_types_multi(layers_of_tensors, actual_vars)
+
+            tensorop_param = {
+                "tns_type": "concatenate",
+                "layers_of_tensors": layers_of_tensors,
+                "concatenate_dim": cat_dim,
+                "actual_vars": var_types
+            }
         elif op_type == "matmul" or op_type == "multiply":
             op_type = "matmultiply" if op_type == "matmul" else "multiply"
             layers_of_tensors = [self.module_of_output[op_args[0].id],
@@ -1050,6 +1194,49 @@ class ASTParserTF(ASTParser):
             reshape_dim = [op_args[i].value for i in range(1, len(op_args))]
             tensorop_param = {"tns_type": op_type,
                               "reshape_dim": reshape_dim}
+        elif op_type == "reduce_mean":
+            # Extract dimension parameter
+            reduce_dim = None
+            for kw in node.value.keywords:
+                if kw.arg == "axis":
+                    reduce_dim = self.param_value(kw.value)
+                    break
+
+            if reduce_dim is None:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: reduce_mean requires an 'axis' parameter."
+                )
+                return None
+
+            # Extract source variable
+            if len(op_args) > 0:
+                if isinstance(op_args[0], ast.Name):
+                    source_var = op_args[0].id
+                    if source_var in self.module_of_output:
+                        source_layers = [self.module_of_output[source_var]]
+                    elif source_var == 'x':
+                        source_layers = ['INPUT']
+                    else:
+                        self.migration_warnings.append(
+                            f"Line {node.lineno}: Source variable '{source_var}' not found."
+                        )
+                        return None
+                else:
+                    self.migration_warnings.append(
+                        f"Line {node.lineno}: reduce_mean operand type not supported."
+                    )
+                    return None
+            else:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: reduce_mean requires an input tensor."
+                )
+                return None
+
+            tensorop_param = {
+                "tns_type": "mean",
+                "reduce_dim": reduce_dim,
+                "layers_of_tensors": source_layers
+            }
         else:
             print(f"{op_type} is not recognized!")
 
@@ -1059,6 +1246,11 @@ class ASTParserTF(ASTParser):
             tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
             self.buml_model.add_tensor_op(tns_obj)
             self.tensor_op_counter+=1
+
+            # Track output variable
+            if hasattr(node, 'targets') and len(node.targets) > 0:
+                target_var = node.targets[0].id
+                self.module_of_output[target_var] = op_name
 
     def handle_outer_attribute_assignment(self, node: ast.Assign):
         """
