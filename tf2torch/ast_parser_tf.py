@@ -187,7 +187,7 @@ class ASTParserTF(ASTParser):
         # Create TensorOp
         target_var = node.targets[0].id
         tensorop_param = {
-            "name": f"_op_{self.tensor_op_counter}",
+            "name": f"op_{self.tensor_op_counter}",
             "tns_type": tns_type,
             "layers_of_tensors": [left_layer, right_layer],
             "actual_vars": var_types  # Track which component (output/hidden) each refers to
