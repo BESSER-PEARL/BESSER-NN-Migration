@@ -858,6 +858,28 @@ class ASTParserTF(ASTParser):
                     # Track cell state for LSTM with special suffix
                     self.module_of_output[var3] = module_name + "__cell"
 
+        elif num_targets == 5:
+            # Bidirectional LSTM: out, fwd_h, fwd_c, bwd_h, bwd_c = self.bilstm(x)
+            var1 = node.targets[0].elts[0].id if isinstance(node.targets[0].elts[0], ast.Name) else None
+            var2 = node.targets[0].elts[1].id if isinstance(node.targets[0].elts[1], ast.Name) else None
+            var3 = node.targets[0].elts[2].id if isinstance(node.targets[0].elts[2], ast.Name) else None
+            var4 = node.targets[0].elts[3].id if isinstance(node.targets[0].elts[3], ast.Name) else None
+            var5 = node.targets[0].elts[4].id if isinstance(node.targets[0].elts[4], ast.Name) else None
+
+            if var1 and var1 != "_":
+                self.rnn_output_vars[module_name] = var1
+                self.module_of_output[var1] = module_name
+            # var2 and var4 are forward and backward hidden states
+            if var2 and var2 != "_":
+                self.module_of_output[var2] = module_name + "__hidden"
+            if var4 and var4 != "_":
+                self.module_of_output[var4] = module_name + "__hidden"
+            # var3 and var5 are forward and backward cell states
+            if var3 and var3 != "_":
+                self.module_of_output[var3] = module_name + "__cell"
+            if var5 and var5 != "_":
+                self.module_of_output[var5] = module_name + "__cell"
+
     def _determine_rnn_output_var(self, node):
         """Determine which variable holds the main RNN output."""
         # In TensorFlow, the first element is always the output sequence
@@ -1431,8 +1453,6 @@ class ASTParserTF(ASTParser):
                                         if not hasattr(self, '_reserved_tf_vars'):
                                             self._reserved_tf_vars = set()
                                         self._reserved_tf_vars.add(h_var)
-                                        print(f"DEBUG: Marked {source_module}.input_reused = True, reserved={h_var}")
-                                    print(f"DEBUG: Set {module_name}.hx_source = {source_module}, return_type={module_obj.return_type}")
                             break
 
                 # Set name_module_input to track which module produced the input

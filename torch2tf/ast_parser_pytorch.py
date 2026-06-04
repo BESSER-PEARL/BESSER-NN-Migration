@@ -1497,6 +1497,9 @@ class ASTParserTorch(ASTParser):
         self.module_of_output[node.targets[0].id] = module_name
 
         module_obj = self._get_layer_by_name(module_name)
+        # Set name_module_input if the input comes from a tracked module
+        if module_obj and input_var in self.module_of_output:
+            module_obj.name_module_input = self.module_of_output[input_var]
         self._detect_parallel_operations(module_obj, input_var)
         self.prev_layer_output = node.targets[0].id
         self._check_residual_connection(module_obj, input_var)
@@ -1990,7 +1993,7 @@ class ASTParserTorch(ASTParser):
         """Check if layer is a bidirectional RNN with hidden return type."""
         return (source_layer and
                 hasattr(source_layer, 'bidirectional') and source_layer.bidirectional and
-                hasattr(source_layer, 'return_type') and source_layer.return_type == 'hidden')
+                hasattr(source_layer, 'return_type') and source_layer.return_type in ('hidden', 'both'))
 
     def _extract_subscript_indices(self, ops_args):
         """Extract indices from subscript operations."""
@@ -2122,13 +2125,14 @@ class ASTParserTorch(ASTParser):
 
         # Early check for bidirectional RNN concat to avoid creating subscript tensorops
         if self._is_bidirectional_rnn_subscript_concat(ops_args):
+            # Skip creating TensorOp - template already generates bidirectional concat
+            # But track the output variable for subsequent usage
             output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
             if output_var:
                 var_name = ops_args[0].value.id
                 source_module = self.module_of_output[var_name]
-                if source_module.endswith("__hidden"):
-                    source_module = source_module[:-8]
-                self.module_of_output[output_var] = source_module
+                # Track as special "bidirectional_concat" marker to preserve variable name
+                self.module_of_output[output_var] = "bidirectional_concat_" + source_module.replace("__hidden", "")
             return None
 
         self._update_prev_layer_return_type_if_subscript(ops_args)
