@@ -429,10 +429,10 @@ class ASTParser(ast.NodeVisitor):
         if isinstance(param, ast.Constant):
             return param.value
         elif isinstance(param, ast.Tuple):
-            values = [el.value for el in param.elts]
+            values = [self.param_value(el) for el in param.elts]
             return values
         elif isinstance(param, ast.List):  # List values
-            values = [el.value for el in param.elts]
+            values = [self.param_value(el) for el in param.elts]
             return values
         elif (isinstance(param, ast.UnaryOp) and
             isinstance(param.op, ast.USub)):  # Negative numbers
