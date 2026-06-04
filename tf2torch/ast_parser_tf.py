@@ -1070,7 +1070,8 @@ class ASTParserTF(ASTParser):
                 inner_node = ast.Assign(targets=[temp_target], value=inner_call)
                 inner_node.lineno = node.lineno
                 inner_node.col_offset = node.col_offset
-                self.process_single_call(inner_node)
+                # Recursively handle in case of multiple levels of nesting
+                self.handle_forward_simple_call(inner_node)
                 self.previous_assign = inner_node
 
                 # Replace inner call with temp variable in outer call
@@ -1199,7 +1200,18 @@ class ASTParserTF(ASTParser):
             if node.value.func.value.id == "self":
                 module_name = node.value.func.attr
                 #populate inputs_outputs and module_of_output
-                input_var = node.value.args[0].id if node.value.args else "x"
+                # Handle different argument types (Name, Call, etc.)
+                if node.value.args:
+                    arg = node.value.args[0]
+                    if isinstance(arg, ast.Name):
+                        input_var = arg.id
+                    elif isinstance(arg, ast.Call):
+                        # Nested call - use the temp variable created earlier
+                        input_var = f"_nested_temp_{self.tensor_op_counter - 1}"
+                    else:
+                        input_var = "x"
+                else:
+                    input_var = "x"
                 self.inputs_outputs[module_name] = [input_var,
                                                     node.targets[0].id]
                 self.module_of_output[node.targets[0].id] = module_name
