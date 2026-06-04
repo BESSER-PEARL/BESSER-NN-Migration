@@ -751,11 +751,19 @@ class ASTParserTF(ASTParser):
         if not module_obj:
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
+        # Mark input_reused when RNN input differs from previous layer output
+        # This ensures unique variable names for multiple RNNs using the same input
+        if module_obj and hasattr(self, 'prev_layer_output') and self.prev_layer_output:
+            if rnn_in != self.prev_layer_output:
+                module_obj.input_reused = True
+
         if module_obj and module_obj in self.buml_model.modules:
             self._handle_module_layer_reuse(node, module_name, module_obj)
         elif module_obj:
             self.buml_model.modules.append(module_obj)
 
+        # Update prev_layer_output to track the RNN output for next layer
+        self.prev_layer_output = rnn_out
         self.previous_assign = node
 
     def _extract_tuple_target_vars(self, node, module_name):
