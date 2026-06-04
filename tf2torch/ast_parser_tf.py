@@ -274,6 +274,23 @@ class ASTParserTF(ASTParser):
                 var_types.append("output")
         return var_types
 
+    def _handle_module_layer_reuse(self, node, module_name, module_obj):
+        """Handle layer reuse by creating synthetic copy."""
+        import copy
+        synthetic_name = f"{module_name}_use_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+
+        synthetic_module = copy.copy(module_obj)
+        synthetic_module.name = synthetic_name
+
+        if module_name in self.inputs_outputs:
+            self.inputs_outputs[synthetic_name] = self.inputs_outputs[module_name]
+
+        output_var = node.targets[0].id
+        self.module_of_output[output_var] = synthetic_name
+
+        self.buml_model.modules.append(synthetic_module)
+
     def _handle_layer_reuse_in_concat(self, layer_obj, arg, layer_name):
         """Handle layer reuse in concatenation."""
         import copy
@@ -733,7 +750,9 @@ class ASTParserTF(ASTParser):
         if not module_obj:
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
-        if module_obj:
+        if module_obj and module_obj in self.buml_model.modules:
+            self._handle_module_layer_reuse(node, module_name, module_obj)
+        elif module_obj:
             self.buml_model.modules.append(module_obj)
 
         self.previous_assign = node
@@ -1296,7 +1315,10 @@ class ASTParserTF(ASTParser):
                     # Set name_module_input to "INPUT" to signal network input
                     module_obj.name_module_input = "INPUT"
 
-                self.buml_model.modules.append(module_obj)
+                if module_obj and module_obj in self.buml_model.modules:
+                    self._handle_module_layer_reuse(node, module_name, module_obj)
+                elif module_obj:
+                    self.buml_model.modules.append(module_obj)
             else:
                 #tensorops or tf.nn.* activations
                 # Check if it's tf.nn.<activation>
