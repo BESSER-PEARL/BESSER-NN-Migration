@@ -646,7 +646,8 @@ class ASTParserTorch(ASTParser):
             self.module_of_output[var1] = module_name
         if var2 and var2 != "_":
             self.rnn_hidden_vars[module_name] = var2
-            self.module_of_output[var2] = module_name
+            # Track hidden state with special suffix to distinguish from output sequence
+            self.module_of_output[var2] = module_name + "__hidden"
 
     def _determine_rnn_return_type(self, node, module_name):
         """Determine RNN return type and main output variable based on underscore pattern."""
@@ -1684,7 +1685,13 @@ class ASTParserTorch(ASTParser):
             for kw in call_node.keywords:
                 if kw.arg == "dim":
                     squeeze_dim = self.param_value(kw.value)
-        return {"tns_type": "squeeze", "reduce_dim": squeeze_dim}
+
+        # Extract source layers to track which variable is being squeezed
+        source_layers = self._extract_source_layers(call_node.func.value) if hasattr(call_node.func, 'value') else None
+        tensorop_param = {"tns_type": "squeeze", "reduce_dim": squeeze_dim}
+        if source_layers:
+            tensorop_param["layers_of_tensors"] = source_layers
+        return tensorop_param
 
     def _extract_op_unsqueeze(self, call_node, op_args):
         """Extract unsqueeze operation parameters."""
@@ -1695,7 +1702,13 @@ class ASTParserTorch(ASTParser):
             for kw in call_node.keywords:
                 if kw.arg == "dim":
                     unsqueeze_dim = self.param_value(kw.value)
-        return {"tns_type": "unsqueeze", "reduce_dim": unsqueeze_dim}
+
+        # Extract source layers to track which variable is being unsqueezed
+        source_layers = self._extract_source_layers(call_node.func.value) if hasattr(call_node.func, 'value') else None
+        tensorop_param = {"tns_type": "unsqueeze", "reduce_dim": unsqueeze_dim}
+        if source_layers:
+            tensorop_param["layers_of_tensors"] = source_layers
+        return tensorop_param
 
     def _extract_op_normalize(self, call_node, op_args):
         """Extract normalize operation parameters."""
