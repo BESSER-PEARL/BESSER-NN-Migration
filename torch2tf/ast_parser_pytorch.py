@@ -650,7 +650,16 @@ class ASTParserTorch(ASTParser):
     def _extract_tuple_target_vars(self, node, module_name):
         """Extract and track output/hidden variables from tuple assignment targets."""
         var1 = node.targets[0].elts[0].id if not isinstance(node.targets[0].elts[0], ast.Tuple) else None
-        var2 = node.targets[0].elts[1].id if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0].id
+
+        # Handle LSTM case: out, (h, c) = self.lstm(x)
+        if isinstance(node.targets[0].elts[1], ast.Tuple):
+            # LSTM: second element is a tuple (h, c)
+            var2 = node.targets[0].elts[1].elts[0].id if isinstance(node.targets[0].elts[1].elts[0], ast.Name) else None
+            var3 = node.targets[0].elts[1].elts[1].id if len(node.targets[0].elts[1].elts) > 1 and isinstance(node.targets[0].elts[1].elts[1], ast.Name) else None
+        else:
+            # RNN/GRU: second element is just h
+            var2 = node.targets[0].elts[1].id
+            var3 = None
 
         if var1 and var1 != "_":
             self.rnn_output_vars[module_name] = var1
@@ -659,6 +668,9 @@ class ASTParserTorch(ASTParser):
             self.rnn_hidden_vars[module_name] = var2
             # Track hidden state with special suffix to distinguish from output sequence
             self.module_of_output[var2] = module_name + "__hidden"
+        if var3 and var3 != "_":
+            # Track cell state for LSTM with special suffix
+            self.module_of_output[var3] = module_name + "__cell"
 
     def _determine_rnn_return_type(self, node, module_name):
         """Determine RNN return type and main output variable based on underscore pattern."""
