@@ -742,7 +742,7 @@ class ASTParserTF(ASTParser):
         # Determine main output variable
         rnn_out = self._determine_rnn_output_var(node)
 
-        # Extract input argument
+        # Extract input argument (also detects initial_state keyword arg)
         rnn_in = self._extract_rnn_input_arg(node)
 
         # Update tracking structures
@@ -750,6 +750,12 @@ class ASTParserTF(ASTParser):
         module_obj = self._get_layer_by_name(module_name)
         if not module_obj:
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
+
+        # Add hx_source parameter if initial_state detected
+        if module_obj and hasattr(self, '_current_rnn_initial_hidden_source') and self._current_rnn_initial_hidden_source:
+            # Store reference to source layer as RNN attribute
+            module_obj.hx_source = self._current_rnn_initial_hidden_source
+            print(f"DEBUG: Set {module_name}.hx_source = {self._current_rnn_initial_hidden_source}")
 
         # Mark input_reused when RNN input differs from previous layer output
         # This ensures unique variable names for multiple RNNs using the same input
@@ -827,7 +833,7 @@ class ASTParserTF(ASTParser):
 
         Also detects initial hidden state parameter for seq2seq/decoder patterns.
         Returns: input_var (str)
-        Side effect: May add migration warnings for initial states
+        Side effect: Sets self._current_rnn_initial_hidden if initial_state is provided
         """
         if not node.value.args:
             return "x"
@@ -841,9 +847,40 @@ class ASTParserTF(ASTParser):
         else:
             input_var = "x"
 
-        # Check for second argument (initial hidden state)
-        # In TensorFlow Keras, initial_state parameter is typically passed as keyword argument
-        # But we check positional args too for completeness
+        # Check for initial_state keyword argument (TensorFlow pattern)
+        self._current_rnn_initial_hidden = None
+        self._current_rnn_initial_hidden_source = None
+        print(f"DEBUG: Checking keywords: {[kw.arg for kw in node.value.keywords]}")
+        for kw in node.value.keywords:
+            if kw.arg == "initial_state":
+                print(f"DEBUG: Found initial_state keyword!")
+                if isinstance(kw.value, ast.List):
+                    # LSTM case: initial_state=[h, c]
+                    # Need to find which layer produced these variables
+                    if len(kw.value.elts) >= 1:
+                        h_var = kw.value.elts[0].id if isinstance(kw.value.elts[0], ast.Name) else None
+                        if h_var and h_var in self.module_of_output:
+                            # Find source layer by looking up the variable
+                            source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
+                            # Store reference to source layer instead of variable names
+                            self._current_rnn_initial_hidden_source = source_module
+                            self.migration_warnings.append(
+                                f"Line {node.lineno}: RNN called with initial_state from layer '{source_module}'. "
+                                f"This will be migrated to PyTorch using the corresponding hidden state variables."
+                            )
+                elif isinstance(kw.value, ast.Name):
+                    # Single variable: initial_state=h
+                    h_var = kw.value.id
+                    if h_var in self.module_of_output:
+                        source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
+                        self._current_rnn_initial_hidden_source = source_module
+                        self.migration_warnings.append(
+                            f"Line {node.lineno}: RNN called with initial_state from layer '{source_module}'. "
+                            f"This will be migrated to PyTorch using the corresponding hidden state variable."
+                        )
+                break
+
+        # Check for second positional argument (less common in TF but possible)
         if len(node.value.args) > 1:
             self.migration_warnings.append(
                 f"Line {node.lineno}: RNN called with additional positional arguments. "
@@ -1287,6 +1324,7 @@ class ASTParserTF(ASTParser):
         if isinstance(node.value.func.value, ast.Name):
             if node.value.func.value.id == "self":
                 module_name = node.value.func.attr
+                print(f"DEBUG process_single_call: module_name={module_name}, keywords={[kw.arg for kw in node.value.keywords]}")
                 #populate inputs_outputs and module_of_output
                 # Handle different argument types (Name, Call, etc.)
                 if node.value.args:
@@ -1309,6 +1347,45 @@ class ASTParserTF(ASTParser):
                     subnns = self.buml_model.sub_nns
                     module_obj = next((obj for obj in subnns if
                                        obj.name == module_name), None)
+
+                # Check for initial_state keyword argument (for RNN layers)
+                if module_obj and hasattr(module_obj, 'return_type'):  # Check if it's an RNN layer
+                    for kw in node.value.keywords:
+                        if kw.arg == "initial_state":
+                            # Extract source layer from initial_state variables
+                            if isinstance(kw.value, ast.List) and len(kw.value.elts) >= 1:
+                                h_var = kw.value.elts[0].id if isinstance(kw.value.elts[0], ast.Name) else None
+                                print(f"DEBUG: h_var={h_var}, in module_of_output: {h_var in self.module_of_output if h_var else False}")
+                                if h_var and h_var in self.module_of_output:
+                                    source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
+                                    print(f"DEBUG: module_of_output[{h_var}] = {self.module_of_output[h_var]} -> source={source_module}")
+                                    module_obj.hx_source = source_module
+                                    # Mark source layer output as reused to prevent variable name reuse
+                                    source_layer = self._get_layer_by_name(source_module)
+                                    if source_layer:
+                                        source_layer.input_reused = True
+                                        # Mark the TF variable as reserved so generated PyTorch var won't be reused
+                                        if not hasattr(self, '_reserved_tf_vars'):
+                                            self._reserved_tf_vars = set()
+                                        self._reserved_tf_vars.add(h_var)
+                                        print(f"DEBUG: Marked {source_module}.input_reused = True, reserved={h_var}")
+                                    print(f"DEBUG: Set {module_name}.hx_source = {source_module}, return_type={module_obj.return_type}")
+                            elif isinstance(kw.value, ast.Name):
+                                h_var = kw.value.id
+                                if h_var in self.module_of_output:
+                                    source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
+                                    module_obj.hx_source = source_module
+                                    # Mark source layer output as reused to prevent variable name reuse
+                                    source_layer = self._get_layer_by_name(source_module)
+                                    if source_layer:
+                                        source_layer.input_reused = True
+                                        # Mark the TF variable as reserved so generated PyTorch var won't be reused
+                                        if not hasattr(self, '_reserved_tf_vars'):
+                                            self._reserved_tf_vars = set()
+                                        self._reserved_tf_vars.add(h_var)
+                                        print(f"DEBUG: Marked {source_module}.input_reused = True, reserved={h_var}")
+                                    print(f"DEBUG: Set {module_name}.hx_source = {source_module}, return_type={module_obj.return_type}")
+                            break
 
                 # Set name_module_input to track which module produced the input
                 if module_obj and input_var in self.module_of_output:
@@ -1570,7 +1647,8 @@ class ASTParserTF(ASTParser):
 
             tensorop_param = {
                 "tns_type": "zeros_like",
-                "layers_of_tensors": source_layers
+                "layers_of_tensors": source_layers,
+                "input_reused": True  # Force new variable name to avoid overwriting previous outputs
             }
         elif op_type == "squeeze":
             # Extract dimension parameter (optional)

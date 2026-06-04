@@ -710,25 +710,12 @@ class ASTParserTorch(ASTParser):
             if isinstance(hidden_arg, ast.Name):
                 # Simple case: rnn(x, h0)
                 self._current_rnn_initial_hidden = hidden_arg.id
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: RNN called with initial hidden state '{hidden_arg.id}'. "
-                    f"This is supported for seq2seq/decoder patterns. The hidden state will be "
-                    f"passed as input to the TensorFlow RNN layer."
-                )
             elif isinstance(hidden_arg, ast.Tuple):
                 # LSTM case: rnn(x, (h0, c0))
                 self._current_rnn_initial_hidden = "tuple_state"
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: LSTM called with initial hidden and cell states. "
-                    f"Both states will be passed to the TensorFlow LSTM layer."
-                )
             else:
-                # Complex expression
+                # Complex expression - not supported yet
                 self._current_rnn_initial_hidden = None
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: RNN called with complex initial hidden state expression. "
-                    f"This may not migrate correctly - manual review recommended."
-                )
         else:
             self._current_rnn_initial_hidden = None
 
@@ -774,6 +761,33 @@ class ASTParserTorch(ASTParser):
         module_obj = self._get_layer_by_name(module_name)
         if not module_obj:
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
+
+        # Handle initial hidden state (hx parameter) for seq2seq patterns
+        if module_obj and hasattr(self, '_current_rnn_initial_hidden') and self._current_rnn_initial_hidden:
+            if self._current_rnn_initial_hidden == "tuple_state":
+                # LSTM case with (h, c) tuple - need to extract the source from the tuple elements
+                # For now, we'll need to track this during argument parsing
+                if len(node.value.args) > 1 and isinstance(node.value.args[1], ast.Tuple):
+                    if len(node.value.args[1].elts) > 0 and isinstance(node.value.args[1].elts[0], ast.Name):
+                        h_var = node.value.args[1].elts[0].id
+                        if h_var in self.module_of_output:
+                            source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
+                            module_obj.hx_source = source_module
+                            # Mark source layer output as reused
+                            source_layer = self._get_layer_by_name(source_module)
+                            if source_layer:
+                                source_layer.input_reused = True
+            elif self._current_rnn_initial_hidden in self.module_of_output:
+                # Simple case with single hidden state variable
+                source_module = self.module_of_output[self._current_rnn_initial_hidden].replace("__hidden", "").replace("__cell", "")
+                module_obj.hx_source = source_module
+                # Mark source layer output as reused
+                source_layer = self._get_layer_by_name(source_module)
+                if source_layer:
+                    source_layer.input_reused = True
+            # Reset for next RNN
+            self._current_rnn_initial_hidden = None
+
         self.buml_model.modules.append(module_obj)
         self.previous_assign = node
 
@@ -2248,7 +2262,8 @@ class ASTParserTorch(ASTParser):
 
         return {
             "tns_type": "zeros_like",
-            "layers_of_tensors": source_layers
+            "layers_of_tensors": source_layers,
+            "input_reused": True  # Force new variable name to avoid overwriting previous outputs
         }
 
     def handle_outer_attribute_assignment(self, node: ast.Assign):
