@@ -267,13 +267,42 @@ class ASTParserTF(ASTParser):
         """Determine var types for N RNN concatenation operands."""
         var_types = []
         for lyr_name, actual_var in zip(layers_of_tensors, actual_vars):
-            if lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
+            # Check if lyr_name has __hidden or __cell suffix
+            if lyr_name.endswith("__hidden"):
+                var_types.append("hidden")
+            elif lyr_name.endswith("__cell"):
+                var_types.append("hidden")  # Cell states are also hidden states
+            elif lyr_name in self.rnn_hidden_vars and actual_var == self.rnn_hidden_vars[lyr_name]:
                 var_types.append("hidden")
             elif lyr_name in self.rnn_output_vars and actual_var == self.rnn_output_vars[lyr_name]:
                 var_types.append("output")
             else:
                 var_types.append("output")
         return var_types
+
+    def _is_bidirectional_hidden_concat(self, layers_of_tensors, var_types):
+        """Check if concat is for bidirectional RNN hidden states (already handled by template)."""
+        # Must have exactly 2 operands
+        if len(layers_of_tensors) != 2:
+            return False
+
+        # Both must be hidden states
+        if not all(vtype == "hidden" for vtype in var_types):
+            return False
+
+        # Both must come from the same base layer
+        base_layer1 = layers_of_tensors[0].replace("__hidden", "").replace("__cell", "")
+        base_layer2 = layers_of_tensors[1].replace("__hidden", "").replace("__cell", "")
+
+        if base_layer1 != base_layer2:
+            return False
+
+        # Check if the layer is bidirectional
+        lyr_obj = next((obj for obj in self.buml_model.modules if obj.name == base_layer1), None)
+        if lyr_obj and hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional:
+            return True
+
+        return False
 
     def _handle_module_layer_reuse(self, node, module_name, module_obj):
         """Handle layer reuse by creating synthetic copy."""
@@ -736,8 +765,11 @@ class ASTParserTF(ASTParser):
 
         module_name = node.value.func.attr
 
+        # Get module object first so we can check if it's bidirectional
+        module_obj = self._get_layer_by_name(module_name)
+
         # Extract and track tuple target variables
-        self._extract_tuple_target_vars(node, module_name)
+        self._extract_tuple_target_vars(node, module_name, module_obj)
 
         # Determine main output variable
         rnn_out = self._determine_rnn_output_var(node)
@@ -747,7 +779,6 @@ class ASTParserTF(ASTParser):
 
         # Update tracking structures
         self.inputs_outputs[module_name] = [rnn_in, rnn_out]
-        module_obj = self._get_layer_by_name(module_name)
         if not module_obj:
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
@@ -772,11 +803,12 @@ class ASTParserTF(ASTParser):
         self.prev_layer_output = rnn_out
         self.previous_assign = node
 
-    def _extract_tuple_target_vars(self, node, module_name):
+    def _extract_tuple_target_vars(self, node, module_name, module_obj=None):
         """Extract and track output/hidden variables from tuple assignment targets."""
         # Handle cases like:
         # out, h = self.rnn(x)  # 2 elements
         # out, h, c = self.lstm(x)  # 3 elements (LSTM)
+        # out, forward_h, backward_h = self.bidirectional_rnn(x)  # 3 elements (Bidirectional)
 
         num_targets = len(node.targets[0].elts)
 
@@ -794,21 +826,37 @@ class ASTParserTF(ASTParser):
                 self.module_of_output[var2] = module_name + "__hidden"
 
         elif num_targets == 3:
-            # LSTM: out, h, c = self.lstm(x)
             var1 = node.targets[0].elts[0].id if isinstance(node.targets[0].elts[0], ast.Name) else None
             var2 = node.targets[0].elts[1].id if isinstance(node.targets[0].elts[1], ast.Name) else None
             var3 = node.targets[0].elts[2].id if isinstance(node.targets[0].elts[2], ast.Name) else None
 
-            if var1 and var1 != "_":
-                self.rnn_output_vars[module_name] = var1
-                self.module_of_output[var1] = module_name
-            if var2 and var2 != "_":
-                self.rnn_hidden_vars[module_name] = var2
-                # Track hidden state with special suffix to distinguish from output sequence
-                self.module_of_output[var2] = module_name + "__hidden"
-            if var3 and var3 != "_":
-                # Track cell state for LSTM with special suffix
-                self.module_of_output[var3] = module_name + "__cell"
+            # Check if this is a bidirectional RNN
+            is_bidirectional = module_obj and hasattr(module_obj, 'bidirectional') and module_obj.bidirectional
+
+            if is_bidirectional:
+                # Bidirectional RNN: out, forward_h, backward_h = self.encoder(x)
+                if var1 and var1 != "_":
+                    self.rnn_output_vars[module_name] = var1
+                    self.module_of_output[var1] = module_name
+                # Both var2 and var3 are hidden states (forward and backward)
+                # They both point to the same layer with __hidden suffix
+                # The template will handle concatenating them
+                if var2 and var2 != "_":
+                    self.module_of_output[var2] = module_name + "__hidden"
+                if var3 and var3 != "_":
+                    self.module_of_output[var3] = module_name + "__hidden"
+            else:
+                # LSTM: out, h, c = self.lstm(x)
+                if var1 and var1 != "_":
+                    self.rnn_output_vars[module_name] = var1
+                    self.module_of_output[var1] = module_name
+                if var2 and var2 != "_":
+                    self.rnn_hidden_vars[module_name] = var2
+                    # Track hidden state with special suffix to distinguish from output sequence
+                    self.module_of_output[var2] = module_name + "__hidden"
+                if var3 and var3 != "_":
+                    # Track cell state for LSTM with special suffix
+                    self.module_of_output[var3] = module_name + "__cell"
 
     def _determine_rnn_output_var(self, node):
         """Determine which variable holds the main RNN output."""
@@ -1526,6 +1574,16 @@ class ASTParserTF(ASTParser):
 
             # Track RNN var types for N variables
             var_types = self._determine_rnn_var_types_multi(layers_of_tensors, actual_vars)
+
+            # Check if this is bidirectional RNN hidden state concat (already handled by template)
+            if self._is_bidirectional_hidden_concat(layers_of_tensors, var_types):
+                # Skip creating TensorOp - template handles bidirectional hidden concat
+                # Just create variable alias so subsequent code can reference it
+                output_var = node.targets[0].id
+                self.variable_aliases[output_var] = actual_vars[0]
+                # Point to the same module as the first variable (the RNN layer)
+                self.module_of_output[output_var] = layers_of_tensors[0]
+                return None
 
             tensorop_param = {
                 "tns_type": "concatenate",
