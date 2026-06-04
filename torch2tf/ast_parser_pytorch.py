@@ -44,10 +44,43 @@ class ASTParserTorch(ASTParser):
     TEMP_BINOP = "_binop_temp_{}"
     TEMP_INLINE = "_inline_{}_{}"
 
+    def _collect_used_variables(self, node):
+        """
+        Collect all variable names that are referenced (not just assigned) in the AST.
+        This helps identify unused variables like LSTM cell states.
+        """
+        used_vars = set()
+
+        class VarCollector(ast.NodeVisitor):
+            def visit_Name(self, n):
+                # Only collect names that are being loaded (used), not stored (assigned)
+                if isinstance(n.ctx, ast.Load):
+                    used_vars.add(n.id)
+                self.generic_visit(n)
+
+        VarCollector().visit(node)
+        return used_vars
+
+    def _mark_unused_cell_states(self, forward_node):
+        """
+        Check if LSTM cell state variables are actually used in the forward method.
+        If not, mark the layer so the template can output `_` instead of the variable name.
+        """
+        used_vars = self._collect_used_variables(forward_node)
+
+        for module_name, cell_var in self.lstm_cell_vars.items():
+            if cell_var not in used_vars:
+                # Cell state is not used, mark the layer
+                layer = self._get_layer_by_name(module_name)
+                if layer:
+                    layer.cell_state_unused = True
+
     def __init__(self, input_nn_type: str, only_nn: bool):
         super().__init__(input_nn_type, only_nn)
 
         self.activation_functions = {}
+        self.lstm_cell_vars = {}  # Track LSTM cell state variables to check if unused
+        self.forward_node = None  # Store forward method node for later analysis
         # Track RNN output vs hidden variables separately
         self.rnn_output_vars = {}  # {module_name: output_var}
         self.rnn_hidden_vars = {}  # {module_name: hidden_var}
@@ -120,6 +153,23 @@ class ASTParserTorch(ASTParser):
         if module_obj:
             self.module_by_name[module_name] = module_obj
         return module_obj
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        """
+        Override to store forward method and check for unused cell states after parsing.
+        """
+        # Find and store the forward method node
+        for child in node.body:
+            if isinstance(child, ast.FunctionDef) and child.name == 'forward':
+                self.forward_node = child
+                break
+
+        # Call parent's visit_ClassDef to do the actual parsing
+        super().visit_ClassDef(node)
+
+        # After parsing, check for unused LSTM cell states
+        if self.forward_node and self.lstm_cell_vars:
+            self._mark_unused_cell_states(self.forward_node)
 
     def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
         """
@@ -671,6 +721,8 @@ class ASTParserTorch(ASTParser):
         if var3 and var3 != "_":
             # Track cell state for LSTM with special suffix
             self.module_of_output[var3] = module_name + "__cell"
+            # Store cell state variable name to check if it's used later
+            self.lstm_cell_vars[module_name] = var3
 
     def _determine_rnn_return_type(self, node, module_name):
         """Determine RNN return type and main output variable based on underscore pattern."""
@@ -775,16 +827,21 @@ class ASTParserTorch(ASTParser):
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
         # Handle initial hidden state (hx parameter) for seq2seq patterns
+        print(f"DEBUG: module={module_name}, has _current_rnn_initial_hidden={hasattr(self, '_current_rnn_initial_hidden')}, value={getattr(self, '_current_rnn_initial_hidden', None)}")
         if module_obj and hasattr(self, '_current_rnn_initial_hidden') and self._current_rnn_initial_hidden:
             if self._current_rnn_initial_hidden == "tuple_state":
                 # LSTM case with (h, c) tuple - need to extract the source from the tuple elements
                 # For now, we'll need to track this during argument parsing
+                print(f"DEBUG: tuple_state case, args len={len(node.value.args)}")
                 if len(node.value.args) > 1 and isinstance(node.value.args[1], ast.Tuple):
+                    print(f"DEBUG: has tuple arg, elts len={len(node.value.args[1].elts)}")
                     if len(node.value.args[1].elts) > 0 and isinstance(node.value.args[1].elts[0], ast.Name):
                         h_var = node.value.args[1].elts[0].id
+                        print(f"DEBUG: h_var={h_var}, in module_of_output={h_var in self.module_of_output}")
                         if h_var in self.module_of_output:
                             source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
                             module_obj.hx_source = source_module
+                            print(f"DEBUG: Set {module_name}.hx_source={source_module}")
                             # Mark source layer output as reused
                             source_layer = self._get_layer_by_name(source_module)
                             if source_layer:
@@ -1498,8 +1555,11 @@ class ASTParserTorch(ASTParser):
 
         module_obj = self._get_layer_by_name(module_name)
         # Set name_module_input if the input comes from a tracked module
+        # Skip for RNN layers as they have special hx parameter handling
         if module_obj and input_var in self.module_of_output:
-            module_obj.name_module_input = self.module_of_output[input_var]
+            layer_class = module_obj.__class__.__name__
+            if layer_class not in ('RNNLayer', 'GRULayer', 'LSTMLayer'):
+                module_obj.name_module_input = self.module_of_output[input_var]
         self._detect_parallel_operations(module_obj, input_var)
         self.prev_layer_output = node.targets[0].id
         self._check_residual_connection(module_obj, input_var)
@@ -2126,13 +2186,18 @@ class ASTParserTorch(ASTParser):
         # Early check for bidirectional RNN concat to avoid creating subscript tensorops
         if self._is_bidirectional_rnn_subscript_concat(ops_args):
             # Skip creating TensorOp - template already generates bidirectional concat
-            # But track the output variable for subsequent usage
+            # Track output variable with special marker ONLY if it's a direct layer input (not used in tensorops)
             output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
             if output_var:
                 var_name = ops_args[0].value.id
                 source_module = self.module_of_output[var_name]
-                # Track as special "bidirectional_concat" marker to preserve variable name
+                # Create a synthetic tensorop entry so other tensorops can reference it
+                op_name = f"op_{self.tensor_op_counter}"
+                self.tensor_op_counter += 1
+                # Track as bidirectional_concat marker for direct layer usage
                 self.module_of_output[output_var] = "bidirectional_concat_" + source_module.replace("__hidden", "")
+                # Also create variable alias for tensorop references
+                self.variable_aliases[op_name] = output_var
             return None
 
         self._update_prev_layer_return_type_if_subscript(ops_args)
