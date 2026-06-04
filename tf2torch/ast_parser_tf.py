@@ -633,6 +633,12 @@ class ASTParserTF(ASTParser):
         resolved_var = self._resolve_variable_alias(source_var)
         source_module = self.module_of_output.get(resolved_var, resolved_var)
 
+        # Strip __hidden or __cell suffix from source_module for tensorop
+        if source_module.endswith("__hidden"):
+            source_module = source_module[:-8]
+        elif source_module.endswith("__cell"):
+            source_module = source_module[:-6]
+
         subscript_op = self._create_subscript_op(op_name, source_module, subscript_pattern)
         self.buml_model.modules.append(subscript_op)
         self.inputs_outputs[op_name] = [resolved_var, output_var]
@@ -644,6 +650,11 @@ class ASTParserTF(ASTParser):
             return False
 
         src_module = self.module_of_output[subscripted_var]
+        # Strip __hidden or __cell suffix to get actual layer name
+        if src_module.endswith("__hidden"):
+            src_module = src_module[:-8]
+        elif src_module.endswith("__cell"):
+            src_module = src_module[:-6]
         src_layer = self._get_layer_by_name(src_module)
         return src_layer and hasattr(src_layer, 'return_type')
 
@@ -898,7 +909,13 @@ class ASTParserTF(ASTParser):
             return
 
         prev_module_name = self.module_of_output[subscripted_var]
-        lyr_obj = self._get_layer_by_name(prev_module_name)
+        # Strip __hidden or __cell suffix to get actual layer name
+        layer_lookup_name = prev_module_name
+        if layer_lookup_name.endswith("__hidden"):
+            layer_lookup_name = layer_lookup_name[:-8]
+        elif layer_lookup_name.endswith("__cell"):
+            layer_lookup_name = layer_lookup_name[:-6]
+        lyr_obj = self._get_layer_by_name(layer_lookup_name)
 
         # If not an RNN layer, handle as regular subscript
         if not lyr_obj or not hasattr(lyr_obj, 'return_type'):

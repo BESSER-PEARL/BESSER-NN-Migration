@@ -185,6 +185,12 @@ class ASTParserTorch(ASTParser):
         resolved_var = self._resolve_variable_alias(source_var)
         source_module = self.module_of_output.get(resolved_var, resolved_var)
 
+        # Strip __hidden or __cell suffix from source_module for tensorop
+        if source_module.endswith("__hidden"):
+            source_module = source_module[:-8]
+        elif source_module.endswith("__cell"):
+            source_module = source_module[:-6]
+
         subscript_op = self._create_subscript_op(op_name, source_module, subscript_pattern)
         self.buml_model.modules.append(subscript_op)
         self.inputs_outputs[op_name] = [resolved_var, output_var]
@@ -197,6 +203,11 @@ class ASTParserTorch(ASTParser):
             return False
 
         src_module = self.module_of_output[subscripted_var]
+        # Strip __hidden or __cell suffix to get actual layer name
+        if src_module.endswith("__hidden"):
+            src_module = src_module[:-8]
+        elif src_module.endswith("__cell"):
+            src_module = src_module[:-6]
         src_layer = self._get_layer_by_name(src_module)
         return src_layer and hasattr(src_layer, 'return_type')
 
@@ -1072,7 +1083,13 @@ class ASTParserTorch(ASTParser):
             return
 
         prev_module_name = self.module_of_output[subscripted_var]
-        lyr_obj = self._get_layer_by_name(prev_module_name)
+        # Strip __hidden or __cell suffix to get actual layer name
+        layer_lookup_name = prev_module_name
+        if layer_lookup_name.endswith("__hidden"):
+            layer_lookup_name = layer_lookup_name[:-8]
+        elif layer_lookup_name.endswith("__cell"):
+            layer_lookup_name = layer_lookup_name[:-6]
+        lyr_obj = self._get_layer_by_name(layer_lookup_name)
 
         # If not an RNN layer, handle as regular subscript
         if not lyr_obj or not hasattr(lyr_obj, 'return_type'):
@@ -2035,6 +2052,35 @@ class ASTParserTorch(ASTParser):
             actual_vars.append(actual_var)
         return actual_vars
 
+    def _is_bidirectional_rnn_subscript_concat(self, ops_args):
+        """Check if this is a bidirectional RNN concat with subscript args (h[-2], h[-1])."""
+        if not (len(ops_args) == 2 and
+                all(isinstance(arg, ast.Subscript) for arg in ops_args)):
+            return False
+
+        # Both subscripts should be on the same variable
+        if not (isinstance(ops_args[0].value, ast.Name) and
+                isinstance(ops_args[1].value, ast.Name) and
+                ops_args[0].value.id == ops_args[1].value.id):
+            return False
+
+        var_name = ops_args[0].value.id
+        if var_name not in self.module_of_output:
+            return False
+
+        source_module = self.module_of_output[var_name]
+        # Strip __hidden suffix if present
+        if source_module.endswith("__hidden"):
+            source_module = source_module[:-8]
+
+        source_layer = self._get_layer_by_name(source_module)
+        if not self._is_bidirectional_hidden_rnn(source_layer):
+            return False
+
+        # Check indices are [-2, -1]
+        indices = self._extract_subscript_indices(ops_args)
+        return indices and set(indices) == {-2, -1}
+
     def extract_tensorop_concatenate(self, node):
         """
         It extracts the concatenate tensorop information.
@@ -2047,6 +2093,17 @@ class ASTParserTorch(ASTParser):
             The tensorop parameters.
         """
         ops_args = node.value.args[0].elts
+
+        # Early check for bidirectional RNN concat to avoid creating subscript tensorops
+        if self._is_bidirectional_rnn_subscript_concat(ops_args):
+            output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
+            if output_var:
+                var_name = ops_args[0].value.id
+                source_module = self.module_of_output[var_name]
+                if source_module.endswith("__hidden"):
+                    source_module = source_module[:-8]
+                self.module_of_output[output_var] = source_module
+            return None
 
         self._update_prev_layer_return_type_if_subscript(ops_args)
 
