@@ -455,7 +455,7 @@ class ASTParserTF(ASTParser):
         op_type = call_node.func.attr
         base_var = self._extract_inline_base_var(call_node, parent_node)
 
-        if op_type not in ['squeeze', 'unsqueeze', 'repeat']:
+        if op_type not in ['squeeze', 'unsqueeze', 'repeat', 'expand_dims']:
             if base_var == 'self':
                 return None
             return base_var
@@ -464,9 +464,12 @@ class ASTParserTF(ASTParser):
         if base_layer is None:
             return base_var
 
-        intermediate_var = self.TEMP_INLINE.format(op_type, self.tensor_op_counter)
+        # Map TensorFlow operation names to PyTorch equivalents
+        tns_type = 'unsqueeze' if op_type == 'expand_dims' else op_type
+
+        intermediate_var = self.TEMP_INLINE.format(tns_type, self.tensor_op_counter)
         tensorop_param = {
-            "tns_type": op_type,
+            "tns_type": tns_type,
             "layers_of_tensors": [base_layer],
             "name": f"op_{self.tensor_op_counter}"
         }
@@ -482,7 +485,20 @@ class ASTParserTF(ASTParser):
     def _extract_inline_base_var(self, call_node, parent_node):
         """Extract base variable from inline operation, handling chained calls."""
         if isinstance(call_node.func.value, ast.Name):
-            return call_node.func.value.id
+            # Check if this is a functional call (tf.operation) or method call (tensor.operation)
+            if call_node.func.value.id == 'tf':
+                # Functional call like tf.squeeze(out, axis=1) - tensor is in args[0]
+                if call_node.args:
+                    first_arg = call_node.args[0]
+                    if isinstance(first_arg, ast.Name):
+                        return first_arg.id
+                    elif isinstance(first_arg, ast.Call):
+                        # Nested inline: tf.squeeze(tf.expand_dims(h, axis=1), axis=1)
+                        return self.extract_inline_tensorop(first_arg, parent_node)
+                return "x"
+            else:
+                # Method call like out.squeeze(1) - tensor is the object
+                return call_node.func.value.id
         elif isinstance(call_node.func.value, ast.Call):
             return self.extract_inline_tensorop(call_node.func.value, parent_node)
         else:
@@ -492,17 +508,42 @@ class ASTParserTF(ASTParser):
 
     def _extract_inline_op_params(self, call_node, op_type):
         """Extract operation parameters for inline TensorOp."""
+        # Check if this is a TensorFlow functional call
+        is_tf_functional = (isinstance(call_node.func, ast.Attribute) and
+                           isinstance(call_node.func.value, ast.Name) and
+                           call_node.func.value.id == 'tf')
+
         if op_type == 'repeat':
-            repeat_counts = [self.param_value(arg) for arg in call_node.args]
-            return {"repeat_dim": repeat_counts}
-        else:
-            dim_value = None
-            if len(call_node.args) > 0:
-                dim_value = self.param_value(call_node.args[0])
-            else:
+            # For tf.tile(tensor, multiples=[...]), multiples is in keywords
+            if is_tf_functional:
                 for kw in call_node.keywords:
-                    if kw.arg == "dim":
+                    if kw.arg == 'multiples':
+                        if isinstance(kw.value, ast.List):
+                            repeat_counts = [self.param_value(e) for e in kw.value.elts]
+                            return {"repeat_dim": repeat_counts}
+                return {"repeat_dim": []}
+            else:
+                # Method call: tensor.repeat(dim0, dim1, ...)
+                repeat_counts = [self.param_value(arg) for arg in call_node.args]
+                return {"repeat_dim": repeat_counts}
+        else:
+            # squeeze/unsqueeze operations
+            dim_value = None
+            if is_tf_functional:
+                # TensorFlow: tf.squeeze(tensor, axis=1) or tf.expand_dims(tensor, axis=1)
+                # Dimension is in keywords as 'axis'
+                for kw in call_node.keywords:
+                    if kw.arg == "axis":
                         dim_value = self.param_value(kw.value)
+            else:
+                # Method call: tensor.squeeze(1) or tensor.unsqueeze(1)
+                # Dimension is in args[0]
+                if len(call_node.args) > 0:
+                    dim_value = self.param_value(call_node.args[0])
+                else:
+                    for kw in call_node.keywords:
+                        if kw.arg == "dim":
+                            dim_value = self.param_value(kw.value)
             return {"reduce_dim": dim_value}
 
     def handle_subscript_operation(self, subscript_node: ast.Subscript, temp_name: str, node: ast.Assign):
@@ -704,7 +745,8 @@ class ASTParserTF(ASTParser):
                 self.module_of_output[var1] = module_name
             if var2 and var2 != "_":
                 self.rnn_hidden_vars[module_name] = var2
-                self.module_of_output[var2] = module_name
+                # Track hidden state with special suffix to distinguish from output sequence
+                self.module_of_output[var2] = module_name + "__hidden"
 
         elif num_targets == 3:
             # LSTM: out, h, c = self.lstm(x)
@@ -717,10 +759,11 @@ class ASTParserTF(ASTParser):
                 self.module_of_output[var1] = module_name
             if var2 and var2 != "_":
                 self.rnn_hidden_vars[module_name] = var2
-                self.module_of_output[var2] = module_name
+                # Track hidden state with special suffix to distinguish from output sequence
+                self.module_of_output[var2] = module_name + "__hidden"
             if var3 and var3 != "_":
-                # Track cell state for LSTM
-                self.module_of_output[var3] = module_name
+                # Track cell state for LSTM with special suffix
+                self.module_of_output[var3] = module_name + "__cell"
 
     def _determine_rnn_output_var(self, node):
         """Determine which variable holds the main RNN output."""
