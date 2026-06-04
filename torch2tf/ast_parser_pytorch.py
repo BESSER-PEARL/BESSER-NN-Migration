@@ -85,6 +85,7 @@ class ASTParserTorch(ASTParser):
             "interpolate": lambda cn, n, args: self._extract_op_interpolate(cn, n, args),
             "pad": lambda cn, n, args: self._extract_op_pad(cn, n, args),
             "dropout": lambda cn, n, args: self._extract_op_dropout(cn, n, args),
+            "zeros_like": lambda cn, n, args: self._extract_op_zeros_like(cn, args),
         }
 
     def _add_layer_with_tracking(self, layer_obj):
@@ -1001,7 +1002,13 @@ class ASTParserTorch(ASTParser):
             attr_name = node.value.attr
 
             if attr_name == 'shape':
-                source_module = self.module_of_output.get(source_var, source_var)
+                # Get source module - if not found and it's 'x', use 'INPUT'
+                if source_var in self.module_of_output:
+                    source_module = self.module_of_output[source_var]
+                elif source_var == 'x':
+                    source_module = 'INPUT'
+                else:
+                    source_module = source_var
 
                 for idx, var_name in enumerate(var_names):
                     if var_name != '_':
@@ -2151,6 +2158,27 @@ class ASTParserTorch(ASTParser):
         return {
             "tns_type": "dropout",
             "dropout_rate": p
+        }
+
+    def _extract_op_zeros_like(self, call_node, op_args):
+        """Extract zeros_like operation parameters."""
+        source_var = None
+
+        # Extract source variable from first argument
+        if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
+            source_var = op_args[0].id
+
+        # Determine source layers
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+
+        return {
+            "tns_type": "zeros_like",
+            "layers_of_tensors": source_layers
         }
 
     def handle_outer_attribute_assignment(self, node: ast.Assign):

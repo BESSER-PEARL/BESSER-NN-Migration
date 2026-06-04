@@ -777,6 +777,7 @@ class ASTParserTF(ASTParser):
         - x = out[:, -1]  # Last timestep of RNN output
         - x = out[:, -1, :]  # Last timestep with explicit feature dimension
         - x = tensor[0]  # Regular tensor slicing
+        - batch_size = tf.shape(x)[0]  # Shape dimension extraction
 
         Parameters:
             node (ast.Assign): The AST node representing the slicing assignment
@@ -784,6 +785,62 @@ class ASTParserTF(ASTParser):
         Returns:
             None, but populates the BUML model
         """
+        # Special handling for tf.shape(x)[dim] pattern
+        if (isinstance(node.value.value, ast.Call) and
+            hasattr(node.value.value.func, 'attr') and
+            node.value.value.func.attr == 'shape' and
+            hasattr(node.value.value.func, 'value') and
+            isinstance(node.value.value.func.value, ast.Name) and
+            node.value.value.func.value.id == 'tf'):
+
+            # This is tf.shape(x)[dim] - create shape_dim tensorop
+            result_var = node.targets[0].id
+
+            # Extract dimension index from subscript
+            if isinstance(node.value.slice, ast.Constant):
+                dim_idx = node.value.slice.value
+            elif isinstance(node.value.slice, ast.Index) and isinstance(node.value.slice.value, ast.Constant):
+                dim_idx = node.value.slice.value.value
+            else:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: Unsupported slice type in tf.shape subscript"
+                )
+                return
+
+            # Extract source tensor from tf.shape() arguments
+            if len(node.value.value.args) > 0:
+                source_arg = node.value.value.args[0]
+                if isinstance(source_arg, ast.Name):
+                    source_var = source_arg.id
+                    # Determine source layers
+                    if source_var in self.module_of_output:
+                        source_layers = [self.module_of_output[source_var]]
+                    else:
+                        source_layers = ['INPUT']
+
+                    # Create shape_dim tensorop
+                    shape_tensorop_param = {
+                        "tns_type": "shape_dim",
+                        "reduce_dim": dim_idx,
+                        "layers_of_tensors": source_layers,
+                        "name": result_var
+                    }
+                    tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+                    self.buml_model.add_tensor_op(tns_obj)
+                    self.module_of_output[result_var] = result_var
+                    return
+                else:
+                    self.migration_warnings.append(
+                        f"Line {node.lineno}: Unsupported source type in tf.shape()"
+                    )
+                    return
+            else:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: tf.shape() call missing argument"
+                )
+                return
+
+        # Regular slicing handling
         if not isinstance(node.value.value, ast.Name):
             # Complex subscript base, handle as regular subscript
             subscripted_var = None
@@ -1030,6 +1087,109 @@ class ASTParserTF(ASTParser):
         if is_nested_call:
             self.is_processing_nested_outer = False
 
+    def _process_reshape_arg(self, arg, node):
+        """
+        Process single reshape argument, handling tf.shape()[dim] calls and variables.
+
+        Similar to torch2tf's _process_reshape_arg but for TensorFlow patterns.
+        Detects tf.shape(x)[dim] subscript patterns and creates shape_dim tensorops.
+
+        Args:
+            arg: AST node representing a reshape dimension argument
+            node: Parent assignment node for line number context
+
+        Returns:
+            Dimension value (int, str variable name, or op name for shape_dim)
+        """
+        # Handle List nodes (e.g., [batch_size, -1] in tf.reshape(x, [batch_size, -1]))
+        if isinstance(arg, ast.List):
+            # Recursively process each element of the list
+            return [self._process_reshape_arg(el, node) for el in arg.elts]
+
+        # Handle tf.shape(x)[dim] subscript pattern
+        if isinstance(arg, ast.Subscript):
+            # Check if subscripted value is a call to tf.shape
+            if (isinstance(arg.value, ast.Call) and
+                hasattr(arg.value.func, 'attr') and
+                arg.value.func.attr == 'shape' and
+                hasattr(arg.value.func, 'value') and
+                isinstance(arg.value.func.value, ast.Name) and
+                arg.value.func.value.id == 'tf'):
+
+                # Extract dimension index from subscript
+                if isinstance(arg.slice, ast.Constant):
+                    dim_idx = arg.slice.value
+                elif isinstance(arg.slice, ast.Index) and isinstance(arg.slice.value, ast.Constant):
+                    dim_idx = arg.slice.value.value
+                else:
+                    self.migration_warnings.append(
+                        f"Line {node.lineno}: Unsupported slice type in tf.shape subscript"
+                    )
+                    return -1
+
+                # Extract source tensor from tf.shape() arguments
+                if len(arg.value.args) > 0:
+                    source_arg = arg.value.args[0]
+                    if isinstance(source_arg, ast.Name):
+                        source_var = source_arg.id
+                        # Determine source layers
+                        if source_var in self.module_of_output:
+                            source_layers = [self.module_of_output[source_var]]
+                        else:
+                            source_layers = ['INPUT']
+
+                        # Create shape_dim tensorop with generated name
+                        op_name = f"op_{self.tensor_op_counter}"
+                        shape_tensorop_param = {
+                            "tns_type": "shape_dim",
+                            "reduce_dim": dim_idx,
+                            "layers_of_tensors": source_layers,
+                            "name": op_name
+                        }
+                        tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+                        self.buml_model.add_tensor_op(tns_obj)
+                        self.module_of_output[op_name] = op_name
+                        self.tensor_op_counter += 1
+                        return op_name
+                    else:
+                        self.migration_warnings.append(
+                            f"Line {node.lineno}: Unsupported source type in tf.shape()"
+                        )
+                        return -1
+                else:
+                    self.migration_warnings.append(
+                        f"Line {node.lineno}: tf.shape() call missing argument"
+                    )
+                    return -1
+
+        # Handle Name nodes (variables that might reference shape dims)
+        elif isinstance(arg, ast.Name):
+            var_name = arg.id
+            # Check if this variable is a shape_dim operation result
+            if var_name in self.module_of_output:
+                layer_name = self.module_of_output[var_name]
+                if layer_name.startswith('op_'):
+                    # This is an operation result, use it directly
+                    return layer_name
+                else:
+                    # Regular variable, try to get its value
+                    return self.param_value(arg)
+            else:
+                # Unknown variable, use as-is (might be defined elsewhere)
+                return var_name
+
+        # Handle Constant nodes (literal values like -1, 64, etc.)
+        elif isinstance(arg, ast.Constant):
+            return arg.value
+
+        # Handle older Python AST Num nodes
+        elif isinstance(arg, ast.Num):
+            return arg.n
+
+        # Fallback to param_value for other cases
+        else:
+            return self.param_value(arg)
+
     def process_single_call(self, node: ast.Assign):
         """
         Process a single (non-chained) call operation.
@@ -1058,6 +1218,11 @@ class ASTParserTF(ASTParser):
                     if source_module in self.rnn_hidden_vars and self.rnn_hidden_vars[source_module] == input_var:
                         # Set a flag to indicate this layer uses RNN hidden state
                         module_obj.use_rnn_hidden = True
+                elif module_obj and input_var == "x":
+                    # Special case: input is "x" (network INPUT) but not in module_of_output
+                    # This happens when there are only tensorops before this layer (e.g., shape_dim)
+                    # Set name_module_input to "INPUT" to signal network input
+                    module_obj.name_module_input = "INPUT"
 
                 self.buml_model.modules.append(module_obj)
             else:
@@ -1201,9 +1366,42 @@ class ASTParserTF(ASTParser):
             tensorop_param = {"tns_type": op_type,
                               "transpose_dim": transpose_dim}
         elif op_type == "reshape":
-            reshape_dim = [op_args[i].value for i in range(1, len(op_args))]
+            # Extract source variable (first argument)
+            if len(op_args) > 0:
+                if isinstance(op_args[0], ast.Name):
+                    source_var = op_args[0].id
+                    if source_var in self.module_of_output:
+                        source_layers = [self.module_of_output[source_var]]
+                    elif source_var == 'x':
+                        source_layers = ['INPUT']
+                    else:
+                        self.migration_warnings.append(
+                            f"Line {node.lineno}: reshape source variable '{source_var}' not found."
+                        )
+                        return None
+                else:
+                    self.migration_warnings.append(
+                        f"Line {node.lineno}: reshape operand type not supported."
+                    )
+                    return None
+            else:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: reshape requires an input tensor."
+                )
+                return None
+
+            # Process each reshape argument (handles constants, variables, and tf.shape()[dim])
+            # TensorFlow reshape has 2 args: tensor and shape (which is usually a list)
+            if len(op_args) == 2 and isinstance(op_args[1], ast.List):
+                # Shape is provided as a list: tf.reshape(x, [dim1, dim2, ...])
+                reshape_dim = self._process_reshape_arg(op_args[1], node)
+            else:
+                # Shape provided as separate arguments (rare): tf.reshape(x, dim1, dim2, ...)
+                reshape_dim = [self._process_reshape_arg(op_args[i], node) for i in range(1, len(op_args))]
+
             tensorop_param = {"tns_type": op_type,
-                              "reshape_dim": reshape_dim}
+                              "reshape_dim": reshape_dim,
+                              "layers_of_tensors": source_layers}
         elif op_type == "reduce_mean":
             # Extract dimension parameter
             reduce_dim = None
