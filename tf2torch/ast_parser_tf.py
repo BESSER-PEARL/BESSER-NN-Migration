@@ -1360,11 +1360,12 @@ class ASTParserTF(ASTParser):
             tensorop_param = {"tns_type": op_type,
                               "layers_of_tensors": layers_of_tensors}
         elif op_type == "transpose":
+            # tf.transpose always maps to permute (general dimension reordering)
             op_args = node.value.keywords[0].value.elts
-            transpose_dim = [op_args[0].value, op_args[1].value,
-                             op_args[2].value]
-            tensorop_param = {"tns_type": op_type,
-                              "transpose_dim": transpose_dim}
+            permute_dim = [op_args[0].value, op_args[1].value,
+                           op_args[2].value]
+            tensorop_param = {"tns_type": "permute",
+                              "permute_dim": permute_dim}
         elif op_type == "reshape":
             # Extract source variable (first argument)
             if len(op_args) > 0:
