@@ -1096,8 +1096,8 @@ class ASTParserTorch(ASTParser):
             self._handle_non_rnn_slicing(node, subscripted_var, result_var)
             return
 
-        # Determine RNN return type based on slice pattern
-        if self._determine_rnn_slice_return_type(node, lyr_obj, prev_module_name, subscripted_var, result_var):
+        # Determine RNN return type based on slice pattern (use base layer name without suffix)
+        if self._determine_rnn_slice_return_type(node, lyr_obj, layer_lookup_name, subscripted_var, result_var):
             return
 
         # Track the result variable and alias
