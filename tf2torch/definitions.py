@@ -24,17 +24,26 @@ layers_mapping = {
 }
 
 params_mapping = {
-    "filters": "out_channels", "kernel_size": "kernel_dim", 
-    "strides": "stride_dim", "padding": "padding_type", 
-    "pool_size": "kernel_dim", "output_size": "output_dim", 
+    "filters": "out_channels", "kernel_size": "kernel_dim",
+    "strides": "stride_dim", "padding": "padding_type",
+    "pool_size": "kernel_dim", "output_size": "output_dim",
     "dropout": "dropout", "return_sequences": "return_sequences",
-    "return_state": "return_state", "axis": "normalized_shape", 
-    "rate": "rate", "input_dim": "num_embeddings", 
+    "return_state": "return_state", "axis": "normalized_shape",
+    "rate": "rate", "input_dim": "num_embeddings",
     "output_dim": "embedding_dim", "permute_in": "permute_in",
     "permute_out": "permute_out", "padding_amount": "padding_amount",
     "in_channels": "in_channels", "in_features": "in_features",
-    "input_size": "input_size",  "bidirectional": "bidirectional"
+    "input_size": "input_size",  "bidirectional": "bidirectional",
+    "use_bias": "bias"
 }
+
+# TF-specific parameters that don't exist in PyTorch and should be silently ignored
+excluded_params = [
+    "mask_zero",  # Embedding: TF-specific masking, no direct PyTorch equivalent
+    "time_major",  # RNN: TF-specific, PyTorch uses batch_first instead
+    "unroll",  # RNN: TF-specific optimization hint
+    "go_backwards",  # RNN: TF-specific, rare usage
+]
 
 
 static_params = {

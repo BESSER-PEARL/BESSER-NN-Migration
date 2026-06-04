@@ -13,7 +13,8 @@ from besser.BUML.metamodel.nn import NN, Layer
 from ast_parser_nn import ASTParser
 from definitions import (
     layers_mapping, params_mapping, static_params, rnn_layers,
-    pos_params, int2list_params, lyrs_of_int2list_params, loss_func_mapping
+    pos_params, int2list_params, lyrs_of_int2list_params, loss_func_mapping,
+    excluded_params
 )
 from transform_code import (
     process_positional_params, param_to_list, set_static_params
@@ -2145,7 +2146,7 @@ def process_params(lyr_type: str, lyr_params: dict):
     It processes and transforms the layers' parameters.
 
     Parameters:
-        lyr_type (str): The type of the layer (PyTorch).
+        lyr_type (str): The type of the layer (TensorFlow).
         lyr_params (dict): A dictionnary storing the layer parameters and
             their values.
 
@@ -2155,6 +2156,7 @@ def process_params(lyr_type: str, lyr_params: dict):
 
     updated_lyr_params = {}
 
+    # Handle units parameter for Dense and RNN layers
     lyrs_units = rnn_layers + ["Dense"]
     if lyr_type in lyrs_units and "units" in lyr_params:
         param = "out_features" if lyr_type == "Dense" else "hidden_size"
@@ -2165,18 +2167,14 @@ def process_params(lyr_type: str, lyr_params: dict):
     has_return_state = lyr_params.get("return_state", False)
 
     for param in lyr_params:
-        if param == "activation":
+        if param in params_mapping:
+            updated_lyr_params[params_mapping[param]] = lyr_params[param]
+        elif param == "activation":
             updated_lyr_params["actv_func"] = lyr_params[param]
-        elif param in ["return_sequences", "return_state"]:
-            # Skip these, handled below to determine return_type
+        elif param in ["return_sequences", "return_state", "units", "positional_params", "name"]:
+            # Handled separately or not needed in BUML
             pass
-        elif param in params_mapping:
-            param_name = params_mapping[param]
-            updated_lyr_params[param_name] = lyr_params[param]
-        elif param == "units":
-            pass
-        else:
-            print(f"parameter {param} of layer {lyr_type} is not found!")
+        # Note: Unknown parameters are silently skipped (not critical for migration)
 
     # Determine return_type based on return_sequences and return_state
     if lyr_type in rnn_layers:
