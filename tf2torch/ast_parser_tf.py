@@ -2167,12 +2167,15 @@ def process_params(lyr_type: str, lyr_params: dict):
     has_return_state = lyr_params.get("return_state", False)
 
     for param in lyr_params:
-        if param in params_mapping:
-            updated_lyr_params[params_mapping[param]] = lyr_params[param]
-        elif param == "activation":
+        if param == "activation":
             updated_lyr_params["actv_func"] = lyr_params[param]
-        elif param in ["return_sequences", "return_state", "units", "positional_params", "name"]:
-            # Handled separately or not needed in BUML
+        elif param in ["return_sequences", "return_state"]:
+            # Skip these, handled below to determine return_type
+            pass
+        elif param in params_mapping:
+            updated_lyr_params[params_mapping[param]] = lyr_params[param]
+        elif param in ["units", "positional_params", "name"]:
+            # Skip these, handled separately
             pass
         # Note: Unknown parameters are silently skipped (not critical for migration)
 
