@@ -245,6 +245,8 @@ class ASTParserTorch(ASTParser):
         self.buml_model.modules.append(subscript_op)
         self.inputs_outputs[op_name] = [resolved_var, output_var]
         self.module_of_output[output_var] = op_name
+        # Update prev_layer_output so next operation can detect branching
+        self.prev_layer_output = output_var
 
 
     def _is_rnn_subscript(self, subscripted_var):
@@ -1377,9 +1379,33 @@ class ASTParserTorch(ASTParser):
 
         self._check_and_mark_residual_input(tns_obj, call_node)
 
+        # Detect parallel operations for TensorOps (similar to layers)
+        input_var = self._extract_tensorop_input_var(call_node, node)
+        if input_var:
+            self._detect_parallel_operations(tns_obj, input_var)
+
         output_var = self._extract_output_var_from_target(node.targets[0])
         if output_var:
             self.module_of_output[output_var] = op_name
+            # Update prev_layer_output so next operation can detect branching
+            self.prev_layer_output = output_var
+
+    def _extract_tensorop_input_var(self, call_node, node):
+        """Extract input variable from TensorOp call."""
+        # Check if it's a method call (e.g., x.mean())
+        if hasattr(call_node, 'func') and hasattr(call_node.func, 'value'):
+            if isinstance(call_node.func.value, ast.Name):
+                val_id = call_node.func.value.id
+                # Skip torch/F/nn as these are library modules, get from args instead
+                if val_id not in ['torch', 'F', 'nn', 'functional']:
+                    return val_id
+
+        # For library calls (torch.mean(x)) or fallback, get from arguments
+        if hasattr(call_node, 'args') and call_node.args:
+            if isinstance(call_node.args[0], ast.Name):
+                return call_node.args[0].id
+
+        return None
 
     def _extract_activation_input_var(self, node):
         """Extract input variable from activation function call."""
@@ -1525,16 +1551,24 @@ class ASTParserTorch(ASTParser):
 
     def _detect_parallel_operations(self, module_obj, input_var):
         """Detect and mark parallel operations and TensorOp usage."""
-        if not (module_obj and input_var in self.module_of_output):
+        if not module_obj:
             return
 
-        source_module = self.module_of_output[input_var]
-        if source_module.startswith("op_"):
-            module_obj.input_reused = True
-            if self.prev_layer_output and input_var != self.prev_layer_output:
-                module_obj.name_module_input = source_module
+        # If input comes from a TensorOp or previous layer output doesn't match current input
+        if input_var in self.module_of_output:
+            source_module = self.module_of_output[input_var]
+            if source_module.startswith("op_"):
+                module_obj.input_reused = True
+                if self.prev_layer_output and input_var != self.prev_layer_output:
+                    module_obj.name_module_input = source_module
+            elif self.prev_layer_output and input_var != self.prev_layer_output:
+                module_obj.input_reused = True
+        # Handle case where input is network input 'x' used by non-first layer
         elif self.prev_layer_output and input_var != self.prev_layer_output:
             module_obj.input_reused = True
+            # For network input, set name_module_input to 'INPUT' marker
+            if input_var == 'x':
+                module_obj.name_module_input = 'INPUT'
 
     def _check_residual_connection(self, module_obj, input_var):
         """Check and mark residual connections."""
@@ -1988,13 +2022,34 @@ class ASTParserTorch(ASTParser):
         self.module_of_output[temp_name] = reuse_layer.name
         return temp_name
 
-    def _handle_first_layer_use_in_concat(self, layer_obj, arg, layer_name):
-        """Handle first layer use in concatenation."""
-        if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
-            input_var = arg.args[0].id
-            if input_var in self.module_of_output:
-                layer_obj.name_module_input = self.module_of_output[input_var]
-                layer_obj.input_reused = True
+    def _handle_first_layer_use_in_concat(self, layer_obj, arg, layer_name, is_inline=False):
+        """Handle first layer use in concatenation.
+
+        Args:
+            layer_obj: The layer object
+            arg: The argument AST node
+            layer_name: Name of the layer
+            is_inline: True if this is an inline layer call (torch.cat([self.fc1(x), ...]))
+                      False if layer was already assigned to variable (a=self.fc1(x); torch.cat([a, ...]))
+        """
+        # Only inline layer calls need separate output variables
+        if is_inline:
+            layer_obj.input_reused = True
+
+            # Track input for inline concat - use 'INPUT' marker if input is 'x'
+            if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+                input_var = arg.args[0].id
+                if input_var == 'x':
+                    layer_obj.name_module_input = 'INPUT'
+                elif input_var in self.module_of_output:
+                    layer_obj.name_module_input = self.module_of_output[input_var]
+        else:
+            # Regular layer call - handle normally
+            if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
+                input_var = arg.args[0].id
+                if input_var in self.module_of_output:
+                    layer_obj.name_module_input = self.module_of_output[input_var]
+                    layer_obj.input_reused = True
 
         self.buml_model.modules.append(layer_obj)
         temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
@@ -2015,7 +2070,8 @@ class ASTParserTorch(ASTParser):
         if layer_obj in self.buml_model.modules:
             return self._handle_layer_reuse_in_concat(layer_obj, arg, layer_name)
         else:
-            return self._handle_first_layer_use_in_concat(layer_obj, arg, layer_name)
+            # This is an inline layer call: torch.cat([self.fc1(x), ...])
+            return self._handle_first_layer_use_in_concat(layer_obj, arg, layer_name, is_inline=True)
 
     def _extract_inline_call_variable(self, arg, node):
         """Extract variable from inline operation call in concatenation."""
