@@ -1075,7 +1075,9 @@ class ASTParserTF(ASTParser):
             self._handle_non_rnn_slicing(node, subscripted_var, result_var)
 
         # Track the result variable
-        self.module_of_output[result_var] = prev_module_name
+        # Don't overwrite if create_subscript_tensorop already set it to the TensorOp name
+        if result_var not in self.module_of_output:
+            self.module_of_output[result_var] = prev_module_name
         self.variable_aliases[result_var] = subscripted_var
         self.previous_assign = node
 
