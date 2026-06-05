@@ -794,6 +794,13 @@ class ASTParserTF(ASTParser):
             if rnn_in != self.prev_layer_output:
                 module_obj.input_reused = True
 
+        # Add Dropout module before RNN if dropout layer exists
+        if module_obj:
+            dropout_layer_name = f"{module_name}_dropout"
+            dropout_module = next((obj for obj in self.buml_model.layers if obj.name == dropout_layer_name), None)
+            if dropout_module:
+                self.buml_model.modules.append(dropout_module)
+
         if module_obj and module_obj in self.buml_model.modules:
             self._handle_module_layer_reuse(node, module_name, module_obj)
         elif module_obj:
@@ -1134,12 +1141,27 @@ class ASTParserTF(ASTParser):
                     lyr_type, lyr_params = self.extract_layer(lyr)
                     lyr_params["bidirectional"] = True
 
-            lyr_type, lyr_params, padding_amount = transform_layer(
+            lyr_type, lyr_params, padding_amount, dropout_rate, has_recurrent_dropout = transform_layer(
                 lyr_type, lyr_params, self.padding_amount, module_name
             )
 
             self.padding_amount = padding_amount
+
+            # Warn about recurrent_dropout having no PyTorch equivalent
+            if has_recurrent_dropout:
+                print(f"WARNING: TensorFlow layer '{module_name}' has recurrent_dropout parameter, "
+                      f"which has no equivalent in PyTorch LSTM/GRU/SimpleRNN. This parameter is not migrated.")
+
             if not lyr_type.startswith("ZeroPadding"):
+                # Add Dropout layer to __init__ if dropout param was present
+                if dropout_rate is not None:
+                    dropout_layer_name = f"{module_name}_dropout"
+                    dropout_layer = getattr(mm_classes, "DropoutLayer")(
+                        name=dropout_layer_name,
+                        rate=dropout_rate
+                    )
+                    self.buml_model.add_layer(dropout_layer)
+
                 # Infer BatchNorm params from previous layers if needed
                 if lyr_type == "BatchNormLayer":
                     inferred_params = infer_batchnorm_params(self.buml_model)
@@ -1180,11 +1202,27 @@ class ASTParserTF(ASTParser):
                             lyr_type, lyr_params = self.extract_layer(lyr)
                             lyr_params["bidirectional"] = True
 
-                lyr_type, lyr_params, padding_amount = transform_layer(
+                lyr_type, lyr_params, padding_amount, dropout_rate, has_recurrent_dropout = transform_layer(
                     lyr_type, lyr_params, self.padding_amount
                 )
                 self.padding_amount = padding_amount
+
+                # Warn about recurrent_dropout having no PyTorch equivalent
+                if has_recurrent_dropout:
+                    print(f"WARNING: Sequential layer has recurrent_dropout parameter, "
+                          f"which has no equivalent in PyTorch LSTM/GRU/SimpleRNN. This parameter is not migrated.")
+
                 if not lyr_type.startswith("ZeroPadding"):
+                    # Add Dropout layer before RNN if dropout param was present
+                    if dropout_rate is not None:
+                        dropout_layer_name = f"layer_{layer_id}"
+                        dropout_layer = getattr(mm_classes, "DropoutLayer")(
+                            name=dropout_layer_name,
+                            rate=dropout_rate
+                        )
+                        subnn.add_layer(dropout_layer)
+                        layer_id += 1
+
                     lyr_params["name"] = f"layer_{layer_id}"
 
                     # Infer BatchNorm params from previous layers if needed
@@ -1468,6 +1506,13 @@ class ASTParserTF(ASTParser):
                     # This happens when there are only tensorops before this layer (e.g., shape_dim)
                     # Set name_module_input to "INPUT" to signal network input
                     module_obj.name_module_input = "INPUT"
+
+                # Add Dropout module before RNN/layer if dropout layer exists
+                if module_obj:
+                    dropout_layer_name = f"{module_name}_dropout"
+                    dropout_module = next((obj for obj in self.buml_model.layers if obj.name == dropout_layer_name), None)
+                    if dropout_module:
+                        self.buml_model.modules.append(dropout_module)
 
                 if module_obj and module_obj in self.buml_model.modules:
                     self._handle_module_layer_reuse(node, module_name, module_obj)
@@ -2286,7 +2331,7 @@ def transform_layer(lyr_type: str, lyr_params: dict,
         lyr_name (str): The name of the layer.
 
     Returns:
-        The type of the layer and its parameters in BUML.
+        Tuple of (lyr_type, lyr_params, padding_amount, dropout_rate, has_recurrent_dropout)
     """
     process_positional_params(lyr_type, lyr_params, pos_params)
 
@@ -2296,12 +2341,12 @@ def transform_layer(lyr_type: str, lyr_params: dict,
     lyr_params, padding_amount = set_conv_padding(lyr_type, lyr_params,
                                                   padding_amount)
 
-    lyr_params = process_params(lyr_type, lyr_params)
+    lyr_params, dropout_rate, has_recurrent_dropout = process_params(lyr_type, lyr_params)
     lyr_params["name"] = layer_name
     if not lyr_type.startswith("ZeroPadding"):
         lyr_type = layers_mapping[lyr_type]
 
-    return lyr_type, lyr_params, padding_amount
+    return lyr_type, lyr_params, padding_amount, dropout_rate, has_recurrent_dropout
 
 
 
@@ -2315,16 +2360,28 @@ def process_params(lyr_type: str, lyr_params: dict):
             their values.
 
     Returns:
-        The parameters transformed into BUML.
+        Tuple of (transformed_params, dropout_rate, has_recurrent_dropout)
+        - transformed_params: The parameters transformed into BUML
+        - dropout_rate: Dropout rate if present on RNN layer, None otherwise
+        - has_recurrent_dropout: True if recurrent_dropout param was present
     """
 
     updated_lyr_params = {}
+    dropout_rate = None
+    has_recurrent_dropout = False
 
     # Handle units parameter for Dense and RNN layers
     lyrs_units = rnn_layers + ["Dense"]
     if lyr_type in lyrs_units and "units" in lyr_params:
         param = "out_features" if lyr_type == "Dense" else "hidden_size"
         updated_lyr_params[param] = lyr_params["units"]
+
+    # Extract dropout for RNN layers (will be converted to separate Dropout layer)
+    if lyr_type in rnn_layers:
+        if "dropout" in lyr_params and lyr_params["dropout"] > 0:
+            dropout_rate = lyr_params["dropout"]
+        if "recurrent_dropout" in lyr_params and lyr_params["recurrent_dropout"] > 0:
+            has_recurrent_dropout = True
 
     # Track return_sequences and return_state to determine return_type
     has_return_sequences = lyr_params.get("return_sequences", False)
@@ -2335,6 +2392,9 @@ def process_params(lyr_type: str, lyr_params: dict):
             updated_lyr_params["actv_func"] = lyr_params[param]
         elif param in ["return_sequences", "return_state"]:
             # Skip these, handled below to determine return_type
+            pass
+        elif param in ["dropout", "recurrent_dropout"]:
+            # Skip dropout params - handled separately above
             pass
         elif param in params_mapping:
             updated_lyr_params[params_mapping[param]] = lyr_params[param]
@@ -2356,7 +2416,7 @@ def process_params(lyr_type: str, lyr_params: dict):
 
     set_static_params(lyr_type, updated_lyr_params, static_params)
 
-    return updated_lyr_params
+    return updated_lyr_params, dropout_rate, has_recurrent_dropout
 
 
 def set_conv_padding(layer_type, lyr_params, padding_amount):
