@@ -14,7 +14,7 @@ from ast_parser_nn import ASTParser
 from definitions import (
     layers_mapping, params_mapping, static_params, rnn_layers,
     pos_params, int2list_params, lyrs_of_int2list_params, loss_func_mapping,
-    excluded_params
+    excluded_params, actv_fun_mapping
 )
 from transform_code import (
     process_positional_params, param_to_list, set_static_params
@@ -27,8 +27,6 @@ tf_actv_func_mapping = {
     "sigmoid": "sigmoid",
     "softmax": "softmax",
     "leaky_relu": "leaky_relu",
-    "elu": "elu",
-    "selu": "selu",
     "gelu": "gelu",
 }
 
@@ -101,6 +99,8 @@ class ASTParserTF(ASTParser):
         self.variable_aliases = {}  # {alias_var: source_var}
         self.layer_by_name = {}  # {layer_name: layer_obj} for O(1) lookup
         self.layer_reuse_count = {}  # {layer_name: reuse_count} for layer reuse tracking
+        # Track standalone activation layers (layers.ReLU, layers.Activation, etc.)
+        self.activation_functions = {}  # {module_name: actv_func_name}
 
     def _get_layer_by_name(self, layer_name):
         """Get layer by name using O(1) lookup, fallback to linear search if not in dict."""
@@ -1136,41 +1136,58 @@ class ASTParserTF(ASTParser):
             isinstance(node.value.func, ast.Attribute)):
             lyr_type, lyr_params = self.extract_layer(node.value)
 
-            if len(node.value.args)>0: #rnn bidirectional
-                if (isinstance(node.value.args[0], ast.Call) and
-                    node.value.func.attr == "Bidirectional"):
-                    lyr = node.value.args[0]
-                    lyr_type, lyr_params = self.extract_layer(lyr)
-                    lyr_params["bidirectional"] = True
+            # Handle standalone activation layers (layers.ReLU, layers.Activation, etc.)
+            if lyr_type in actv_fun_mapping:
+                # Store activation function for later use in forward pass
+                if lyr_type == "Activation":
+                    # layers.Activation('relu') - extract activation name from first arg
+                    if len(node.value.args) > 0 and isinstance(node.value.args[0], ast.Constant):
+                        actv_name = node.value.args[0].value
+                    else:
+                        actv_name = "relu"  # default
+                    self.activation_functions[module_name] = actv_name
+                else:
+                    # layers.ReLU(), layers.Sigmoid(), etc.
+                    self.activation_functions[module_name] = actv_fun_mapping[lyr_type]
+                # Skip the rest of layer processing for activations
+            else:
+                # Regular layer processing
 
-            lyr_type, lyr_params, padding_amount, dropout_rate, has_recurrent_dropout = transform_layer(
-                lyr_type, lyr_params, self.padding_amount, module_name
-            )
+                if len(node.value.args)>0: #rnn bidirectional
+                    if (isinstance(node.value.args[0], ast.Call) and
+                        node.value.func.attr == "Bidirectional"):
+                        lyr = node.value.args[0]
+                        lyr_type, lyr_params = self.extract_layer(lyr)
+                        lyr_params["bidirectional"] = True
 
-            self.padding_amount = padding_amount
+                lyr_type, lyr_params, padding_amount, dropout_rate, has_recurrent_dropout = transform_layer(
+                    lyr_type, lyr_params, self.padding_amount, module_name
+                )
 
-            # Warn about recurrent_dropout having no PyTorch equivalent
-            if has_recurrent_dropout:
-                print(f"WARNING: TensorFlow layer '{module_name}' has recurrent_dropout parameter, "
-                      f"which has no equivalent in PyTorch LSTM/GRU/SimpleRNN. This parameter is not migrated.")
+                self.padding_amount = padding_amount
 
-            if not lyr_type.startswith("ZeroPadding"):
-                # Add Dropout layer to __init__ if dropout param was present
-                if dropout_rate is not None:
-                    dropout_layer_name = f"{module_name}_dropout"
-                    dropout_layer = getattr(mm_classes, "DropoutLayer")(
-                        name=dropout_layer_name,
-                        rate=dropout_rate
-                    )
-                    self.buml_model.add_layer(dropout_layer)
+                # Warn about recurrent_dropout having no PyTorch equivalent
+                if has_recurrent_dropout:
+                    print(f"WARNING: TensorFlow layer '{module_name}' has recurrent_dropout parameter, "
+                          f"which has no equivalent in PyTorch LSTM/GRU/SimpleRNN. This parameter is not migrated.")
 
-                # Infer BatchNorm params from previous layers if needed
-                if lyr_type == "BatchNormLayer":
-                    inferred_params = infer_batchnorm_params(self.buml_model)
-                    lyr_params.update(inferred_params)
+                if not lyr_type.startswith("ZeroPadding"):
+                    # Add Dropout layer to __init__ if dropout param was present
+                    if dropout_rate is not None:
+                        dropout_layer_name = f"{module_name}_dropout"
+                        dropout_layer = getattr(mm_classes, "DropoutLayer")(
+                            name=dropout_layer_name,
+                            rate=dropout_rate
+                        )
+                        self.buml_model.add_layer(dropout_layer)
 
-                buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-                self.buml_model.add_layer(buml_layer)
+                    # Infer BatchNorm params from previous layers if needed
+                    if lyr_type == "BatchNormLayer":
+                        inferred_params = infer_batchnorm_params(self.buml_model)
+                        lyr_params.update(inferred_params)
+
+                    buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+                    self.buml_model.add_layer(buml_layer)
 
         #to get the proper order from forward the method
         self.buml_model.modules.clear()
@@ -1525,7 +1542,10 @@ class ASTParserTF(ASTParser):
                         module_obj.name_module_input = dropout_layer_name
                         self.buml_model.modules.append(dropout_module)
 
-                if module_obj and module_obj in self.buml_model.modules:
+                # Handle standalone activation layers (layers.ReLU, layers.Activation, etc.)
+                if module_name in self.activation_functions:
+                    self._handle_module_activation(node, module_name)
+                elif module_obj and module_obj in self.buml_model.modules:
                     self._handle_module_layer_reuse(node, module_name, module_obj)
                 elif module_obj:
                     self.buml_model.modules.append(module_obj)
@@ -1605,6 +1625,51 @@ class ASTParserTF(ASTParser):
             # Update module_of_output
             if input_var in self.module_of_output:
                 self.module_of_output[node.targets[0].id] = self.module_of_output[input_var]
+
+    def _try_merge_activation(self, node, module_name):
+        """Try to merge activation with previous layer. Returns (merged, prev_layer_name)."""
+        if not hasattr(self, 'previous_assign') or not self.previous_assign:
+            return False, None
+
+        if not hasattr(self.previous_assign.value.func, 'attr'):
+            return False, None
+
+        prev_lyr_name = self.previous_assign.value.func.attr
+        prev_lyr_obj = self._get_layer_by_name(prev_lyr_name)
+        if not prev_lyr_obj:
+            return False, None
+
+        actv = self.activation_functions[module_name]
+        # actv might already be the BUML name (relu) or TF name (relu)
+        actv_func = actv if actv in tf_actv_func_mapping.values() else actv
+
+        prev_lyr_obj.actv_func = actv_func
+        output_var = node.targets[0].id
+        self.module_of_output[output_var] = prev_lyr_name
+        return True, prev_lyr_name
+
+    def _create_standalone_activation(self, node, module_name):
+        """Create standalone activation layer."""
+        unique_name = f"{module_name}_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+
+        actv = self.activation_functions[module_name]
+        # actv might already be the BUML name (relu) or need mapping
+        actv_func = actv if actv in tf_actv_func_mapping.values() else actv
+
+        actv_lyr = mm_classes.GeneralLayer(name=unique_name, actv_func=actv_func)
+        self.buml_model.modules.append(actv_lyr)
+
+        input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
+        output_var = node.targets[0].id
+        self.inputs_outputs[unique_name] = [input_var, output_var]
+        self.module_of_output[output_var] = unique_name
+
+    def _handle_module_activation(self, node, module_name):
+        """Handle module API activation layers with merge logic."""
+        merged, _ = self._try_merge_activation(node, module_name)
+        if not merged:
+            self._create_standalone_activation(node, module_name)
 
     def extract_tensorop(self, node: ast.Assign):
         """

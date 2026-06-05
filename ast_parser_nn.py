@@ -53,7 +53,21 @@ class ASTParser(ast.NodeVisitor):
         self.unprocessed_nodes: list = []
         # Accumulate warnings about unsupported features
         self.migration_warnings: list = []
+        # Track variable usage counts in forward method for input_reused detection
+        self.variable_usage_count: dict = {}
+        self.forward_method_body: list = []
 
+
+    def _analyze_variable_usage(self, forward_method):
+        """
+        Analyze variable usage in the forward method to determine which variables
+        are used multiple times. This helps set input_reused correctly for TensorOps.
+        """
+        for stmt in forward_method.body:
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    var_name = node.id
+                    self.variable_usage_count[var_name] = self.variable_usage_count.get(var_name, 0) + 1
 
     def visit_ClassDef(self, node: ast.ClassDef):
         """
@@ -88,6 +102,14 @@ class ASTParser(ast.NodeVisitor):
             self.buml_model.name = node.name
             self.in_class = True
 
+        # First pass: Find and analyze forward method for variable usage
+        for child in node.body:
+            if isinstance(child, ast.FunctionDef) and child.name == 'forward':
+                self._analyze_variable_usage(child)
+                self.forward_method_body = child.body
+                break
+
+        # Second pass: Process all methods normally
         for child in node.body:
             if isinstance(child, ast.FunctionDef):
                 self.visit(child)

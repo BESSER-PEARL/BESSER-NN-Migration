@@ -1045,18 +1045,19 @@ class ASTParserTorch(ASTParser):
         # Update prev_layer_output for TensorOps
         self.prev_layer_output = output_var
 
-        # Mark source layers for residual connections
-        # When we have x = a + b where a and b are from different layers,
-        # mark both source layers so their inputs are preserved
-        if tns_type == "binop_add" and isinstance(left_layer, str) and isinstance(right_layer, str):
-            # Find the layer objects for both operands
-            for layer_name in [left_layer, right_layer]:
-                if layer_name and not isinstance(layer_name, (int, float)):
-                    # Look up the layer that produced this output
-                    layer_obj = self._get_layer_by_name(layer_name)
-                    if layer_obj:
-                        # Mark that this layer's input should be preserved (residual connection)
+        # Mark source layers when their output is reused in binops
+        # This ensures that intermediate transformations create new variables
+        # instead of overwriting the original layer output
+        for layer_name in [left_layer, right_layer]:
+            if isinstance(layer_name, str) and not isinstance(layer_name, (int, float)):
+                # Check if this is a layer reference (not a TensorOp like "op_3")
+                if not layer_name.startswith("op_"):
+                    # Strip __hidden or __cell suffix to get base layer name
+                    base_layer_name = layer_name.replace('__hidden', '').replace('__cell', '').replace('__forward', '').replace('__backward', '')
+                    layer_obj = self._get_layer_by_name(base_layer_name)
+                    if layer_obj and not hasattr(layer_obj, '_input_reused_marked'):
                         layer_obj.input_reused = True
+                        layer_obj._input_reused_marked = True  # Avoid redundant marking
 
     def _extract_tuple_var_names(self, tuple_target):
         """Extract variable names from tuple unpacking target."""
@@ -1184,6 +1185,21 @@ class ASTParserTorch(ASTParser):
         # Determine RNN return type based on slice pattern (use base layer name without suffix)
         if self._determine_rnn_slice_return_type(node, lyr_obj, layer_lookup_name, subscripted_var, result_var):
             return
+
+        # Check if this is a bidirectional RNN subscript pattern (h[-2] or h[-1])
+        # For bidirectional RNNs, these represent forward and backward hidden states
+        if (lyr_obj and hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional and
+            isinstance(node.value.slice, ast.UnaryOp) and
+            isinstance(node.value.slice.operand, ast.Constant)):
+            slice_idx = -node.value.slice.operand.value if isinstance(node.value.slice.op, ast.USub) else node.value.slice.operand.value
+            # For bidirectional: -2 = forward (last layer, forward direction), -1 = backward (last layer, backward direction)
+            if slice_idx in [-2, -1]:
+                suffix = "__forward" if slice_idx == -2 else "__backward"
+                # Track with direction suffix so they're different
+                self.module_of_output[result_var] = layer_lookup_name + suffix
+                self.variable_aliases[result_var] = subscripted_var
+                self.previous_assign = node
+                return
 
         # Track the result variable and alias
         self.module_of_output[result_var] = prev_module_name
@@ -1371,6 +1387,22 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but adds TensorOp to model and tracks output
         """
+        # Check if input variable is used multiple times - if so, mark input_reused=True
+        if 'input_reused' not in tensorop_param or not tensorop_param['input_reused']:
+            # Extract the input variable name from the call node
+            input_var_name = None
+            if call_node and isinstance(call_node, ast.Call):
+                # For method calls like x.unsqueeze(), the object is in call_node.func.value
+                if isinstance(call_node.func, ast.Attribute) and isinstance(call_node.func.value, ast.Name):
+                    input_var_name = call_node.func.value.id
+                # For function calls like torch.squeeze(x), check first argument
+                elif call_node.args and isinstance(call_node.args[0], ast.Name):
+                    input_var_name = call_node.args[0].id
+
+            # If the input variable is used more than once in the forward method, mark input_reused=True
+            if input_var_name and self.variable_usage_count.get(input_var_name, 0) > 1:
+                tensorop_param['input_reused'] = True
+
         op_name = f"op_{self.tensor_op_counter}"
         tensorop_param["name"] = op_name
         tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)

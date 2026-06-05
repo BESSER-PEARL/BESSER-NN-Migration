@@ -4,7 +4,7 @@ to BUML code.
 """
 
 layers_mapping = {
-    "Conv1D": "Conv1D", "Conv2D": "Conv2D", "Conv3D": "Conv3D",      
+    "Conv1D": "Conv1D", "Conv2D": "Conv2D", "Conv3D": "Conv3D",
     "MaxPool1D": "PoolingLayer", "MaxPool2D": "PoolingLayer",
     "MaxPool3D": "PoolingLayer", "AveragePooling1D": "PoolingLayer",
     "AveragePooling2D": "PoolingLayer", "AveragePooling3D": "PoolingLayer",
@@ -21,6 +21,12 @@ layers_mapping = {
     "Embedding": "EmbeddingLayer", "BatchNormalization": "BatchNormLayer",
     "LayerNormalization": "LayerNormLayer", "Dropout": "DropoutLayer",
     "SimpleRNN": "SimpleRNNLayer", "LSTM": "LSTMLayer", "GRU": "GRULayer",
+}
+
+# TF standalone activation layers mapping (layers.ReLU, layers.Activation, etc.)
+actv_fun_mapping = {
+    "ReLU": "relu", "LeakyReLU": "leaky_relu", "Sigmoid": "sigmoid",
+    "Softmax": "softmax", "Tanh": "tanh", "GELU": "gelu", "Activation": "activation"
 }
 
 params_mapping = {
