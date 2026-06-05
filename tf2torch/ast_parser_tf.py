@@ -1519,6 +1519,10 @@ class ASTParserTF(ASTParser):
                     dropout_layer_name = f"{module_name}_dropout"
                     dropout_module = next((obj for obj in self.buml_model.layers if obj.name == dropout_layer_name), None)
                     if dropout_module:
+                        # Set dropout's input to be the same as the RNN's original input
+                        dropout_module.name_module_input = module_obj.name_module_input
+                        # Update RNN's input to be the dropout layer
+                        module_obj.name_module_input = dropout_layer_name
                         self.buml_model.modules.append(dropout_module)
 
                 if module_obj and module_obj in self.buml_model.modules:
