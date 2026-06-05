@@ -1658,8 +1658,12 @@ class ASTParserTF(ASTParser):
                 "concatenate_dim": cat_dim,
                 "actual_vars": var_types
             }
-        elif op_type == "matmul" or op_type == "multiply":
-            op_type = "matmultiply" if op_type == "matmul" else "multiply"
+        elif op_type == "add" or op_type == "matmul" or op_type == "multiply":
+            if op_type == "matmul":
+                op_type = "matmultiply"
+            elif op_type == "add":
+                op_type = "binop_add"
+            # binop_add, multiply, matmultiply are all binary ops
             layers_of_tensors = [self.module_of_output[op_args[0].id],
                                  self.module_of_output[op_args[1].id]]
             tensorop_param = {"tns_type": op_type,
