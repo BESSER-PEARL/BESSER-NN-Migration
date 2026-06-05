@@ -1450,13 +1450,25 @@ class ASTParserTF(ASTParser):
                     input_var = "x"
                 self.inputs_outputs[module_name] = [input_var,
                                                     node.targets[0].id]
-                self.module_of_output[node.targets[0].id] = module_name
+                # Get module_obj BEFORE updating module_of_output
                 module_obj = next((obj for obj in self.buml_model.layers if
                                    obj.name == module_name), None)
                 if not module_obj:
                     subnns = self.buml_model.sub_nns
                     module_obj = next((obj for obj in subnns if
                                        obj.name == module_name), None)
+
+                # Set name_module_input BEFORE updating module_of_output (to avoid self-reference)
+                if module_obj and input_var in self.module_of_output:
+                    module_obj.name_module_input = self.module_of_output[input_var]
+                elif module_obj and input_var == "x":
+                    # Special case: input is "x" (network INPUT) but not in module_of_output
+                    # This happens when there are only tensorops before this layer (e.g., shape_dim)
+                    # Set name_module_input to "INPUT" to signal network input
+                    module_obj.name_module_input = "INPUT"
+
+                # NOW update module_of_output
+                self.module_of_output[node.targets[0].id] = module_name
 
                 # Check for initial_state keyword argument (for RNN layers)
                 if module_obj and hasattr(module_obj, 'return_type'):  # Check if it's an RNN layer
@@ -1495,19 +1507,12 @@ class ASTParserTF(ASTParser):
                                         self._reserved_tf_vars.add(h_var)
                             break
 
-                # Set name_module_input to track which module produced the input
+                # Check for RNN hidden state usage
                 if module_obj and input_var in self.module_of_output:
-                    module_obj.name_module_input = self.module_of_output[input_var]
-                    # For RNN hidden states, mark that we need the hidden output not sequence output
                     source_module = self.module_of_output[input_var]
                     if source_module in self.rnn_hidden_vars and self.rnn_hidden_vars[source_module] == input_var:
                         # Set a flag to indicate this layer uses RNN hidden state
                         module_obj.use_rnn_hidden = True
-                elif module_obj and input_var == "x":
-                    # Special case: input is "x" (network INPUT) but not in module_of_output
-                    # This happens when there are only tensorops before this layer (e.g., shape_dim)
-                    # Set name_module_input to "INPUT" to signal network input
-                    module_obj.name_module_input = "INPUT"
 
                 # Add Dropout module before RNN/layer if dropout layer exists
                 if module_obj:
@@ -2259,6 +2264,36 @@ class ASTParserTF(ASTParser):
         iterate_and_permute(self.buml_model.modules)
 
 
+    def add_squeeze_for_global_pooling(self):
+        """
+        Add squeeze TensorOps after global pooling layers to remove the
+        size-1 dimension added by AdaptiveAvgPool.
+        """
+        def add_squeeze_ops(modules):
+            """Insert squeeze TensorOps after global pooling layers."""
+            i = 0
+            while i < len(modules):
+                module = modules[i]
+                if (isinstance(module, Layer) and
+                    module.__class__.__name__ == "PoolingLayer" and
+                    hasattr(module, 'pooling_type') and
+                    module.pooling_type.startswith("global")):
+                    # Create squeeze TensorOp to remove the size-1 dimension
+                    squeeze_op = mm_classes.TensorOp(
+                        name=f"{module.name}_squeeze",
+                        tns_type='squeeze',
+                        reduce_dim=-1
+                    )
+                    # Insert squeeze op right after the pooling layer
+                    modules.insert(i + 1, squeeze_op)
+                    i += 1  # Skip the newly inserted squeeze op
+                i += 1
+
+        if self.buml_model.sub_nns:
+            for subnn in self.buml_model.sub_nns:
+                add_squeeze_ops(subnn.modules)
+
+        add_squeeze_ops(self.buml_model.modules)
 
 
     def permute(self, module, modules: list,
@@ -2306,7 +2341,7 @@ class ASTParserTF(ASTParser):
         else:
             prev_cnn = False
         if current_cnn:
-            if not prev_cnn and (prev_module is None or 
+            if not prev_cnn and (prev_module is None or
                                  prev_module.name not in lyr_out_permuted):
                 module.permute_in = True
                 if prev_module is not None:
@@ -2314,7 +2349,12 @@ class ASTParserTF(ASTParser):
             elif prev_cnn and prev_module.name in lyr_out_permuted:
                 module.permute_in = True
             if not next_cnn:
-                module.permute_out = True
+                # For global pooling, don't set permute_out (will add squeeze instead)
+                is_global_pooling = (module.__class__.__name__ == "PoolingLayer" and
+                                   hasattr(module, 'pooling_type') and
+                                   module.pooling_type.startswith("global"))
+                if not is_global_pooling:
+                    module.permute_out = True
                 lyr_out_permuted.append(module.name)
         prev_module = module
         return prev_module

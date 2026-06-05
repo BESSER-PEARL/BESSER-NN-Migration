@@ -96,6 +96,9 @@ class ASTParser(ast.NodeVisitor):
         self.set_remaining_lyr_params()
         # Add permute before and after conv blocks to make TF and Pytorch eqv
         self.add_permute_dim()
+        # Add squeeze after global pooling layers (TF to PyTorch specific)
+        if hasattr(self, 'add_squeeze_for_global_pooling'):
+            self.add_squeeze_for_global_pooling()
         # Set in_class var to False at the end of NN architecture processing
         self.in_class = False
 
@@ -263,6 +266,9 @@ class ASTParser(ast.NodeVisitor):
             self.handle_sequential_layers(node, self.buml_model.name)
 
             self.add_permute_dim()
+            # Add squeeze after global pooling layers (TF to PyTorch specific)
+            if hasattr(self, 'add_squeeze_for_global_pooling'):
+                self.add_squeeze_for_global_pooling()
 
 
 
