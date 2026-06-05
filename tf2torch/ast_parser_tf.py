@@ -1667,12 +1667,18 @@ class ASTParserTF(ASTParser):
                 "concatenate_dim": cat_dim,
                 "actual_vars": var_types
             }
-        elif op_type == "add" or op_type == "matmul" or op_type == "multiply":
-            if op_type == "matmul":
-                op_type = "matmultiply"
-            elif op_type == "add":
-                op_type = "binop_add"
-            # binop_add, multiply, matmultiply are all binary ops
+        elif op_type in ["add", "subtract", "multiply", "divide", "floor_divide", "matmul"]:
+            # Map TF functional calls to BUML binary operation types
+            op_map = {
+                "add": "binop_add",
+                "subtract": "binop_subtract",
+                "multiply": "multiply",
+                "divide": "binop_divide",
+                "floor_divide": "binop_floor_divide",
+                "matmul": "matmultiply"
+            }
+            op_type = op_map[op_type]
+            # All binary ops require two tensor operands
             layers_of_tensors = [self.module_of_output[op_args[0].id],
                                  self.module_of_output[op_args[1].id]]
             tensorop_param = {"tns_type": op_type,
