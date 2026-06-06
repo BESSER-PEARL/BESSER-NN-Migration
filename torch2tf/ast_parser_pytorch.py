@@ -595,6 +595,54 @@ class ASTParserTorch(ASTParser):
         self.handle_subscript_operation(subscript_node, temp_name, node)
         node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
 
+    def _is_noop_squeeze(self, call_node):
+        """Check if a call is a no-op squeeze(0) on single-layer RNN hidden state."""
+        if not isinstance(call_node, ast.Call):
+            return False
+        if not isinstance(call_node.func, ast.Attribute):
+            return False
+        if call_node.func.attr != 'squeeze':
+            return False
+
+        # Extract base variable
+        if not isinstance(call_node.func.value, ast.Name):
+            return False
+        base_var = call_node.func.value.id
+
+        # Check if it's squeeze(0)
+        dim_value = None
+        if len(call_node.args) > 0:
+            dim_value = self.param_value(call_node.args[0])
+        else:
+            for kw in call_node.keywords:
+                if kw.arg == "dim":
+                    dim_value = self.param_value(kw.value)
+
+        if dim_value != 0:
+            return False
+
+        # Check if base_var is an RNN hidden/cell state
+        if base_var not in self.module_of_output:
+            return False
+
+        base_layer = self.module_of_output[base_var]
+        if not (base_layer and (base_layer.endswith('__hidden') or base_layer.endswith('__cell'))):
+            return False
+
+        # Check if it's a single-layer RNN
+        rnn_layer_name = base_layer.replace('__hidden', '').replace('__cell', '')
+        rnn_layer = self._get_layer_by_name(rnn_layer_name)
+        if not rnn_layer:
+            return False
+
+        num_layers = getattr(rnn_layer, 'num_layers', None)
+        if rnn_layer.__class__.__name__ not in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer'):
+            return False
+        if not (num_layers is None or num_layers == 1):
+            return False
+
+        return True
+
     def _handle_nested_call(self, node):
         """Process nested calls (e.g., F.relu(self.conv(x))). Returns True if nested."""
         if not (isinstance(node.value, ast.Call) and node.value.args):
@@ -603,6 +651,13 @@ class ASTParserTorch(ASTParser):
             return False
 
         inner_call = node.value.args[0]
+
+        # Check if inner call is a no-op squeeze - if so, skip intermediate and use base var
+        if self._is_noop_squeeze(inner_call):
+            base_var = inner_call.func.value.id
+            node.value.args[0] = ast.Name(id=base_var, ctx=ast.Load())
+            return False  # Not treated as nested since we're bypassing it
+
         temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
         self.tensor_op_counter += 1
         temp_target = ast.Name(id=temp_name, ctx=ast.Store())
@@ -1363,6 +1418,22 @@ class ASTParserTorch(ASTParser):
         base_layer = self.module_of_output.get(base_var)
         if base_layer is None:
             return base_var
+
+        # Check for no-op squeeze(0) on single-layer RNN hidden states before creating TensorOp
+        if op_type == 'squeeze':
+            op_params = self._extract_inline_op_params(call_node, op_type)
+            if (op_params.get('reduce_dim') == 0 and
+                base_layer and
+                (base_layer.endswith('__hidden') or base_layer.endswith('__cell'))):
+                rnn_layer_name = base_layer.replace('__hidden', '').replace('__cell', '')
+                rnn_layer = self._get_layer_by_name(rnn_layer_name)
+                # num_layers can be None (defaults to 1) or explicitly 1
+                num_layers = getattr(rnn_layer, 'num_layers', None) if rnn_layer else None
+                if (rnn_layer and
+                    rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
+                    (num_layers is None or num_layers == 1)):
+                    # No-op: return base variable, don't create TensorOp
+                    return base_var
 
         intermediate_var = self.TEMP_INLINE.format(op_type, self.tensor_op_counter)
         tensorop_param = {
@@ -2149,6 +2220,26 @@ class ASTParserTorch(ASTParser):
                 arg.func.value.id == 'self'):
                 return self._extract_layer_call_variable(arg, arg.func.attr)
             else:
+                # Check for no-op squeeze(0) on single-layer RNN hidden states
+                if (isinstance(arg.func, ast.Attribute) and
+                    arg.func.attr == 'squeeze' and
+                    isinstance(arg.func.value, ast.Name)):
+                    base_var = arg.func.value.id
+                    # Check if squeeze(0)
+                    if (len(arg.args) > 0 and isinstance(arg.args[0], ast.Constant) and
+                        arg.args[0].value == 0):
+                        # Check if base_var is an RNN hidden state
+                        if base_var in self.module_of_output:
+                            base_layer = self.module_of_output[base_var]
+                            if base_layer and (base_layer.endswith('__hidden') or base_layer.endswith('__cell')):
+                                rnn_layer_name = base_layer.replace('__hidden', '').replace('__cell', '')
+                                rnn_layer = self._get_layer_by_name(rnn_layer_name)
+                                num_layers = getattr(rnn_layer, 'num_layers', None) if rnn_layer else None
+                                if (rnn_layer and
+                                    rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
+                                    (num_layers is None or num_layers == 1)):
+                                    # No-op squeeze: return base variable directly
+                                    return base_var
                 return self._extract_inline_call_variable(arg, node)
         elif isinstance(arg, ast.Subscript):
             return self._extract_subscript_variable(arg, node)
