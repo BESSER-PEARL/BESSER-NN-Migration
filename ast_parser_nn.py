@@ -228,21 +228,21 @@ class ASTParser(ast.NodeVisitor):
 
     def visit_Return(self, node: ast.Return):
         """
-        It visits return statements. If the return value is a module call,
+        It visits return statements. If the return value is a module call or binary operation,
         it processes it as if it were an assignment.
 
         Parameters:
             node (ast.Return): The AST node representing a return statement.
 
         Returns:
-            None, but processes the return value if it's a layer call.
+            None, but processes the return value if it's a layer call or binop.
         """
         # Only process if we're in a class (forward method) and input_nn_type is subclassing
         if not self.in_class or self.input_nn_type != "subclassing":
             return
 
-        # Check if return value is a Call (e.g., return self.fc(x))
-        if isinstance(node.value, ast.Call):
+        # Check if return value is a Call (e.g., return self.fc(x)) or BinOp (e.g., return x1 + x2)
+        if isinstance(node.value, (ast.Call, ast.BinOp)):
             # Create a synthetic assignment node for processing
             # This allows reusing the existing assignment processing logic
             synthetic_assign = ast.Assign(

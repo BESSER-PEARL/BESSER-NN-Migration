@@ -2159,15 +2159,25 @@ class ASTParserTorch(ASTParser):
         """Track output variable for bidirectional concat."""
         output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
         if output_var:
-            self.module_of_output[output_var] = source_layer_name
+            self.module_of_output[output_var] = "bidirectional_concat_" + source_layer_name
         return output_var is not None
 
     def _check_bidirectional_rnn_concat(self, ops_args, layers_of_tensors, node):
         """Check if this is a bidirectional RNN concatenation pattern and handle it."""
-        if not (len(ops_args) == 2 and len(set(layers_of_tensors)) == 1):
+        # Strip __forward/__backward suffixes for comparison
+        base_layers = [name.replace("__forward", "").replace("__backward", "") for name in layers_of_tensors]
+
+        if not (len(ops_args) == 2 and len(set(base_layers)) == 1):
             return False
 
-        source_layer_name = layers_of_tensors[0]
+        # Use the first base layer name (without suffixes) as source
+        source_layer_name = base_layers[0]
+        # But check if we need to keep the original for proper layer lookup
+        # If the original has no suffix, use it; otherwise use base
+        orig_name = layers_of_tensors[0]
+        if not (orig_name.endswith("__forward") or orig_name.endswith("__backward")):
+            source_layer_name = orig_name
+
         source_layer = self._get_layer_by_name(source_layer_name)
 
         if not self._is_bidirectional_hidden_rnn(source_layer):
@@ -2178,8 +2188,10 @@ class ASTParserTorch(ASTParser):
             if indices and set(indices) == {-2, -1}:
                 return self._handle_bidirectional_concat_output(node, source_layer_name)
 
-        elif all(isinstance(arg, ast.Name) for arg in ops_args):
-            return self._handle_bidirectional_concat_output(node, source_layer_name)
+        # For name-based patterns (h_forward, h_backward), don't skip - let it create TensorOp
+        # The template will already generate the automatic concat, but having the explicit one is fine
+        # elif all(isinstance(arg, ast.Name) for arg in ops_args):
+        #     return self._handle_bidirectional_concat_output(node, source_layer_name)
 
         return False
 
