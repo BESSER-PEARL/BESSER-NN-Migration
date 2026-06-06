@@ -859,6 +859,13 @@ class ASTParserTorch(ASTParser):
             # Reset for next RNN
             self._current_rnn_initial_hidden = None
 
+        # Set name_module_input to track data input (not hidden state input)
+        if module_obj and rnn_in in self.module_of_output:
+            module_obj.name_module_input = self.module_of_output[rnn_in]
+        elif module_obj and rnn_in == 'x':
+            # First layer using network input - don't set name_module_input
+            pass
+
         self.buml_model.modules.append(module_obj)
         self.previous_assign = node
 
@@ -1139,6 +1146,11 @@ class ASTParserTorch(ASTParser):
                 lyr_obj.return_type = "hidden"
         elif isinstance(node.value.slice, ast.Tuple) and len(node.value.slice.elts) == 3:
             if lyr_obj.return_type == "full":
+                self._handle_non_rnn_slicing(node, subscripted_var, result_var)
+                return True
+            # If RNN already returns both (sequence + hidden), subscripting the sequence
+            # is a post-processing operation, not a return_type change
+            if lyr_obj.return_type == "both":
                 self._handle_non_rnn_slicing(node, subscripted_var, result_var)
                 return True
             if lyr_obj.return_type != "both":
@@ -1621,11 +1633,8 @@ class ASTParserTorch(ASTParser):
 
         module_obj = self._get_layer_by_name(module_name)
         # Set name_module_input if the input comes from a tracked module
-        # Skip for RNN layers as they have special hx parameter handling
         if module_obj and input_var in self.module_of_output:
-            layer_class = module_obj.__class__.__name__
-            if layer_class not in ('RNNLayer', 'GRULayer', 'LSTMLayer'):
-                module_obj.name_module_input = self.module_of_output[input_var]
+            module_obj.name_module_input = self.module_of_output[input_var]
         self._detect_parallel_operations(module_obj, input_var)
         self.prev_layer_output = node.targets[0].id
         self._check_residual_connection(module_obj, input_var)
