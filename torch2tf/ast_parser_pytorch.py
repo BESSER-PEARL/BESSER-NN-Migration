@@ -708,6 +708,10 @@ class ASTParserTorch(ASTParser):
             # LSTM: second element is a tuple (h, c)
             var2 = node.targets[0].elts[1].elts[0].id if isinstance(node.targets[0].elts[1].elts[0], ast.Name) else None
             var3 = node.targets[0].elts[1].elts[1].id if len(node.targets[0].elts[1].elts) > 1 and isinstance(node.targets[0].elts[1].elts[1], ast.Name) else None
+        elif len(node.targets[0].elts) == 3:
+            # LSTM with 3-element flat tuple: out, h, c = self.lstm(x)
+            var2 = node.targets[0].elts[1].id if isinstance(node.targets[0].elts[1], ast.Name) else None
+            var3 = node.targets[0].elts[2].id if isinstance(node.targets[0].elts[2], ast.Name) else None
         else:
             # RNN/GRU: second element is just h
             var2 = node.targets[0].elts[1].id
@@ -728,6 +732,7 @@ class ASTParserTorch(ASTParser):
 
     def _determine_rnn_return_type(self, node, module_name):
         """Determine RNN return type and main output variable based on underscore pattern."""
+        num_elts = len(node.targets[0].elts)
         first_elem = node.targets[0].elts[0]
         second_elem = node.targets[0].elts[1] if not isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].elts[0]
 
@@ -743,7 +748,11 @@ class ASTParserTorch(ASTParser):
         elif not first_is_underscore and second_is_underscore:
             rnn_out = node.targets[0].elts[0].id
             if lyr_obj:
-                lyr_obj.return_type = "full"
+                # For 3-element tuples (LSTM), even if h and c are "_", we need return_state=True
+                if num_elts == 3 or isinstance(node.targets[0].elts[1], ast.Tuple):
+                    lyr_obj.return_type = "both"
+                else:
+                    lyr_obj.return_type = "full"
         else:
             rnn_out = node.targets[0].elts[0].id
             if lyr_obj:
