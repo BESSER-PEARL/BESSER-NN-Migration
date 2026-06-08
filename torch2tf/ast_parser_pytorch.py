@@ -893,14 +893,11 @@ class ASTParserTorch(ASTParser):
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
         # Handle initial hidden state (hx parameter) for seq2seq patterns
-        print(f"DEBUG: module={module_name}, has _current_rnn_initial_hidden={hasattr(self, '_current_rnn_initial_hidden')}, value={getattr(self, '_current_rnn_initial_hidden', None)}")
         if module_obj and hasattr(self, '_current_rnn_initial_hidden') and self._current_rnn_initial_hidden:
             if self._current_rnn_initial_hidden == "tuple_state":
                 # LSTM case with (h, c) tuple - need to extract the source from the tuple elements
                 # For now, we'll need to track this during argument parsing
-                print(f"DEBUG: tuple_state case, args len={len(node.value.args)}")
                 if len(node.value.args) > 1 and isinstance(node.value.args[1], ast.Tuple):
-                    print(f"DEBUG: has tuple arg, elts len={len(node.value.args[1].elts)}")
                     if len(node.value.args[1].elts) > 0 and isinstance(node.value.args[1].elts[0], ast.Name):
                         h_var = node.value.args[1].elts[0].id
                         print(f"DEBUG: h_var={h_var}, in module_of_output={h_var in self.module_of_output}")
