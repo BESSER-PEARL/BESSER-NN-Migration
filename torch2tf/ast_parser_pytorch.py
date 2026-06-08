@@ -1656,7 +1656,7 @@ class ASTParserTorch(ASTParser):
             self._create_standalone_activation(node, module_name)
 
     def _handle_module_layer_reuse(self, node, module_name, module_obj):
-        """Handle layer reuse by creating synthetic copy."""
+        """Handle layer reuse by creating synthetic copy with current call's input tracking."""
         import copy
         synthetic_name = f"{module_name}_use_{self.tensor_op_counter}"
         self.tensor_op_counter += 1
@@ -1664,10 +1664,23 @@ class ASTParserTorch(ASTParser):
         synthetic_module = copy.copy(module_obj)
         synthetic_module.name = synthetic_name
 
-        if module_name in self.inputs_outputs:
-            self.inputs_outputs[synthetic_name] = self.inputs_outputs[module_name]
+        # Extract input for current call (already done in _process_module_api before this)
+        # inputs_outputs[module_name] contains current call's input/output
+        input_var, output_var = self.inputs_outputs[module_name]
 
-        output_var = node.targets[0].id
+        # Set inputs_outputs for synthetic layer with current call's input/output
+        self.inputs_outputs[synthetic_name] = [input_var, output_var]
+
+        # Copy name_module_input from original module (set before module_of_output overwrite)
+        # This has the correct input source
+        if hasattr(module_obj, 'name_module_input') and module_obj.name_module_input:
+            synthetic_module.name_module_input = module_obj.name_module_input
+
+        # Mark as input_reused since it's using output from another module
+        if input_var in self.module_of_output:
+            synthetic_module.input_reused = True
+
+        # Map output variable to synthetic module
         self.module_of_output[output_var] = synthetic_name
 
         self.buml_model.layers.append(synthetic_module)
@@ -1708,13 +1721,18 @@ class ASTParserTorch(ASTParser):
             return
 
         input_var = self._extract_rnn_input_arg(node)
-        self.inputs_outputs[module_name] = [input_var, node.targets[0].id]
-        self.module_of_output[node.targets[0].id] = module_name
+        output_var = node.targets[0].id
+
+        # Save input source BEFORE overwriting module_of_output (for layer reuse)
+        input_source_module = self.module_of_output.get(input_var) if input_var in self.module_of_output else None
+
+        self.inputs_outputs[module_name] = [input_var, output_var]
+        self.module_of_output[output_var] = module_name
 
         module_obj = self._get_layer_by_name(module_name)
-        # Set name_module_input if the input comes from a tracked module
-        if module_obj and input_var in self.module_of_output:
-            module_obj.name_module_input = self.module_of_output[input_var]
+        # Set name_module_input using saved input source (not overwritten value)
+        if module_obj and input_source_module:
+            module_obj.name_module_input = input_source_module
         self._detect_parallel_operations(module_obj, input_var)
         self.prev_layer_output = node.targets[0].id
         self._check_residual_connection(module_obj, input_var)
@@ -1796,10 +1814,11 @@ class ASTParserTorch(ASTParser):
 
             if isinstance(prev_module, Layer):
                 lyr_type = prev_module.__class__.__name__
-                # Transpose after Embedding or similar layers that output features-last
-                # is converting to channels-first for PyTorch Conv
+                # Transpose after Embedding or pass-through layers (Dropout, etc.)
+                # that preserve format is converting to channels-first for PyTorch Conv
                 # TensorFlow Conv uses same format, so skip
-                if lyr_type in ["EmbeddingLayer"]:
+                # Pass-through layers: Dropout, BatchNorm don't change dimensionality
+                if lyr_type in ["EmbeddingLayer", "DropoutLayer", "BatchNormLayer"]:
                     prev_module.permute_out = True
                     return None
 
