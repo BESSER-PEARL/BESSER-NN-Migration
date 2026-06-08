@@ -1658,8 +1658,10 @@ class ASTParserTorch(ASTParser):
     def _handle_module_layer_reuse(self, node, module_name, module_obj):
         """Handle layer reuse by creating synthetic copy with current call's input tracking."""
         import copy
-        synthetic_name = f"{module_name}_use_{self.tensor_op_counter}"
-        self.tensor_op_counter += 1
+        # Use per-layer reuse counter for clearer naming (dropout_use_1, dropout_use_2, ...)
+        self.layer_reuse_count[module_name] = self.layer_reuse_count.get(module_name, 0) + 1
+        use_count = self.layer_reuse_count[module_name]
+        synthetic_name = f"{module_name}_use_{use_count}"
 
         synthetic_module = copy.copy(module_obj)
         synthetic_module.name = synthetic_name
