@@ -1776,9 +1776,33 @@ class ASTParserTorch(ASTParser):
         return {"tns_type": op_type+"tiply", "layers_of_tensors": layers_of_tensors}
 
     def _extract_op_transpose(self, call_node, op_args):
-        """Extract transpose operation parameters."""
+        """Extract transpose operation parameters.
+
+        Detects and skips format conversion transposes that swap dimensions
+        to convert from features-last to channels-first format before Conv layers.
+        """
         transpose_dim = [op_args[i].value for i in range(len(op_args))]
         source_var = call_node.func.value.id if isinstance(call_node.func.value, ast.Name) else None
+
+        # Check if this is a dimension-swapping transpose for format conversion
+        # Pattern: transpose(d1, d2) where d2 = d1 + 1 (swapping adjacent dimensions)
+        # Common cases: transpose(1, 2), transpose(2, 3), etc.
+        if (len(transpose_dim) == 2 and
+            transpose_dim[1] == transpose_dim[0] + 1 and
+            transpose_dim[0] > 0):  # Skip batch dimension
+
+            modules = self.buml_model.modules
+            prev_module = modules[-1] if modules else None
+
+            if isinstance(prev_module, Layer):
+                lyr_type = prev_module.__class__.__name__
+                # Transpose after Embedding or similar layers that output features-last
+                # is converting to channels-first for PyTorch Conv
+                # TensorFlow Conv uses same format, so skip
+                if lyr_type in ["EmbeddingLayer"]:
+                    prev_module.permute_out = True
+                    return None
+
         if source_var and source_var in self.module_of_output:
             source_layers = [self.module_of_output[source_var]]
         elif source_var:
