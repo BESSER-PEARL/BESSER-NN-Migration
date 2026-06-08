@@ -128,7 +128,7 @@ class ASTParser(ast.NodeVisitor):
     def set_remaining_lyr_params(self):
         """
         It iterates through the layers and tensorops to set their 'input_reused'
-        and 'name_module_input' parameters.
+        and 'name_module_input' parameters. Also resolves multiple return values.
         """
         for i, module in enumerate(self.buml_model.modules):
             if isinstance(module, Layer) or hasattr(module, 'input_reused'):
@@ -136,6 +136,25 @@ class ASTParser(ast.NodeVisitor):
                     module, self.inputs_outputs, self.module_of_output,
                     self.buml_model.modules, i
                 )
+
+        # Handle tuple returns
+        if hasattr(self, 'pytorch_return_vars') and self.pytorch_return_vars:
+            # Map PyTorch variables to module names
+            return_modules = []
+            for pytorch_var in self.pytorch_return_vars:
+                if pytorch_var == '_':
+                    continue
+                if pytorch_var in self.module_of_output:
+                    module_name = self.module_of_output[pytorch_var]
+                    return_modules.append(module_name)
+
+            # Store in model's inputs_outputs for generator to access
+            if return_modules:
+                self.inputs_outputs['__return__'] = [None, ','.join(return_modules)]
+
+        # Store inputs_outputs in model for generator access
+        self.buml_model.inputs_outputs = self.inputs_outputs
+
 
 
     def add_permute_dim(self):
@@ -228,14 +247,14 @@ class ASTParser(ast.NodeVisitor):
 
     def visit_Return(self, node: ast.Return):
         """
-        It visits return statements. If the return value is a module call or binary operation,
-        it processes it as if it were an assignment.
+        It visits return statements. If the return value is a module call, binary operation,
+        or tuple, it processes it accordingly.
 
         Parameters:
             node (ast.Return): The AST node representing a return statement.
 
         Returns:
-            None, but processes the return value if it's a layer call or binop.
+            None, but processes the return value and tracks multiple return values.
         """
         # Only process if we're in a class (forward method) and input_nn_type is subclassing
         if not self.in_class or self.input_nn_type != "subclassing":
@@ -253,6 +272,19 @@ class ASTParser(ast.NodeVisitor):
             synthetic_assign.lineno = node.lineno
             synthetic_assign.col_offset = node.col_offset
             self.visit_Assign(synthetic_assign)
+
+        # Handle tuple returns (e.g., return rep, recon)
+        elif isinstance(node.value, ast.Tuple):
+            # Track the tuple of return variables from PyTorch source
+            pytorch_return_vars = []
+            for elt in node.value.elts:
+                if isinstance(elt, ast.Name):
+                    pytorch_return_vars.append(elt.id)
+
+            # Store for set_remaining_lyr_params to create a return TensorOp
+            if not hasattr(self, 'pytorch_return_vars'):
+                self.pytorch_return_vars = []
+            self.pytorch_return_vars = pytorch_return_vars
 
 
     def handle_sequential_nn(self, node: ast.Assign):
