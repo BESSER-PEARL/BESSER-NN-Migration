@@ -129,7 +129,27 @@ class ASTParser(ast.NodeVisitor):
         """
         It iterates through the layers and tensorops to set their 'input_reused'
         and 'name_module_input' parameters. Also resolves multiple return values.
+        Also marks modules to prevent variable reuse for residual connections.
         """
+        # First pass: identify modules whose outputs are used in binops
+        binop_source_modules = set()
+        for module in self.buml_model.modules:
+            if hasattr(module, 'tns_type') and 'binop' in module.tns_type:
+                if hasattr(module, 'layers_of_tensors'):
+                    for source in module.layers_of_tensors:
+                        if isinstance(source, str) and not source.startswith('op_'):
+                            binop_source_modules.add(source)
+
+        # Second pass: mark modules that use binop sources as input
+        # We need to mark the module that IMMEDIATELY FOLLOWS the binop source
+        # so it doesn't reuse the source's output variable
+        for i, module in enumerate(self.buml_model.modules):
+            # Check if this module takes input from a binop source module
+            if hasattr(module, 'name_module_input') and module.name_module_input:
+                if module.name_module_input in binop_source_modules:
+                    module.input_reused = True
+
+        # Third pass: set remaining params
         for i, module in enumerate(self.buml_model.modules):
             if isinstance(module, Layer) or hasattr(module, 'input_reused'):
                 set_remaining_params(
