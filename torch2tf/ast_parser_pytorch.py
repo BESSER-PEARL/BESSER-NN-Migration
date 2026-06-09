@@ -1416,8 +1416,8 @@ class ASTParserTorch(ASTParser):
         if base_layer is None:
             return base_var
 
-        # Check for no-op squeeze(0) on single-layer RNN hidden states before creating TensorOp
-        if op_type == 'squeeze':
+        # Check for no-op squeeze(0) or unsqueeze(0) on single-layer RNN hidden states before creating TensorOp
+        if op_type in ('squeeze', 'unsqueeze'):
             op_params = self._extract_inline_op_params(call_node, op_type)
             if (op_params.get('reduce_dim') == 0 and
                 base_layer and
@@ -1429,7 +1429,10 @@ class ASTParserTorch(ASTParser):
                 if (rnn_layer and
                     rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
                     (num_layers is None or num_layers == 1)):
-                    # No-op: return base variable, don't create TensorOp
+                    # No-op: update module_of_output mapping and return base variable
+                    output_var = self._extract_output_var_from_target(parent_node.targets[0])
+                    if output_var and base_layer:
+                        self.module_of_output[output_var] = base_layer
                     return base_var
 
         intermediate_var = self.TEMP_INLINE.format(op_type, self.tensor_op_counter)
@@ -1476,6 +1479,26 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but adds TensorOp to model and tracks output
         """
+        # Check for no-op squeeze(0) or unsqueeze(0) on single-layer RNN hidden states
+        tns_type = tensorop_param.get('tns_type')
+        if tns_type in ('squeeze', 'unsqueeze') and tensorop_param.get('reduce_dim') == 0:
+            # Check if operating on RNN hidden state
+            layers_of_tensors = tensorop_param.get('layers_of_tensors', [])
+            if layers_of_tensors:
+                base_layer = layers_of_tensors[0] if isinstance(layers_of_tensors[0], str) else None
+                if base_layer and (base_layer.endswith('__hidden') or base_layer.endswith('__cell')):
+                    rnn_layer_name = base_layer.replace('__hidden', '').replace('__cell', '')
+                    rnn_layer = self._get_layer_by_name(rnn_layer_name)
+                    num_layers = getattr(rnn_layer, 'num_layers', None) if rnn_layer else None
+                    if (rnn_layer and
+                        rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
+                        (num_layers is None or num_layers == 1)):
+                        # No-op: update module_of_output mapping and return without creating tensorop
+                        output_var = self._extract_output_var_from_target(node.targets[0])
+                        if output_var and base_layer:
+                            self.module_of_output[output_var] = base_layer
+                        return
+
         # Check if input variable is used multiple times - if so, mark input_reused=True
         if 'input_reused' not in tensorop_param or not tensorop_param['input_reused']:
             # Extract the input variable name from the call node
