@@ -2611,16 +2611,22 @@ class ASTParserTorch(ASTParser):
     def _extract_op_dropout(self, call_node, node, ops_args):
         """Extract F.dropout operation parameters."""
         p = 0.5
+        training_aware = False
 
         # Extract from keywords
         for kw in call_node.keywords:
             if kw.arg == 'p':
                 if isinstance(kw.value, ast.Constant):
                     p = kw.value.value
+            elif kw.arg == 'training':
+                # F.dropout with training parameter (e.g., training=self.training)
+                # means dropout should be training-aware
+                training_aware = True
 
         return {
             "tns_type": "dropout",
-            "dropout_rate": p
+            "dropout_rate": p,
+            "dropout_training_aware": training_aware
         }
 
     def _extract_op_zeros_like(self, call_node, op_args):
