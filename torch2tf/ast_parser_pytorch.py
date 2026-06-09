@@ -2386,10 +2386,10 @@ class ASTParserTorch(ASTParser):
             if indices and set(indices) == {-2, -1}:
                 return self._handle_bidirectional_concat_output(node, source_layer_name)
 
-        # For name-based patterns (h_forward, h_backward), don't skip - let it create TensorOp
-        # The template will already generate the automatic concat, but having the explicit one is fine
-        # elif all(isinstance(arg, ast.Name) for arg in ops_args):
-        #     return self._handle_bidirectional_concat_output(node, source_layer_name)
+        # For name-based patterns (h_forward, h_backward), also skip to avoid duplicate concat
+        # The template automatically generates concat for bidirectional RNN hidden states
+        if all(isinstance(arg, ast.Name) for arg in ops_args):
+            return self._handle_bidirectional_concat_output(node, source_layer_name)
 
         return False
 
