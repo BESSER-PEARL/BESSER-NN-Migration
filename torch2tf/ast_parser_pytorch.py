@@ -1499,21 +1499,37 @@ class ASTParserTorch(ASTParser):
                             self.module_of_output[output_var] = base_layer
                         return
 
-        # Check if input variable is used multiple times - if so, mark input_reused=True
-        if 'input_reused' not in tensorop_param or not tensorop_param['input_reused']:
-            # Extract the input variable name from the call node
-            input_var_name = None
-            if call_node and isinstance(call_node, ast.Call):
-                # For method calls like x.unsqueeze(), the object is in call_node.func.value
-                if isinstance(call_node.func, ast.Attribute) and isinstance(call_node.func.value, ast.Name):
-                    input_var_name = call_node.func.value.id
-                # For function calls like torch.squeeze(x), check first argument
-                elif call_node.args and isinstance(call_node.args[0], ast.Name):
-                    input_var_name = call_node.args[0].id
+        # TODO: Properly detect when an operation's INPUT is reused (branching), not just variable name reuse
+        # The current variable_usage_count counts ALL occurrences of a variable name in the method,
+        # which incorrectly flags sequential reassignments (x = F.op(x, ...); x = layer(x)) as "reuse".
+        #
+        # What we need: detect when the SAME TENSOR VALUE is used by multiple operations (branching):
+        #   Branching (should set input_reused=True):
+        #     x = conv(input)
+        #     y = fc1(x)  # x reused
+        #     z = fc2(x)  # x reused again
+        #
+        #   Sequential (should NOT set input_reused=True):
+        #     x = F.interpolate(x, ...)  # reassignment to same variable name
+        #     x = conv(x)                # different value, not reuse
+        #
+        # Proper implementation requires data flow analysis to track tensor values, not just variable names.
 
-            # If the input variable is used more than once in the forward method, mark input_reused=True
-            if input_var_name and self.variable_usage_count.get(input_var_name, 0) > 1:
-                tensorop_param['input_reused'] = True
+        # COMMENTED OUT - INCORRECT LOGIC (counts variable name occurrences, not tensor value reuse)
+        # if 'input_reused' not in tensorop_param or not tensorop_param['input_reused']:
+        #     # Extract the input variable name from the call node
+        #     input_var_name = None
+        #     if call_node and isinstance(call_node, ast.Call):
+        #         # Check first argument first (for function calls like F.interpolate(x, ...))
+        #         if call_node.args and isinstance(call_node.args[0], ast.Name):
+        #             input_var_name = call_node.args[0].id
+        #         # Fallback: for method calls like x.unsqueeze() with no args, use the object
+        #         elif isinstance(call_node.func, ast.Attribute) and isinstance(call_node.func.value, ast.Name):
+        #             input_var_name = call_node.func.value.id
+        #
+        #     # If the input variable is used more than once in the forward method, mark input_reused=True
+        #     if input_var_name and self.variable_usage_count.get(input_var_name, 0) > 1:
+        #         tensorop_param['input_reused'] = True
 
         op_name = f"op_{self.tensor_op_counter}"
         tensorop_param["name"] = op_name
