@@ -1354,11 +1354,17 @@ class ASTParserTorch(ASTParser):
                     isinstance(self.previous_assign.value.func.value, ast.Name) and
                     self.previous_assign.value.func.value.id != "self"):
                     ops_name = self.previous_assign.value.func.attr
-                    if ops_name == "permute":
+                    if ops_name in ["permute", "transpose"]:
                         lyrs = self.buml_model.layers
                         lyr_obj = next((obj for obj in lyrs if
                                         obj.name == lyr_name), None)
                         lyr_obj.permute_in = True
+                        # Update variable tracking when removing transpose
+                        # Map transpose output variable back to transpose input's source layer
+                        transpose_output_var = self.previous_assign.targets[0].id
+                        transpose_input_var = self.previous_assign.value.func.value.id
+                        if transpose_input_var in self.module_of_output:
+                            self.module_of_output[transpose_output_var] = self.module_of_output[transpose_input_var]
                         self.buml_model.tensor_ops.pop()
                         self.buml_model.modules.pop()
 
