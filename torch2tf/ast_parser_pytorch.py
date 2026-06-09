@@ -1485,9 +1485,11 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but adds TensorOp to model and tracks output
         """
-        # Check for no-op squeeze(0) or unsqueeze(0) on single-layer RNN hidden states
+        # Check for no-op squeeze(0) on single-layer RNN hidden states
+        # Only remove squeeze(0) which converts [1,B,H] to [B,H] (TF native format)
+        # Preserve unsqueeze(0) to maintain correct output shapes
         tns_type = tensorop_param.get('tns_type')
-        if tns_type in ('squeeze', 'unsqueeze') and tensorop_param.get('reduce_dim') == 0:
+        if tns_type == 'squeeze' and tensorop_param.get('reduce_dim') == 0:
             # Check if operating on RNN hidden state
             layers_of_tensors = tensorop_param.get('layers_of_tensors', [])
             if layers_of_tensors:
