@@ -900,11 +900,9 @@ class ASTParserTorch(ASTParser):
                 if len(node.value.args) > 1 and isinstance(node.value.args[1], ast.Tuple):
                     if len(node.value.args[1].elts) > 0 and isinstance(node.value.args[1].elts[0], ast.Name):
                         h_var = node.value.args[1].elts[0].id
-                        print(f"DEBUG: h_var={h_var}, in module_of_output={h_var in self.module_of_output}")
                         if h_var in self.module_of_output:
                             source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
                             module_obj.hx_source = source_module
-                            print(f"DEBUG: Set {module_name}.hx_source={source_module}")
                             # Mark source layer output as reused
                             source_layer = self._get_layer_by_name(source_module)
                             if source_layer:
@@ -917,6 +915,14 @@ class ASTParserTorch(ASTParser):
                 source_layer = self._get_layer_by_name(source_module)
                 if source_layer:
                     source_layer.input_reused = True
+                # If source is a tensorop, mark it as RNN initial state
+                # This will be used in TensorFlow generator to skip unsqueeze(0)
+                if source_module.startswith('op_'):
+                    # Find the tensorop in modules
+                    for mod in self.buml_model.modules:
+                        if hasattr(mod, 'name') and mod.name == source_module:
+                            mod.is_rnn_initial_state = True
+                            break
             # Reset for next RNN
             self._current_rnn_initial_hidden = None
 
