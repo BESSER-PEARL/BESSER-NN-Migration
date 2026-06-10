@@ -2219,6 +2219,13 @@ class ASTParserTorch(ASTParser):
         if tensorop_param == "flatten_created":
             return
 
+        # Handle training-aware dropout as a layer instead of tensorop
+        if (tensorop_param and
+            tensorop_param.get('tns_type') == 'dropout' and
+            tensorop_param.get('dropout_training_aware')):
+            self._create_dropout_layer(tensorop_param, node)
+            return
+
         if tensorop_param:
             self._create_and_track_tensorop(tensorop_param, call_node, node)
 
@@ -2641,6 +2648,42 @@ class ASTParserTorch(ASTParser):
             "dropout_rate": p,
             "dropout_training_aware": training_aware
         }
+
+    def _create_dropout_layer(self, tensorop_param, node):
+        """Create a Dropout layer from F.dropout with training parameter."""
+        # Generate layer name following convention (dropout_0, dropout_1, etc.)
+        dropout_name = f"dropout_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+
+        # Get input variable
+        input_var = None
+        if isinstance(node.value, ast.Call) and node.value.args:
+            if isinstance(node.value.args[0], ast.Name):
+                input_var = node.value.args[0].id
+
+        # Determine input source module
+        name_module_input = None
+        if input_var and input_var in self.module_of_output:
+            name_module_input = self.module_of_output[input_var]
+
+        # Create DropoutLayer using BUML
+        layer_obj = getattr(mm_classes, "DropoutLayer")(
+            name=dropout_name,
+            rate=tensorop_param.get('dropout_rate', 0.5)
+        )
+
+        # Set input source if available
+        if name_module_input:
+            layer_obj.name_module_input = name_module_input
+
+        # Add layer to model and tracking
+        self._add_layer_with_tracking(layer_obj)
+
+        # Track output mapping
+        output_var = self._extract_output_var_from_target(node.targets[0])
+        if output_var:
+            self.module_of_output[output_var] = dropout_name
+            self.prev_layer_output = output_var
 
     def _extract_op_zeros_like(self, call_node, op_args):
         """Extract zeros_like operation parameters."""
