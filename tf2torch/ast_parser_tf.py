@@ -1219,6 +1219,23 @@ class ASTParserTF(ASTParser):
         for elt in node.value.args[0].elts:
             if isinstance(elt, ast.Call):
                 lyr_type, lyr_params = self.extract_layer(elt)
+
+                # Handle activation layers (ReLU, Sigmoid, etc.)
+                if lyr_type in actv_fun_mapping:
+                    actv_func = actv_fun_mapping[lyr_type]
+                    # Check if previous layer supports inline activation
+                    if subnn.layers and hasattr(subnn.layers[-1], 'actv_func'):
+                        subnn.layers[-1].actv_func = actv_func
+                    else:
+                        # Create standalone activation layer
+                        actv_layer = getattr(mm_classes, "GeneralLayer")(
+                            name=f"layer_{layer_id}",
+                            actv_func=actv_func
+                        )
+                        subnn.add_layer(actv_layer)
+                        layer_id += 1
+                    continue
+
                 if len(elt.args)>0: #rnn bidirectional
                     if (isinstance(elt.args[0], ast.Call) and
                         isinstance(elt.func, ast.Attribute)):
