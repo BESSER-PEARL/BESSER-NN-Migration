@@ -2211,6 +2211,12 @@ class ASTParserTF(ASTParser):
         else:
             print(f"{op_type} is not recognized!")
 
+        # Handle dropout as a layer instead of tensorop
+        if (tensorop_param and
+            tensorop_param.get('tns_type') == 'dropout'):
+            self._create_dropout_layer(tensorop_param, node)
+            return
+
         if tensorop_param:
             op_name = f"op_{self.tensor_op_counter}"
             tensorop_param["name"] = op_name
@@ -2222,6 +2228,35 @@ class ASTParserTF(ASTParser):
             if hasattr(node, 'targets') and len(node.targets) > 0:
                 target_var = node.targets[0].id
                 self.module_of_output[target_var] = op_name
+
+    def _create_dropout_layer(self, tensorop_param, node):
+        """Create a Dropout layer from tf.nn.dropout."""
+        # Generate layer name following convention
+        dropout_name = f"dropout_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+
+        # Get source layers from tensorop_param
+        source_layers = tensorop_param.get('layers_of_tensors', [])
+        name_module_input = source_layers[0] if source_layers else None
+
+        # Create DropoutLayer using BUML
+        layer_obj = getattr(mm_classes, "DropoutLayer")(
+            name=dropout_name,
+            rate=tensorop_param.get('dropout_rate', 0.5)
+        )
+
+        # Set input source if available
+        if name_module_input:
+            layer_obj.name_module_input = name_module_input
+
+        # Add layer and track output
+        self.buml_model.add_layer(layer_obj)
+        self.buml_model.modules.append(layer_obj)
+
+        # Track output variable
+        if hasattr(node, 'targets') and len(node.targets) > 0:
+            output_var = node.targets[0].id
+            self.module_of_output[output_var] = dropout_name
 
     def handle_outer_attribute_assignment(self, node: ast.Assign):
         """
