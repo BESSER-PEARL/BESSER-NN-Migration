@@ -1507,12 +1507,11 @@ class ASTParserTorch(ASTParser):
                     if (rnn_layer and
                         rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
                         (num_layers is None or num_layers == 1)):
-                        # No-op but still create tensorop for variable assignment in generated code
-                        # This ensures variables like h_squeezed appear in the output
+                        # No-op: update module_of_output mapping and return without creating tensorop
                         output_var = self._extract_output_var_from_target(node.targets[0])
                         if output_var and base_layer:
                             self.module_of_output[output_var] = base_layer
-                        # Continue to create tensorop, mark it after creation
+                        return
 
         # Mark if this is a no-op squeeze (will be handled before creating TensorOp)
         is_noop_squeeze = (tns_type == 'squeeze' and
@@ -1540,9 +1539,16 @@ class ASTParserTorch(ASTParser):
         tensorop_param["name"] = op_name
         tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
 
-        # Mark no-op squeeze operations
-        if is_noop_squeeze:
-            tns_obj.is_noop = True
+        # Check if this is unsqueeze(0) operating on RNN hidden state
+        # When squeeze(0) was skipped (no-op), unsqueeze(0) should also be skipped
+        # to maintain semantic equivalence between PyTorch [1,B,H] and TensorFlow [B,H]
+        if tns_type == 'unsqueeze' and tensorop_param.get('reduce_dim') == 0:
+            layers_of_tensors = tensorop_param.get('layers_of_tensors', [])
+            if layers_of_tensors and isinstance(layers_of_tensors[0], str):
+                source_var = layers_of_tensors[0]
+                # Check if source is RNN hidden state (squeeze was skipped)
+                if source_var.endswith('__hidden') or source_var.endswith('__cell'):
+                    tns_obj.is_rnn_initial_state = True
 
         self.buml_model.add_tensor_op(tns_obj)
         self.tensor_op_counter += 1
