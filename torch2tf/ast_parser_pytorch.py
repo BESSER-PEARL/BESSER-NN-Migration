@@ -1507,47 +1507,43 @@ class ASTParserTorch(ASTParser):
                     if (rnn_layer and
                         rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
                         (num_layers is None or num_layers == 1)):
-                        # No-op: update module_of_output mapping and return without creating tensorop
+                        # No-op but still create tensorop for variable assignment in generated code
+                        # This ensures variables like h_squeezed appear in the output
                         output_var = self._extract_output_var_from_target(node.targets[0])
                         if output_var and base_layer:
                             self.module_of_output[output_var] = base_layer
-                        return
+                        # Continue to create tensorop, mark it after creation
 
-        # TODO: Properly detect when an operation's INPUT is reused (branching), not just variable name reuse
-        # The current variable_usage_count counts ALL occurrences of a variable name in the method,
-        # which incorrectly flags sequential reassignments (x = F.op(x, ...); x = layer(x)) as "reuse".
-        #
-        # What we need: detect when the SAME TENSOR VALUE is used by multiple operations (branching):
-        #   Branching (should set input_reused=True):
-        #     x = conv(input)
-        #     y = fc1(x)  # x reused
-        #     z = fc2(x)  # x reused again
-        #
-        #   Sequential (should NOT set input_reused=True):
-        #     x = F.interpolate(x, ...)  # reassignment to same variable name
-        #     x = conv(x)                # different value, not reuse
-        #
-        # Proper implementation requires data flow analysis to track tensor values, not just variable names.
-
-        # COMMENTED OUT - INCORRECT LOGIC (counts variable name occurrences, not tensor value reuse)
-        # if 'input_reused' not in tensorop_param or not tensorop_param['input_reused']:
-        #     # Extract the input variable name from the call node
-        #     input_var_name = None
-        #     if call_node and isinstance(call_node, ast.Call):
-        #         # Check first argument first (for function calls like F.interpolate(x, ...))
-        #         if call_node.args and isinstance(call_node.args[0], ast.Name):
-        #             input_var_name = call_node.args[0].id
-        #         # Fallback: for method calls like x.unsqueeze() with no args, use the object
-        #         elif isinstance(call_node.func, ast.Attribute) and isinstance(call_node.func.value, ast.Name):
-        #             input_var_name = call_node.func.value.id
-        #
-        #     # If the input variable is used more than once in the forward method, mark input_reused=True
-        #     if input_var_name and self.variable_usage_count.get(input_var_name, 0) > 1:
-        #         tensorop_param['input_reused'] = True
+        # Mark if this is a no-op squeeze (will be handled before creating TensorOp)
+        is_noop_squeeze = (tns_type == 'squeeze' and
+                          tensorop_param.get('reduce_dim') == 0 and
+                          tensorop_param.get('layers_of_tensors') and
+                          len(tensorop_param['layers_of_tensors']) > 0)
+        if is_noop_squeeze:
+            base_layer = tensorop_param['layers_of_tensors'][0]
+            if isinstance(base_layer, str) and (base_layer.endswith('__hidden') or base_layer.endswith('__cell')):
+                rnn_layer_name = base_layer.replace('__hidden', '').replace('__cell', '')
+                rnn_layer = self._get_layer_by_name(rnn_layer_name)
+                num_layers = getattr(rnn_layer, 'num_layers', None) if rnn_layer else None
+                if (rnn_layer and
+                    rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
+                    (num_layers is None or num_layers == 1)):
+                    is_noop_squeeze = True
+                else:
+                    is_noop_squeeze = False
+            else:
+                is_noop_squeeze = False
+        else:
+            is_noop_squeeze = False
 
         op_name = f"op_{self.tensor_op_counter}"
         tensorop_param["name"] = op_name
         tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+
+        # Mark no-op squeeze operations
+        if is_noop_squeeze:
+            tns_obj.is_noop = True
+
         self.buml_model.add_tensor_op(tns_obj)
         self.tensor_op_counter += 1
 
@@ -1561,6 +1557,10 @@ class ASTParserTorch(ASTParser):
         output_var = self._extract_output_var_from_target(node.targets[0])
         if output_var:
             self.module_of_output[output_var] = op_name
+            # Store actual variable name in inputs_outputs for generator to use
+            # This ensures h_squeezed appears in output, not just op_1
+            input_var = self._extract_tensorop_input_var(call_node, node)
+            self.inputs_outputs[op_name] = [input_var, output_var]
             # Update prev_layer_output so next operation can detect branching
             self.prev_layer_output = output_var
 
