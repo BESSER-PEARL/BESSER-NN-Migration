@@ -1491,64 +1491,17 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but adds TensorOp to model and tracks output
         """
-        # Check for no-op squeeze(0) on single-layer RNN hidden states
-        # Only remove squeeze(0) which converts [1,B,H] to [B,H] (TF native format)
-        # Preserve unsqueeze(0) to maintain correct output shapes
-        tns_type = tensorop_param.get('tns_type')
-        if tns_type == 'squeeze' and tensorop_param.get('reduce_dim') == 0:
-            # Check if operating on RNN hidden state
-            layers_of_tensors = tensorop_param.get('layers_of_tensors', [])
-            if layers_of_tensors:
-                base_layer = layers_of_tensors[0] if isinstance(layers_of_tensors[0], str) else None
-                if base_layer and (base_layer.endswith('__hidden') or base_layer.endswith('__cell')):
-                    rnn_layer_name = base_layer.replace('__hidden', '').replace('__cell', '')
-                    rnn_layer = self._get_layer_by_name(rnn_layer_name)
-                    num_layers = getattr(rnn_layer, 'num_layers', None) if rnn_layer else None
-                    if (rnn_layer and
-                        rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
-                        (num_layers is None or num_layers == 1)):
-                        # No-op: update module_of_output mapping and return without creating tensorop
-                        output_var = self._extract_output_var_from_target(node.targets[0])
-                        if output_var and base_layer:
-                            self.module_of_output[output_var] = base_layer
-                        return
-
-        # Mark if this is a no-op squeeze (will be handled before creating TensorOp)
-        is_noop_squeeze = (tns_type == 'squeeze' and
-                          tensorop_param.get('reduce_dim') == 0 and
-                          tensorop_param.get('layers_of_tensors') and
-                          len(tensorop_param['layers_of_tensors']) > 0)
-        if is_noop_squeeze:
-            base_layer = tensorop_param['layers_of_tensors'][0]
-            if isinstance(base_layer, str) and (base_layer.endswith('__hidden') or base_layer.endswith('__cell')):
-                rnn_layer_name = base_layer.replace('__hidden', '').replace('__cell', '')
-                rnn_layer = self._get_layer_by_name(rnn_layer_name)
-                num_layers = getattr(rnn_layer, 'num_layers', None) if rnn_layer else None
-                if (rnn_layer and
-                    rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
-                    (num_layers is None or num_layers == 1)):
-                    is_noop_squeeze = True
-                else:
-                    is_noop_squeeze = False
-            else:
-                is_noop_squeeze = False
-        else:
-            is_noop_squeeze = False
+        # Note: We used to skip squeeze(0) on RNN hidden states, but this causes shape mismatches
+        # when the squeezed value is later unsqueezed and used. TensorFlow will handle squeeze(0)
+        # on [B,H] as a no-op automatically, so we should generate both squeeze and unsqueeze.
 
         op_name = f"op_{self.tensor_op_counter}"
         tensorop_param["name"] = op_name
         tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
 
-        # Check if this is unsqueeze(0) operating on RNN hidden state
-        # When squeeze(0) was skipped (no-op), unsqueeze(0) should also be skipped
-        # to maintain semantic equivalence between PyTorch [1,B,H] and TensorFlow [B,H]
-        if tns_type == 'unsqueeze' and tensorop_param.get('reduce_dim') == 0:
-            layers_of_tensors = tensorop_param.get('layers_of_tensors', [])
-            if layers_of_tensors and isinstance(layers_of_tensors[0], str):
-                source_var = layers_of_tensors[0]
-                # Check if source is RNN hidden state (squeeze was skipped)
-                if source_var.endswith('__hidden') or source_var.endswith('__cell'):
-                    tns_obj.is_rnn_initial_state = True
+        # Note: is_rnn_initial_state flag is set later when we detect this tensorop
+        # is used as hx_source for an RNN layer (see handle_rnn_layer)
+        # Don't mark unsqueeze as skippable just because it operates on RNN hidden state
 
         self.buml_model.add_tensor_op(tns_obj)
         self.tensor_op_counter += 1
