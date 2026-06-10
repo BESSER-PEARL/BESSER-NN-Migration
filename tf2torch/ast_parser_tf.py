@@ -1132,62 +1132,68 @@ class ASTParserTF(ASTParser):
                 self.handle_sequential_layers(node, module_name)
 
         #simple calls to layers
-        if (isinstance(node.value, ast.Call) and
+        elif (isinstance(node.value, ast.Call) and
             isinstance(node.value.func, ast.Attribute)):
-            lyr_type, lyr_params = self.extract_layer(node.value)
-
-            # Handle standalone activation layers (layers.ReLU, layers.Activation, etc.)
-            if lyr_type in actv_fun_mapping:
-                # Store activation function for later use in forward pass
-                if lyr_type == "Activation":
-                    # layers.Activation('relu') - extract activation name from first arg
-                    if len(node.value.args) > 0 and isinstance(node.value.args[0], ast.Constant):
-                        actv_name = node.value.args[0].value
-                    else:
-                        actv_name = "relu"  # default
-                    self.activation_functions[module_name] = actv_name
-                else:
-                    # layers.ReLU(), layers.Sigmoid(), etc.
-                    self.activation_functions[module_name] = actv_fun_mapping[lyr_type]
-                # Skip the rest of layer processing for activations
+            # Check for tf.keras.Sequential
+            if (hasattr(node.value.func, 'attr') and
+                node.value.func.attr == "Sequential"):
+                self.handle_sequential_layers(node, module_name)
+                # Don't return - let modules.clear() execute below
             else:
-                # Regular layer processing
+                lyr_type, lyr_params = self.extract_layer(node.value)
 
-                if len(node.value.args)>0: #rnn bidirectional
-                    if (isinstance(node.value.args[0], ast.Call) and
-                        node.value.func.attr == "Bidirectional"):
-                        lyr = node.value.args[0]
-                        lyr_type, lyr_params = self.extract_layer(lyr)
-                        lyr_params["bidirectional"] = True
+                # Handle standalone activation layers (layers.ReLU, layers.Activation, etc.)
+                if lyr_type in actv_fun_mapping:
+                    # Store activation function for later use in forward pass
+                    if lyr_type == "Activation":
+                        # layers.Activation('relu') - extract activation name from first arg
+                        if len(node.value.args) > 0 and isinstance(node.value.args[0], ast.Constant):
+                            actv_name = node.value.args[0].value
+                        else:
+                            actv_name = "relu"  # default
+                        self.activation_functions[module_name] = actv_name
+                    else:
+                        # layers.ReLU(), layers.Sigmoid(), etc.
+                        self.activation_functions[module_name] = actv_fun_mapping[lyr_type]
+                    # Skip the rest of layer processing for activations
+                else:
+                    # Regular layer processing
 
-                lyr_type, lyr_params, padding_amount, dropout_rate, has_recurrent_dropout = transform_layer(
-                    lyr_type, lyr_params, self.padding_amount, module_name
-                )
+                    if len(node.value.args)>0: #rnn bidirectional
+                        if (isinstance(node.value.args[0], ast.Call) and
+                            node.value.func.attr == "Bidirectional"):
+                            lyr = node.value.args[0]
+                            lyr_type, lyr_params = self.extract_layer(lyr)
+                            lyr_params["bidirectional"] = True
 
-                self.padding_amount = padding_amount
+                    lyr_type, lyr_params, padding_amount, dropout_rate, has_recurrent_dropout = transform_layer(
+                        lyr_type, lyr_params, self.padding_amount, module_name
+                    )
 
-                # Warn about recurrent_dropout having no PyTorch equivalent
-                if has_recurrent_dropout:
-                    print(f"WARNING: TensorFlow layer '{module_name}' has recurrent_dropout parameter, "
-                          f"which has no equivalent in PyTorch LSTM/GRU/SimpleRNN. This parameter is not migrated.")
+                    self.padding_amount = padding_amount
 
-                if not lyr_type.startswith("ZeroPadding"):
-                    # Add Dropout layer to __init__ if dropout param was present
-                    if dropout_rate is not None:
-                        dropout_layer_name = f"{module_name}_dropout"
-                        dropout_layer = getattr(mm_classes, "DropoutLayer")(
-                            name=dropout_layer_name,
-                            rate=dropout_rate
-                        )
-                        self.buml_model.add_layer(dropout_layer)
+                    # Warn about recurrent_dropout having no PyTorch equivalent
+                    if has_recurrent_dropout:
+                        print(f"WARNING: TensorFlow layer '{module_name}' has recurrent_dropout parameter, "
+                              f"which has no equivalent in PyTorch LSTM/GRU/SimpleRNN. This parameter is not migrated.")
 
-                    # Infer BatchNorm params from previous layers if needed
-                    if lyr_type == "BatchNormLayer":
-                        inferred_params = infer_batchnorm_params(self.buml_model)
-                        lyr_params.update(inferred_params)
+                    if not lyr_type.startswith("ZeroPadding"):
+                        # Add Dropout layer to __init__ if dropout param was present
+                        if dropout_rate is not None:
+                            dropout_layer_name = f"{module_name}_dropout"
+                            dropout_layer = getattr(mm_classes, "DropoutLayer")(
+                                name=dropout_layer_name,
+                                rate=dropout_rate
+                            )
+                            self.buml_model.add_layer(dropout_layer)
 
-                    buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-                    self.buml_model.add_layer(buml_layer)
+                        # Infer BatchNorm params from previous layers if needed
+                        if lyr_type == "BatchNormLayer":
+                            inferred_params = infer_batchnorm_params(self.buml_model)
+                            lyr_params.update(inferred_params)
+
+                        buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+                        self.buml_model.add_layer(buml_layer)
 
         #to get the proper order from forward the method
         self.buml_model.modules.clear()
