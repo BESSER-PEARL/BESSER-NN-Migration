@@ -2357,7 +2357,8 @@ class ASTParserTorch(ASTParser):
         """Track output variable for bidirectional concat."""
         output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
         if output_var:
-            self.module_of_output[output_var] = "bidirectional_concat_" + source_layer_name
+            concat_module = "bidirectional_concat_" + source_layer_name
+            self.module_of_output[output_var] = concat_module
         return output_var is not None
 
     def _check_bidirectional_rnn_concat(self, ops_args, layers_of_tensors, node):
