@@ -819,7 +819,6 @@ class ASTParserTF(ASTParser):
         if module_obj and hasattr(self, '_current_rnn_initial_hidden_source') and self._current_rnn_initial_hidden_source:
             # Store reference to source layer as RNN attribute
             module_obj.hx_source = self._current_rnn_initial_hidden_source
-            print(f"DEBUG: Set {module_name}.hx_source = {self._current_rnn_initial_hidden_source}")
 
         # Mark input_reused when RNN input differs from previous layer output
         # This ensures unique variable names for multiple RNNs using the same input
@@ -960,10 +959,8 @@ class ASTParserTF(ASTParser):
         # Check for initial_state keyword argument (TensorFlow pattern)
         self._current_rnn_initial_hidden = None
         self._current_rnn_initial_hidden_source = None
-        print(f"DEBUG: Checking keywords: {[kw.arg for kw in node.value.keywords]}")
         for kw in node.value.keywords:
             if kw.arg == "initial_state":
-                print(f"DEBUG: Found initial_state keyword!")
                 if isinstance(kw.value, ast.List):
                     # LSTM case: initial_state=[h, c]
                     # Need to find which layer produced these variables
@@ -1518,9 +1515,7 @@ class ASTParserTF(ASTParser):
         if not h_var or h_var not in self.module_of_output:
             return
 
-        print(f"DEBUG: h_var={h_var}, in module_of_output: True")
         source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
-        print(f"DEBUG: module_of_output[{h_var}] = {self.module_of_output[h_var]} -> source={source_module}")
         module_obj.hx_source = source_module
 
         # Mark source layer output as reused
@@ -1530,8 +1525,6 @@ class ASTParserTF(ASTParser):
             if not hasattr(self, '_reserved_tf_vars'):
                 self._reserved_tf_vars = set()
             self._reserved_tf_vars.add(h_var)
-            print(f"DEBUG: Marked {source_module}.input_reused = True, reserved={h_var}")
-        print(f"DEBUG: Set {module_name}.hx_source = {source_module}, return_type={module_obj.return_type}")
 
     def _set_module_input(self, module_obj, input_var):
         """Set name_module_input for a module based on input variable."""
@@ -1557,7 +1550,6 @@ class ASTParserTF(ASTParser):
         if isinstance(node.value.func.value, ast.Name):
             if node.value.func.value.id == "self":
                 module_name = node.value.func.attr
-                print(f"DEBUG process_single_call: module_name={module_name}, keywords={[kw.arg for kw in node.value.keywords]}")
                 #populate inputs_outputs and module_of_output
                 # Handle different argument types (Name, Call, etc.)
                 if node.value.args:
@@ -2150,11 +2142,17 @@ class ASTParserTF(ASTParser):
             self.module_of_output[output_var] = layers_of_tensors[0]
             return None
 
+        # Check if concat output variable is different from input variables
+        # If so, set input_reused to get a unique output variable name
+        output_var = node.targets[0].id
+        input_reused = output_var not in actual_vars
+
         return {
             "tns_type": "concatenate",
             "layers_of_tensors": layers_of_tensors,
             "concatenate_dim": cat_dim,
-            "actual_vars": var_types
+            "actual_vars": var_types,
+            "input_reused": input_reused
         }
 
     def extract_tensorop(self, node: ast.Assign):
