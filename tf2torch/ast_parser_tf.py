@@ -2619,27 +2619,53 @@ def process_params(lyr_type: str, lyr_params: dict):
 def set_conv_padding(layer_type, lyr_params, padding_amount):
     """
     If padding is used before conv layers, its amount is stored in
-    the 'padding_amount' attribute. This function adds the padding 
-    to the conv layer.
+    the 'padding_amount' attribute. This function adds the padding
+    to the conv layer. Also handles conversion of TF padding='same'
+    to PyTorch numeric padding.
 
     Parameters:
         lyr_type (str): The type of the layer (TensorFlow).
         lyr_params (dict): A dictionnary storing the layer parameters and
             their values.
-        padding_amount (int | None): It  keeps track of padding in 
-            ZeroPadding layer. In TF, padding is added to conv layers 
+        padding_amount (int | None): It  keeps track of padding in
+            ZeroPadding layer. In TF, padding is added to conv layers
             using a separate layer, but in PyTorch and BUML it is defined
             as an attribute of the conv layer.
 
     Returns:
-        The type of the layer and its parameters in BUML. 
+        The type of the layer and its parameters in BUML.
     """
 
 
     if layer_type.startswith("ZeroPadding"):
         padding_amount = lyr_params["padding"]
-    elif layer_type.startswith("Conv"):
-        if padding_amount is not None:
+    elif layer_type.startswith("Conv") or layer_type.startswith("MaxPooling") or layer_type.startswith("AveragePooling"):
+        # Handle TF padding='same' -> calculate PyTorch padding amount
+        # Note: At this point params haven't been mapped yet, so use TF names
+        if "padding" in lyr_params and lyr_params["padding"] == "same":
+            # For 'same' padding with stride=1: padding = (kernel_size - 1) // 2
+            # This formula works for most common cases
+            # Use pool_size for pooling layers, kernel_size for conv layers
+            size_param = "pool_size" if layer_type.startswith(("MaxPooling", "AveragePooling")) else "kernel_size"
+            if size_param in lyr_params:
+                size_value = lyr_params[size_param]
+                # Calculate padding for each dimension
+                if isinstance(size_value, list):
+                    padding = [(k - 1) // 2 for k in size_value]
+                    # If all dimensions have same padding, use single value
+                    if len(set(padding)) == 1:
+                        padding = padding[0]
+                else:
+                    padding = (size_value - 1) // 2
+                lyr_params["padding_amount"] = padding
+                # Remove padding since we converted to padding_amount
+                del lyr_params["padding"]
+        # Handle padding='valid' -> padding=0
+        elif "padding" in lyr_params and lyr_params["padding"] == "valid":
+            lyr_params["padding_amount"] = 0
+            del lyr_params["padding"]
+        # Handle ZeroPadding before conv
+        elif padding_amount is not None:
             lyr_params["padding_amount"] = padding_amount
             padding_amount = None
 
