@@ -67,6 +67,39 @@ def infer_batchnorm_params(buml_model):
     return {"dimension": "1D", "num_features": 1}
 
 
+def infer_layernorm_params(buml_model):
+    """
+    Infer LayerNormalization normalized_shape from previous layers.
+
+    LayerNorm normalizes over the last dimension(s). We infer the shape
+    from the output of the previous layer.
+
+    Parameters:
+        buml_model: The BUML model with already added layers.
+
+    Returns:
+        dict with 'normalized_shape' param as a list.
+    """
+    # Search backwards through layers for the most recent layer with output shape
+    for layer in reversed(buml_model.layers):
+        layer_class = layer.__class__.__name__
+
+        # For RNN layers, use hidden_size
+        if layer_class in ["SimpleRNNLayer", "LSTMLayer", "GRULayer"]:
+            return {"normalized_shape": [layer.hidden_size]}
+
+        # For Linear/Dense layers, use out_features
+        if layer_class == "LinearLayer":
+            return {"normalized_shape": [layer.out_features]}
+
+        # For Conv layers, use out_channels
+        if layer_class in ["Conv1D", "Conv2D", "Conv3D"]:
+            return {"normalized_shape": [layer.out_channels]}
+
+    # Default: will be inferred dynamically at runtime
+    return {"normalized_shape": [1]}
+
+
 class ASTParserTF(ASTParser):
     """
     Class visiting and parsing TensorFlow code AST
@@ -1195,6 +1228,11 @@ class ASTParserTF(ASTParser):
                             inferred_params = infer_batchnorm_params(self.buml_model)
                             lyr_params.update(inferred_params)
 
+                        # Infer LayerNorm params from previous layers if needed
+                        if lyr_type == "LayerNormLayer":
+                            inferred_params = infer_layernorm_params(self.buml_model)
+                            lyr_params.update(inferred_params)
+
                         buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
                         self.buml_model.add_layer(buml_layer)
 
@@ -1273,6 +1311,11 @@ class ASTParserTF(ASTParser):
                     # Infer BatchNorm params from previous layers if needed
                     if lyr_type == "BatchNormLayer":
                         inferred_params = infer_batchnorm_params(subnn)
+                        lyr_params.update(inferred_params)
+
+                    # Infer LayerNorm params from previous layers if needed
+                    if lyr_type == "LayerNormLayer":
+                        inferred_params = infer_layernorm_params(subnn)
                         lyr_params.update(inferred_params)
 
                     subnn_layer = getattr(mm_classes, lyr_type)(**lyr_params)
