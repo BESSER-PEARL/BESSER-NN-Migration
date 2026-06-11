@@ -1818,10 +1818,12 @@ class ASTParserTF(ASTParser):
         """Extract reduce_max tensorop parameters."""
         # Extract dimension parameter
         reduce_dim = None
+        keepdims = False
         for kw in node.value.keywords:
             if kw.arg == "axis":
                 reduce_dim = self.param_value(kw.value)
-                break
+            elif kw.arg == "keepdims":
+                keepdims = self.param_value(kw.value)
 
         if reduce_dim is None:
             self.migration_warnings.append(
@@ -1836,6 +1838,7 @@ class ASTParserTF(ASTParser):
         return {
             "tns_type": "max",
             "reduce_dim": reduce_dim,
+            "reduce_keepdims": keepdims,
             "layers_of_tensors": source_layers
         }
 
