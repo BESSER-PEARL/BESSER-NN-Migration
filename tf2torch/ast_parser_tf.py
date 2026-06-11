@@ -1258,6 +1258,27 @@ class ASTParserTF(ASTParser):
             if isinstance(elt, ast.Call):
                 lyr_type, lyr_params = self.extract_layer(elt)
 
+                # Handle nested Sequential
+                if lyr_type == "Sequential":
+                    # Create a synthetic node for nested Sequential
+                    nested_seq_name = f"{seq_name}_nested_{layer_id}"
+                    # Recursively process nested Sequential
+                    nested_node = ast.Assign(targets=[ast.Name(id=nested_seq_name)], value=elt)
+                    self.handle_sequential_layers(nested_node, nested_seq_name)
+                    # Get the nested subnn that was just created and flatten its layers into parent
+                    nested_subnn = next((obj for obj in self.buml_model.sub_nns if
+                                        obj.name == nested_seq_name), None)
+                    if nested_subnn:
+                        # Flatten: add nested Sequential's layers directly to parent Sequential
+                        # Rename layers to avoid conflicts and update layer_id counter
+                        for nested_layer in nested_subnn.layers:
+                            nested_layer.name = f"layer_{layer_id}"
+                            subnn.add_layer(nested_layer)
+                            layer_id += 1
+                        # Remove the nested subnn from model since we flattened it
+                        self.buml_model.sub_nns.remove(nested_subnn)
+                    continue
+
                 # Handle activation layers (ReLU, Sigmoid, etc.)
                 if lyr_type in actv_fun_mapping:
                     actv_func = actv_fun_mapping[lyr_type]
