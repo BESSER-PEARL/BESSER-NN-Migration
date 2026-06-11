@@ -2310,7 +2310,7 @@ class ASTParserTF(ASTParser):
         It permutes input and output of cnn layers if needed
         to make pytorch and tensorflow equivalent.
         """
-        cnns = ["Conv1D", "Conv2D", "Conv3D", "PoolingLayer"]
+        cnns = ["Conv1D", "Conv2D", "Conv3D", "PoolingLayer", "BatchNormLayer"]
         bml_modules = self.buml_model.modules
 
         def iterate_and_permute(modules):
