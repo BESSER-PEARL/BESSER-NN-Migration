@@ -1694,6 +1694,367 @@ class ASTParserTF(ASTParser):
         if not merged:
             self._create_standalone_activation(node, module_name)
 
+    def _extract_source_variable(self, op_args, node, op_type):
+        """
+        Extract source variable from tensorop arguments.
+
+        Returns:
+            list: Source layers, or None if extraction failed
+        """
+        if len(op_args) == 0:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: {op_type} requires an input tensor."
+            )
+            return None
+
+        if not isinstance(op_args[0], ast.Name):
+            self.migration_warnings.append(
+                f"Line {node.lineno}: {op_type} operand type not supported."
+            )
+            return None
+
+        source_var = op_args[0].id
+        if source_var in self.module_of_output:
+            return [self.module_of_output[source_var]]
+        elif source_var == 'x':
+            return ['INPUT']
+        else:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: {op_type} source variable '{source_var}' not found."
+            )
+            return None
+
+    def _extract_zeros_like(self, node, op_args):
+        """Extract zeros_like tensorop parameters."""
+        source_layers = self._extract_source_variable(op_args, node, "zeros_like")
+        if source_layers is None:
+            return None
+
+        return {
+            "tns_type": "zeros_like",
+            "layers_of_tensors": source_layers,
+            "input_reused": True
+        }
+
+    def _extract_squeeze(self, node, op_args):
+        """Extract squeeze tensorop parameters."""
+        # Extract dimension parameter (optional)
+        reduce_dim = None
+        for kw in node.value.keywords:
+            if kw.arg == "axis":
+                reduce_dim = self.param_value(kw.value)
+                break
+
+        source_layers = self._extract_source_variable(op_args, node, "squeeze")
+        if source_layers is None:
+            return None
+
+        return {
+            "tns_type": "squeeze",
+            "reduce_dim": reduce_dim,
+            "layers_of_tensors": source_layers,
+            "input_reused": True
+        }
+
+    def _extract_expand_dims(self, node, op_args):
+        """Extract expand_dims tensorop parameters."""
+        # Extract dimension parameter (required)
+        reduce_dim = None
+        for kw in node.value.keywords:
+            if kw.arg == "axis":
+                reduce_dim = self.param_value(kw.value)
+                break
+
+        # axis can also be positional (second argument)
+        if reduce_dim is None and len(op_args) > 1:
+            reduce_dim = self.param_value(op_args[1])
+
+        if reduce_dim is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: expand_dims requires an 'axis' parameter."
+            )
+            return None
+
+        source_layers = self._extract_source_variable(op_args, node, "expand_dims")
+        if source_layers is None:
+            return None
+
+        return {
+            "tns_type": "unsqueeze",
+            "reduce_dim": reduce_dim,
+            "layers_of_tensors": source_layers,
+            "input_reused": True
+        }
+
+    def _extract_reduce_mean(self, node, op_args):
+        """Extract reduce_mean tensorop parameters."""
+        # Extract dimension parameter
+        reduce_dim = None
+        for kw in node.value.keywords:
+            if kw.arg == "axis":
+                reduce_dim = self.param_value(kw.value)
+                break
+
+        if reduce_dim is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: reduce_mean requires an 'axis' parameter."
+            )
+            return None
+
+        source_layers = self._extract_source_variable(op_args, node, "reduce_mean")
+        if source_layers is None:
+            return None
+
+        return {
+            "tns_type": "mean",
+            "reduce_dim": reduce_dim,
+            "layers_of_tensors": source_layers
+        }
+
+    def _extract_reduce_max(self, node, op_args):
+        """Extract reduce_max tensorop parameters."""
+        # Extract dimension parameter
+        reduce_dim = None
+        for kw in node.value.keywords:
+            if kw.arg == "axis":
+                reduce_dim = self.param_value(kw.value)
+                break
+
+        if reduce_dim is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: reduce_max requires an 'axis' parameter."
+            )
+            return None
+
+        source_layers = self._extract_source_variable(op_args, node, "reduce_max")
+        if source_layers is None:
+            return None
+
+        return {
+            "tns_type": "max",
+            "reduce_dim": reduce_dim,
+            "layers_of_tensors": source_layers
+        }
+
+    def _extract_l2_normalize(self, node, op_args):
+        """Extract l2_normalize tensorop parameters."""
+        # Extract dimension parameter
+        reduce_dim = None
+        for kw in node.value.keywords:
+            if kw.arg == "axis":
+                reduce_dim = self.param_value(kw.value)
+                break
+
+        if reduce_dim is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: l2_normalize requires an 'axis' parameter."
+            )
+            return None
+
+        source_layers = self._extract_source_variable(op_args, node, "l2_normalize")
+        if source_layers is None:
+            return None
+
+        return {
+            "tns_type": "normalize",
+            "reduce_dim": reduce_dim,
+            "layers_of_tensors": source_layers,
+            "input_reused": True
+        }
+
+    def _extract_tile(self, node, op_args):
+        """Extract tile tensorop parameters."""
+        # Extract multiples/repeat counts
+        repeat_counts = []
+        if len(op_args) > 1:
+            multiples_arg = op_args[1]
+            if isinstance(multiples_arg, (ast.List, ast.Tuple)):
+                for elt in multiples_arg.elts:
+                    repeat_counts.append(self.param_value(elt))
+            else:
+                repeat_counts.append(self.param_value(multiples_arg))
+
+        source_layers = self._extract_source_variable(op_args, node, "tile")
+        if source_layers is None:
+            return None
+
+        return {
+            "tns_type": "repeat",
+            "repeat_dim": repeat_counts,
+            "layers_of_tensors": source_layers,
+            "input_reused": True
+        }
+
+    def _extract_binary_op(self, node, op_args, op_type):
+        """Extract binary operation (add, subtract, multiply, divide, etc.)."""
+        op_map = {
+            "add": "binop_add",
+            "subtract": "binop_subtract",
+            "multiply": "multiply",
+            "divide": "binop_divide",
+            "floor_divide": "binop_floor_divide",
+            "matmul": "matmultiply"
+        }
+        tns_type = op_map[op_type]
+        layers_of_tensors = [self.module_of_output[op_args[0].id],
+                             self.module_of_output[op_args[1].id]]
+        return {"tns_type": tns_type, "layers_of_tensors": layers_of_tensors}
+
+    def _extract_transpose(self, node, op_args):
+        """Extract transpose tensorop parameters."""
+        op_args_kw = node.value.keywords[0].value.elts
+        permute_dim = [op_args_kw[0].value, op_args_kw[1].value, op_args_kw[2].value]
+        return {"tns_type": "permute", "permute_dim": permute_dim}
+
+    def _extract_reshape(self, node, op_args):
+        """Extract reshape tensorop parameters."""
+        source_layers = self._extract_source_variable(op_args, node, "reshape")
+        if source_layers is None:
+            return None
+
+        # Process reshape arguments
+        if len(op_args) == 2 and isinstance(op_args[1], ast.List):
+            reshape_dim = self._process_reshape_arg(op_args[1], node)
+        else:
+            reshape_dim = [self._process_reshape_arg(op_args[i], node)
+                           for i in range(1, len(op_args))]
+
+        return {
+            "tns_type": "reshape",
+            "reshape_dim": reshape_dim,
+            "layers_of_tensors": source_layers
+        }
+
+    def _extract_pad(self, node, op_args):
+        """Extract pad tensorop parameters."""
+        pad_amount = None
+        pad_mode = 'CONSTANT'
+
+        # Second argument is paddings
+        if len(op_args) > 1:
+            paddings_arg = op_args[1]
+            if isinstance(paddings_arg, (ast.List, ast.Tuple)):
+                pad_amount = []
+                for elt in paddings_arg.elts:
+                    if isinstance(elt, (ast.List, ast.Tuple)):
+                        pad_amount.append([self.param_value(e) for e in elt.elts])
+                    else:
+                        pad_amount.append(self.param_value(elt))
+
+        # Extract mode from keywords
+        for kw in node.value.keywords:
+            if kw.arg == "mode":
+                pad_mode = self.param_value(kw.value)
+                break
+
+        source_layers = self._extract_source_variable(op_args, node, "pad")
+        if source_layers is None:
+            return None
+
+        return {
+            "tns_type": "pad",
+            "pad_amount": pad_amount,
+            "pad_mode": pad_mode,
+            "layers_of_tensors": source_layers,
+            "input_reused": True
+        }
+
+    def _extract_dropout(self, node, op_args):
+        """Extract dropout tensorop parameters."""
+        dropout_rate = 0.5  # Default
+
+        for kw in node.value.keywords:
+            if kw.arg == "rate":
+                dropout_rate = self.param_value(kw.value)
+                break
+
+        source_layers = self._extract_source_variable(op_args, node, "dropout")
+        if source_layers is None:
+            return None
+
+        return {
+            "tns_type": "dropout",
+            "dropout_rate": dropout_rate,
+            "layers_of_tensors": source_layers,
+            "input_reused": True
+        }
+
+    def _extract_resize(self, node, op_args):
+        """Extract resize/interpolate tensorop parameters."""
+        resize_size = None
+        resize_mode = 'bilinear'
+
+        # Second argument is size
+        if len(op_args) > 1:
+            size_arg = op_args[1]
+            if isinstance(size_arg, (ast.List, ast.Tuple)):
+                resize_size = tuple(self.param_value(elt) for elt in size_arg.elts)
+            else:
+                resize_size = self.param_value(size_arg)
+
+        # Extract method from keywords
+        for kw in node.value.keywords:
+            if kw.arg == "method":
+                resize_mode = self.param_value(kw.value)
+                break
+
+        source_layers = self._extract_source_variable(op_args, node, "resize")
+        if source_layers is None:
+            return None
+
+        return {
+            "tns_type": "interpolate",
+            "interpolate_size": resize_size,
+            "interpolate_mode": resize_mode,
+            "layers_of_tensors": source_layers,
+            "input_reused": True
+        }
+
+    def _extract_concat(self, node, op_args):
+        """Extract concat tensorop parameters."""
+        ops_args = node.value.args[0].elts
+
+        # Extract variables
+        variables = self._extract_concat_variables(ops_args, node)
+        if variables is None:
+            return None
+
+        # Resolve aliases
+        actual_vars = self._resolve_concat_variables(variables)
+
+        # Get source layers
+        layers_of_tensors = []
+        for var in actual_vars:
+            if isinstance(var, str) and var.startswith("INLINE_CALL:"):
+                layers_of_tensors.append(var)
+            elif var in self.module_of_output:
+                layers_of_tensors.append(self.module_of_output[var])
+            else:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: Variable '{var}' not found in module outputs."
+                )
+                return None
+
+        # Get concatenation dimension
+        cat_dim = self.param_value(node.value.keywords[0].value)
+
+        # Track RNN var types
+        var_types = self._determine_rnn_var_types_multi(layers_of_tensors, actual_vars)
+
+        # Check if bidirectional RNN concat (handled by template)
+        if self._is_bidirectional_hidden_concat(layers_of_tensors, var_types):
+            output_var = node.targets[0].id
+            self.variable_aliases[output_var] = actual_vars[0]
+            self.module_of_output[output_var] = layers_of_tensors[0]
+            return None
+
+        return {
+            "tns_type": "concatenate",
+            "layers_of_tensors": layers_of_tensors,
+            "concatenate_dim": cat_dim,
+            "actual_vars": var_types
+        }
+
     def extract_tensorop(self, node: ast.Assign):
         """
         It extracts the tensorop name and its parameters.
@@ -1709,528 +2070,33 @@ class ASTParserTF(ASTParser):
         op_args = node.value.args
         tensorop_param = None
         if op_type == "concat":
-            ops_args = node.value.args[0].elts
-
-            # Extract variables (handles subscripts, calls, N-args)
-            variables = self._extract_concat_variables(ops_args, node)
-            if variables is None:
-                return None
-
-            # Resolve aliases
-            actual_vars = self._resolve_concat_variables(variables)
-
-            # Get source layers
-            layers_of_tensors = []
-            for var in actual_vars:
-                # Handle inline layer call markers
-                if isinstance(var, str) and var.startswith("INLINE_CALL:"):
-                    layers_of_tensors.append(var)  # Pass marker directly
-                elif var in self.module_of_output:
-                    layers_of_tensors.append(self.module_of_output[var])
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: Variable '{var}' not found in module outputs."
-                    )
-                    return None
-
-            # Get concatenation dimension
-            cat_dim = self.param_value(node.value.keywords[0].value)
-
-            # Track RNN var types for N variables
-            var_types = self._determine_rnn_var_types_multi(layers_of_tensors, actual_vars)
-
-            # Check if this is bidirectional RNN hidden state concat (already handled by template)
-            if self._is_bidirectional_hidden_concat(layers_of_tensors, var_types):
-                # Skip creating TensorOp - template handles bidirectional hidden concat
-                # Just create variable alias so subsequent code can reference it
-                output_var = node.targets[0].id
-                self.variable_aliases[output_var] = actual_vars[0]
-                # Point to the same module as the first variable (the RNN layer)
-                self.module_of_output[output_var] = layers_of_tensors[0]
-                return None
-
-            tensorop_param = {
-                "tns_type": "concatenate",
-                "layers_of_tensors": layers_of_tensors,
-                "concatenate_dim": cat_dim,
-                "actual_vars": var_types
-            }
+            tensorop_param = self._extract_concat(node, op_args)
         elif op_type in ["add", "subtract", "multiply", "divide", "floor_divide", "matmul"]:
-            # Map TF functional calls to BUML binary operation types
-            op_map = {
-                "add": "binop_add",
-                "subtract": "binop_subtract",
-                "multiply": "multiply",
-                "divide": "binop_divide",
-                "floor_divide": "binop_floor_divide",
-                "matmul": "matmultiply"
-            }
-            op_type = op_map[op_type]
-            # All binary ops require two tensor operands
-            layers_of_tensors = [self.module_of_output[op_args[0].id],
-                                 self.module_of_output[op_args[1].id]]
-            tensorop_param = {"tns_type": op_type,
-                              "layers_of_tensors": layers_of_tensors}
+            tensorop_param = self._extract_binary_op(node, op_args, op_type)
         elif op_type == "transpose":
-            # tf.transpose always maps to permute (general dimension reordering)
-            op_args = node.value.keywords[0].value.elts
-            permute_dim = [op_args[0].value, op_args[1].value,
-                           op_args[2].value]
-            tensorop_param = {"tns_type": "permute",
-                              "permute_dim": permute_dim}
+            tensorop_param = self._extract_transpose(node, op_args)
         elif op_type == "reshape":
-            # Extract source variable (first argument)
-            if len(op_args) > 0:
-                if isinstance(op_args[0], ast.Name):
-                    source_var = op_args[0].id
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var == 'x':
-                        source_layers = ['INPUT']
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: reshape source variable '{source_var}' not found."
-                        )
-                        return None
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: reshape operand type not supported."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: reshape requires an input tensor."
-                )
-                return None
-
-            # Process each reshape argument (handles constants, variables, and tf.shape()[dim])
-            # TensorFlow reshape has 2 args: tensor and shape (which is usually a list)
-            if len(op_args) == 2 and isinstance(op_args[1], ast.List):
-                # Shape is provided as a list: tf.reshape(x, [dim1, dim2, ...])
-                reshape_dim = self._process_reshape_arg(op_args[1], node)
-            else:
-                # Shape provided as separate arguments (rare): tf.reshape(x, dim1, dim2, ...)
-                reshape_dim = [self._process_reshape_arg(op_args[i], node) for i in range(1, len(op_args))]
-
-            tensorop_param = {"tns_type": op_type,
-                              "reshape_dim": reshape_dim,
-                              "layers_of_tensors": source_layers}
+            tensorop_param = self._extract_reshape(node, op_args)
         elif op_type == "reduce_mean":
-            # Extract dimension parameter
-            reduce_dim = None
-            for kw in node.value.keywords:
-                if kw.arg == "axis":
-                    reduce_dim = self.param_value(kw.value)
-                    break
-
-            if reduce_dim is None:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: reduce_mean requires an 'axis' parameter."
-                )
-                return None
-
-            # Extract source variable
-            if len(op_args) > 0:
-                if isinstance(op_args[0], ast.Name):
-                    source_var = op_args[0].id
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var == 'x':
-                        source_layers = ['INPUT']
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: Source variable '{source_var}' not found."
-                        )
-                        return None
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: reduce_mean operand type not supported."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: reduce_mean requires an input tensor."
-                )
-                return None
-
-            tensorop_param = {
-                "tns_type": "mean",
-                "reduce_dim": reduce_dim,
-                "layers_of_tensors": source_layers
-            }
+            tensorop_param = self._extract_reduce_mean(node, op_args)
         elif op_type == "zeros_like":
-            # Extract source variable
-            if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
-                source_var = op_args[0].id
-                if source_var in self.module_of_output:
-                    source_layers = [self.module_of_output[source_var]]
-                elif source_var == 'x':
-                    source_layers = ['INPUT']
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: zeros_like source variable '{source_var}' not found."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: zeros_like requires an input tensor."
-                )
-                return None
-
-            tensorop_param = {
-                "tns_type": "zeros_like",
-                "layers_of_tensors": source_layers,
-                "input_reused": True  # Force new variable name to avoid overwriting previous outputs
-            }
+            tensorop_param = self._extract_zeros_like(node, op_args)
         elif op_type == "squeeze":
-            # Extract dimension parameter (optional)
-            reduce_dim = None
-            for kw in node.value.keywords:
-                if kw.arg == "axis":
-                    reduce_dim = self.param_value(kw.value)
-                    break
-
-            # Extract source variable
-            if len(op_args) > 0:
-                if isinstance(op_args[0], ast.Name):
-                    source_var = op_args[0].id
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var == 'x':
-                        source_layers = ['INPUT']
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: squeeze source variable '{source_var}' not found."
-                        )
-                        return None
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: squeeze operand type not supported."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: squeeze requires an input tensor."
-                )
-                return None
-
-            tensorop_param = {
-                "tns_type": "squeeze",
-                "reduce_dim": reduce_dim,
-                "layers_of_tensors": source_layers,
-                "input_reused": True
-            }
+            tensorop_param = self._extract_squeeze(node, op_args)
         elif op_type == "expand_dims":
-            # Extract dimension parameter (required)
-            reduce_dim = None
-            for kw in node.value.keywords:
-                if kw.arg == "axis":
-                    reduce_dim = self.param_value(kw.value)
-                    break
-
-            # axis can also be positional (second argument)
-            if reduce_dim is None and len(op_args) > 1:
-                reduce_dim = self.param_value(op_args[1])
-
-            if reduce_dim is None:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: expand_dims requires an 'axis' parameter."
-                )
-                return None
-
-            # Extract source variable
-            if len(op_args) > 0:
-                if isinstance(op_args[0], ast.Name):
-                    source_var = op_args[0].id
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var == 'x':
-                        source_layers = ['INPUT']
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: expand_dims source variable '{source_var}' not found."
-                        )
-                        return None
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: expand_dims operand type not supported."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: expand_dims requires an input tensor."
-                )
-                return None
-
-            tensorop_param = {
-                "tns_type": "unsqueeze",
-                "reduce_dim": reduce_dim,
-                "layers_of_tensors": source_layers,
-                "input_reused": True
-            }
+            tensorop_param = self._extract_expand_dims(node, op_args)
         elif op_type == "reduce_max":
-            # Extract dimension parameter (optional)
-            reduce_dim = None
-            for kw in node.value.keywords:
-                if kw.arg == "axis":
-                    reduce_dim = self.param_value(kw.value)
-                    break
-
-            # Extract source variable
-            if len(op_args) > 0:
-                if isinstance(op_args[0], ast.Name):
-                    source_var = op_args[0].id
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var == 'x':
-                        source_layers = ['INPUT']
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: reduce_max source variable '{source_var}' not found."
-                        )
-                        return None
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: reduce_max operand type not supported."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: reduce_max requires an input tensor."
-                )
-                return None
-
-            tensorop_param = {
-                "tns_type": "max",
-                "reduce_dim": reduce_dim,
-                "layers_of_tensors": source_layers,
-                "input_reused": True
-            }
+            tensorop_param = self._extract_reduce_max(node, op_args)
         elif op_type == "l2_normalize":
-            # Extract dimension parameter
-            norm_dim = None
-            for kw in node.value.keywords:
-                if kw.arg == "axis":
-                    norm_dim = self.param_value(kw.value)
-                    break
-
-            # Extract source variable
-            if len(op_args) > 0:
-                if isinstance(op_args[0], ast.Name):
-                    source_var = op_args[0].id
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var == 'x':
-                        source_layers = ['INPUT']
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: l2_normalize source variable '{source_var}' not found."
-                        )
-                        return None
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: l2_normalize operand type not supported."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: l2_normalize requires an input tensor."
-                )
-                return None
-
-            tensorop_param = {
-                "tns_type": "normalize",
-                "reduce_dim": norm_dim,
-                "layers_of_tensors": source_layers,
-                "input_reused": True
-            }
+            tensorop_param = self._extract_l2_normalize(node, op_args)
         elif op_type == "tile":
-            # Extract multiples/repeat counts
-            repeat_counts = []
-            if len(op_args) > 1:
-                # Second argument is multiples - can be a list or tuple
-                multiples_arg = op_args[1]
-                if isinstance(multiples_arg, (ast.List, ast.Tuple)):
-                    for elt in multiples_arg.elts:
-                        repeat_counts.append(self.param_value(elt))
-                else:
-                    # Single value or variable
-                    repeat_counts.append(self.param_value(multiples_arg))
-
-            # Extract source variable
-            if len(op_args) > 0:
-                if isinstance(op_args[0], ast.Name):
-                    source_var = op_args[0].id
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var == 'x':
-                        source_layers = ['INPUT']
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: tile source variable '{source_var}' not found."
-                        )
-                        return None
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: tile operand type not supported."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: tile requires an input tensor."
-                )
-                return None
-
-            tensorop_param = {
-                "tns_type": "repeat",
-                "repeat_dim": repeat_counts,
-                "layers_of_tensors": source_layers,
-                "input_reused": True
-            }
+            tensorop_param = self._extract_tile(node, op_args)
         elif op_type == "pad":
-            # Extract padding parameters
-            pad_amount = None
-            pad_mode = 'CONSTANT'
-
-            # Second argument is paddings
-            if len(op_args) > 1:
-                paddings_arg = op_args[1]
-                if isinstance(paddings_arg, (ast.List, ast.Tuple)):
-                    pad_amount = []
-                    for elt in paddings_arg.elts:
-                        if isinstance(elt, (ast.List, ast.Tuple)):
-                            # Each element is [before, after] for a dimension
-                            pad_amount.append([self.param_value(e) for e in elt.elts])
-                        else:
-                            pad_amount.append(self.param_value(elt))
-
-            # Extract mode from keywords
-            for kw in node.value.keywords:
-                if kw.arg == "mode":
-                    pad_mode = self.param_value(kw.value)
-                    break
-
-            # Extract source variable
-            if len(op_args) > 0:
-                if isinstance(op_args[0], ast.Name):
-                    source_var = op_args[0].id
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var == 'x':
-                        source_layers = ['INPUT']
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: pad source variable '{source_var}' not found."
-                        )
-                        return None
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: pad operand type not supported."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: pad requires an input tensor."
-                )
-                return None
-
-            tensorop_param = {
-                "tns_type": "pad",
-                "pad_amount": pad_amount,
-                "pad_mode": pad_mode,
-                "layers_of_tensors": source_layers,
-                "input_reused": True
-            }
+            tensorop_param = self._extract_pad(node, op_args)
         elif op_type == "dropout":
-            # Extract dropout rate
-            dropout_rate = 0.5  # Default
-
-            for kw in node.value.keywords:
-                if kw.arg == "rate":
-                    dropout_rate = self.param_value(kw.value)
-                    break
-
-            # Extract source variable
-            if len(op_args) > 0:
-                if isinstance(op_args[0], ast.Name):
-                    source_var = op_args[0].id
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var == 'x':
-                        source_layers = ['INPUT']
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: dropout source variable '{source_var}' not found."
-                        )
-                        return None
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: dropout operand type not supported."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: dropout requires an input tensor."
-                )
-                return None
-
-            tensorop_param = {
-                "tns_type": "dropout",
-                "dropout_rate": dropout_rate,
-                "layers_of_tensors": source_layers,
-                "input_reused": True
-            }
+            tensorop_param = self._extract_dropout(node, op_args)
         elif op_type == "resize":
-            # tf.image.resize(x, size, method='bilinear')
-            # Extract size parameter (required)
-            resize_size = None
-            resize_mode = 'bilinear'
-
-            # Second argument is size
-            if len(op_args) > 1:
-                size_arg = op_args[1]
-                if isinstance(size_arg, (ast.List, ast.Tuple)):
-                    resize_size = tuple(self.param_value(elt) for elt in size_arg.elts)
-                else:
-                    resize_size = self.param_value(size_arg)
-
-            # Extract method from keywords
-            for kw in node.value.keywords:
-                if kw.arg == "method":
-                    resize_mode = self.param_value(kw.value)
-                    break
-
-            # Extract source variable
-            if len(op_args) > 0:
-                if isinstance(op_args[0], ast.Name):
-                    source_var = op_args[0].id
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    elif source_var == 'x':
-                        source_layers = ['INPUT']
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: resize source variable '{source_var}' not found."
-                        )
-                        return None
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: resize operand type not supported."
-                    )
-                    return None
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: resize requires an input tensor."
-                )
-                return None
-
-            tensorop_param = {
-                "tns_type": "interpolate",
-                "interpolate_size": resize_size,
-                "interpolate_mode": resize_mode,
-                "layers_of_tensors": source_layers,
-                "input_reused": True
-            }
+            tensorop_param = self._extract_resize(node, op_args)
         else:
             print(f"{op_type} is not recognized!")
 
