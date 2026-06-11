@@ -1466,6 +1466,49 @@ class ASTParserTF(ASTParser):
         else:
             return self.param_value(arg)
 
+    def _handle_initial_state_keyword(self, module_obj, module_name, kw):
+        """Handle initial_state keyword argument for RNN layers."""
+        if isinstance(kw.value, ast.List) and len(kw.value.elts) >= 1:
+            h_var = kw.value.elts[0].id if isinstance(kw.value.elts[0], ast.Name) else None
+        elif isinstance(kw.value, ast.Name):
+            h_var = kw.value.id
+        else:
+            return
+
+        if not h_var or h_var not in self.module_of_output:
+            return
+
+        print(f"DEBUG: h_var={h_var}, in module_of_output: True")
+        source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
+        print(f"DEBUG: module_of_output[{h_var}] = {self.module_of_output[h_var]} -> source={source_module}")
+        module_obj.hx_source = source_module
+
+        # Mark source layer output as reused
+        source_layer = self._get_layer_by_name(source_module)
+        if source_layer:
+            source_layer.input_reused = True
+            if not hasattr(self, '_reserved_tf_vars'):
+                self._reserved_tf_vars = set()
+            self._reserved_tf_vars.add(h_var)
+            print(f"DEBUG: Marked {source_module}.input_reused = True, reserved={h_var}")
+        print(f"DEBUG: Set {module_name}.hx_source = {source_module}, return_type={module_obj.return_type}")
+
+    def _set_module_input(self, module_obj, input_var):
+        """Set name_module_input for a module based on input variable."""
+        if input_var in self.module_of_output:
+            module_obj.name_module_input = self.module_of_output[input_var]
+        elif input_var == "x":
+            module_obj.name_module_input = "INPUT"
+
+    def _handle_dropout_before_module(self, module_obj, module_name):
+        """Add Dropout module before RNN/layer if dropout layer exists."""
+        dropout_layer_name = f"{module_name}_dropout"
+        dropout_module = next((obj for obj in self.buml_model.layers if obj.name == dropout_layer_name), None)
+        if dropout_module:
+            dropout_module.name_module_input = module_obj.name_module_input
+            module_obj.name_module_input = dropout_layer_name
+            self.buml_model.modules.append(dropout_module)
+
     def process_single_call(self, node: ast.Assign):
         """
         Process a single (non-chained) call operation.
@@ -1499,52 +1542,17 @@ class ASTParserTF(ASTParser):
                                        obj.name == module_name), None)
 
                 # Set name_module_input BEFORE updating module_of_output (to avoid self-reference)
-                if module_obj and input_var in self.module_of_output:
-                    module_obj.name_module_input = self.module_of_output[input_var]
-                elif module_obj and input_var == "x":
-                    # Special case: input is "x" (network INPUT) but not in module_of_output
-                    # This happens when there are only tensorops before this layer (e.g., shape_dim)
-                    # Set name_module_input to "INPUT" to signal network input
-                    module_obj.name_module_input = "INPUT"
+                if module_obj:
+                    self._set_module_input(module_obj, input_var)
 
                 # NOW update module_of_output
                 self.module_of_output[node.targets[0].id] = module_name
 
                 # Check for initial_state keyword argument (for RNN layers)
-                if module_obj and hasattr(module_obj, 'return_type'):  # Check if it's an RNN layer
+                if module_obj and hasattr(module_obj, 'return_type'):
                     for kw in node.value.keywords:
                         if kw.arg == "initial_state":
-                            # Extract source layer from initial_state variables
-                            if isinstance(kw.value, ast.List) and len(kw.value.elts) >= 1:
-                                h_var = kw.value.elts[0].id if isinstance(kw.value.elts[0], ast.Name) else None
-                                print(f"DEBUG: h_var={h_var}, in module_of_output: {h_var in self.module_of_output if h_var else False}")
-                                if h_var and h_var in self.module_of_output:
-                                    source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
-                                    print(f"DEBUG: module_of_output[{h_var}] = {self.module_of_output[h_var]} -> source={source_module}")
-                                    module_obj.hx_source = source_module
-                                    # Mark source layer output as reused to prevent variable name reuse
-                                    source_layer = self._get_layer_by_name(source_module)
-                                    if source_layer:
-                                        source_layer.input_reused = True
-                                        # Mark the TF variable as reserved so generated PyTorch var won't be reused
-                                        if not hasattr(self, '_reserved_tf_vars'):
-                                            self._reserved_tf_vars = set()
-                                        self._reserved_tf_vars.add(h_var)
-                                        print(f"DEBUG: Marked {source_module}.input_reused = True, reserved={h_var}")
-                                    print(f"DEBUG: Set {module_name}.hx_source = {source_module}, return_type={module_obj.return_type}")
-                            elif isinstance(kw.value, ast.Name):
-                                h_var = kw.value.id
-                                if h_var in self.module_of_output:
-                                    source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
-                                    module_obj.hx_source = source_module
-                                    # Mark source layer output as reused to prevent variable name reuse
-                                    source_layer = self._get_layer_by_name(source_module)
-                                    if source_layer:
-                                        source_layer.input_reused = True
-                                        # Mark the TF variable as reserved so generated PyTorch var won't be reused
-                                        if not hasattr(self, '_reserved_tf_vars'):
-                                            self._reserved_tf_vars = set()
-                                        self._reserved_tf_vars.add(h_var)
+                            self._handle_initial_state_keyword(module_obj, module_name, kw)
                             break
 
                 # Check for RNN hidden state usage
@@ -1556,14 +1564,7 @@ class ASTParserTF(ASTParser):
 
                 # Add Dropout module before RNN/layer if dropout layer exists
                 if module_obj:
-                    dropout_layer_name = f"{module_name}_dropout"
-                    dropout_module = next((obj for obj in self.buml_model.layers if obj.name == dropout_layer_name), None)
-                    if dropout_module:
-                        # Set dropout's input to be the same as the RNN's original input
-                        dropout_module.name_module_input = module_obj.name_module_input
-                        # Update RNN's input to be the dropout layer
-                        module_obj.name_module_input = dropout_layer_name
-                        self.buml_model.modules.append(dropout_module)
+                    self._handle_dropout_before_module(module_obj, module_name)
 
                 # Handle standalone activation layers (layers.ReLU, layers.Activation, etc.)
                 if module_name in self.activation_functions:
