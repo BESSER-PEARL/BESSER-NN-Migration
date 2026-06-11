@@ -1541,6 +1541,11 @@ class ASTParserTF(ASTParser):
                 # Set name_module_input BEFORE updating module_of_output (to avoid self-reference)
                 if module_obj:
                     self._set_module_input(module_obj, input_var)
+                    # Mark input_reused if this layer consumes a split output
+                    if input_var in self.module_of_output:
+                        source = self.module_of_output[input_var]
+                        if isinstance(source, str) and "__split_" in source:
+                            module_obj.input_reused = True
 
                 # NOW update module_of_output
                 self.module_of_output[node.targets[0].id] = module_name
@@ -2008,6 +2013,59 @@ class ASTParserTF(ASTParser):
             "input_reused": True
         }
 
+    def _extract_split(self, node, op_args):
+        """Extract split tensorop parameters for tf.split(value, num_or_size_splits, axis)."""
+        # tf.split signature: tf.split(value, num_or_size_splits, axis=0, num=None, name=None)
+        # Example: chunk1, chunk2, chunk3 = tf.split(last, num_or_size_splits=3, axis=1)
+
+        # Extract source layers using the common helper
+        source_layers = self._extract_source_variable(op_args, node, "split")
+        if source_layers is None:
+            return None
+
+        # Get num_or_size_splits from positional arg or keyword
+        num_splits = None
+        if len(op_args) >= 2:
+            num_splits = self.param_value(op_args[1])
+        else:
+            for kw in node.value.keywords:
+                if kw.arg == "num_or_size_splits":
+                    num_splits = self.param_value(kw.value)
+                    break
+
+        if num_splits is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: tf.split missing num_or_size_splits argument"
+            )
+            return None
+
+        # Get split axis from positional arg or keyword
+        split_axis = None
+        if len(op_args) >= 3:
+            split_axis = self.param_value(op_args[2])
+        else:
+            for kw in node.value.keywords:
+                if kw.arg == "axis":
+                    split_axis = self.param_value(kw.value)
+                    break
+
+        if split_axis is None:
+            split_axis = 0  # Default axis is 0 in TensorFlow
+
+        # Track output variables from tuple assignment
+        if isinstance(node.targets[0], ast.Tuple):
+            output_vars = [elt.id for elt in node.targets[0].elts if isinstance(elt, ast.Name)]
+        else:
+            output_vars = [node.targets[0].id]
+
+        return {
+            "tns_type": "split",
+            "split_sizes": num_splits,
+            "split_dim": split_axis,
+            "layers_of_tensors": source_layers,
+            "output_vars": output_vars
+        }
+
     def _extract_concat(self, node, op_args):
         """Extract concat tensorop parameters."""
         ops_args = node.value.args[0].elts
@@ -2067,7 +2125,9 @@ class ASTParserTF(ASTParser):
         op_type = node.value.func.attr
         op_args = node.value.args
         tensorop_param = None
-        if op_type == "concat":
+        if op_type == "split":
+            tensorop_param = self._extract_split(node, op_args)
+        elif op_type == "concat":
             tensorop_param = self._extract_concat(node, op_args)
         elif op_type in ["add", "subtract", "multiply", "divide", "floor_divide", "matmul"]:
             tensorop_param = self._extract_binary_op(node, op_args, op_type)
@@ -2107,14 +2167,24 @@ class ASTParserTF(ASTParser):
         if tensorop_param:
             op_name = f"op_{self.tensor_op_counter}"
             tensorop_param["name"] = op_name
+
+            # Special handling for split: remove output_vars before creating TensorOp
+            output_vars = tensorop_param.pop("output_vars", None)
+
             tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
             self.buml_model.add_tensor_op(tns_obj)
             self.tensor_op_counter+=1
 
-            # Track output variable
+            # Track output variable(s)
             if hasattr(node, 'targets') and len(node.targets) > 0:
-                target_var = node.targets[0].id
-                self.module_of_output[target_var] = op_name
+                if output_vars and len(output_vars) > 1:
+                    # Multiple outputs (e.g., split): track each with suffix like RNN does
+                    for idx, var in enumerate(output_vars):
+                        self.module_of_output[var] = f"{op_name}__split_{idx}"
+                else:
+                    # Single output: normal tracking
+                    target_var = node.targets[0].id
+                    self.module_of_output[target_var] = op_name
 
     def _create_dropout_layer(self, tensorop_param, node):
         """Create a Dropout layer from tf.nn.dropout."""
