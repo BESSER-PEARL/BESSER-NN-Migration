@@ -9,7 +9,7 @@ import ast
 import sys
 sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 import besser.BUML.metamodel.nn as mm_classes
-from besser.BUML.metamodel.nn import NN, Layer
+from besser.BUML.metamodel.nn import NN, Layer, TensorOp
 from ast_parser_nn import ASTParser
 from definitions import (
     layers_mapping, params_mapping, static_params, rnn_layers,
@@ -2384,10 +2384,16 @@ class ASTParserTF(ASTParser):
         
         """
         current_cnn, prev_cnn, next_cnn = False, False, False
+
+        # Check if next module is CNN or spatial tensorop
         if isinstance(next_module, Layer):
             if next_module.__class__.__name__ in cnns:
                 next_cnn = True
+        elif isinstance(next_module, TensorOp):
+            if next_module.tns_type in ("interpolate", "pad"):
+                next_cnn = True
 
+        # Check if current module is CNN or spatial tensorop
         if isinstance(module, Layer):
             if module.__class__.__name__ in cnns:
                 current_cnn = True
@@ -2401,27 +2407,59 @@ class ASTParserTF(ASTParser):
                         next_in = next_module.name_module_input
                         if next_in != module.name:
                             next_cnn = False
+        elif isinstance(module, TensorOp):
+            if module.tns_type in ("interpolate", "pad"):
+                current_cnn = True
+                # TensorOps use name_module_input to track their input
+                if module.name_module_input:
+                    prev_module_name = module.name_module_input
+                    prev_module = next((obj for obj in modules if
+                                        obj.name == prev_module_name), None)
 
         if isinstance(prev_module, Layer):
             if prev_module.__class__.__name__ in cnns:
                 prev_cnn = True
+        elif isinstance(prev_module, TensorOp):
+            # Treat spatial tensorops (interpolate, pad) as CNN-like for permute logic
+            # They expect NCHW input and output NCHW, so next layer shouldn't add input permute
+            if prev_module.tns_type in ("interpolate", "pad"):
+                prev_cnn = True
+            else:
+                prev_cnn = False
         else:
             prev_cnn = False
         if current_cnn:
+            # Determine if we need input permute
             if not prev_cnn and (prev_module is None or
                                  prev_module.name not in lyr_out_permuted):
-                module.permute_in = True
+                # For Layers, set permute_in attribute
+                if isinstance(module, Layer):
+                    module.permute_in = True
+                # For TensorOps (interpolate, pad), we'll add permute in handle_tensorop
+                elif isinstance(module, TensorOp):
+                    # Mark that this tensorop needs input permute
+                    module.permute_in = True
                 if prev_module is not None:
                     lyr_out_permuted.append(prev_module.name)
             elif prev_cnn and prev_module.name in lyr_out_permuted:
-                module.permute_in = True
+                if isinstance(module, Layer):
+                    module.permute_in = True
+                elif isinstance(module, TensorOp):
+                    module.permute_in = True
+
+            # Determine if we need output permute
             if not next_cnn:
                 # For global pooling, don't set permute_out (will add squeeze instead)
-                is_global_pooling = (module.__class__.__name__ == "PoolingLayer" and
+                is_global_pooling = (isinstance(module, Layer) and
+                                   module.__class__.__name__ == "PoolingLayer" and
                                    hasattr(module, 'pooling_type') and
                                    module.pooling_type.startswith("global"))
                 if not is_global_pooling:
-                    module.permute_out = True
+                    if isinstance(module, Layer):
+                        module.permute_out = True
+                    elif isinstance(module, TensorOp):
+                        # Mark that this tensorop needs output permute
+                        module.permute_out = True
                 lyr_out_permuted.append(module.name)
         prev_module = module
         return prev_module
