@@ -5,8 +5,9 @@ to BUML code.
 
 layers_mapping = {
     "Conv1D": "Conv1D", "Conv2D": "Conv2D", "Conv3D": "Conv3D",
-    "MaxPool1D": "PoolingLayer", "MaxPool2D": "PoolingLayer",
-    "MaxPool3D": "PoolingLayer", "AveragePooling1D": "PoolingLayer",
+    "MaxPooling1D": "PoolingLayer", "MaxPooling2D": "PoolingLayer",
+    "MaxPooling3D": "PoolingLayer",
+    "AveragePooling1D": "PoolingLayer",
     "AveragePooling2D": "PoolingLayer", "AveragePooling3D": "PoolingLayer",
     "AdaptiveAveragePooling1D": "PoolingLayer",
     "GlobalAveragePooling1D": "PoolingLayer",
@@ -53,12 +54,12 @@ excluded_params = [
 
 
 static_params = {
-    "MaxPool1D": {"pooling_type": "max", "dimension": "1D"},
-    "MaxPool2D": {"pooling_type": "max", "dimension": "2D"},
-    "MaxPool3D": {"pooling_type": "max", "dimension": "3D"},
-    "AveragePooling1D": {"pooling_type": "avg", "dimension": "1D"},
-    "AveragePooling2D": {"pooling_type": "avg", "dimension": "2D"},
-    "AveragePooling3D": {"pooling_type": "avg", "dimension": "3D"},
+    "MaxPooling1D": {"pooling_type": "max", "dimension": "1D"},
+    "MaxPooling2D": {"pooling_type": "max", "dimension": "2D"},
+    "MaxPooling3D": {"pooling_type": "max", "dimension": "3D"},
+    "AveragePooling1D": {"pooling_type": "average", "dimension": "1D"},
+    "AveragePooling2D": {"pooling_type": "average", "dimension": "2D"},
+    "AveragePooling3D": {"pooling_type": "average", "dimension": "3D"},
     "AdaptiveAveragePooling1D": {"pooling_type": "adaptive_average", 
                                  "dimension": "1D"},
     "AdaptiveAveragePooling2D": {"pooling_type": "adaptive_average", 
@@ -94,7 +95,7 @@ pos_params = {"Dense": ["units", "activation"],
               "GRU": ["units", "activation"],
               "Conv": ["filters", "kernel_size", "strides", "padding"],
               "AveragePooling": ["pool_size", "strides", "padding"],
-              "MaxPool": ["pool_size", "strides", "padding"],
+              "MaxPooling": ["pool_size", "strides", "padding"],
               "AdaptiveAveragePooling": ["output_size"],
               "AdaptiveMaxPooling": ["output_size"],
               "Dropout ": ["rate"],
@@ -104,7 +105,7 @@ int2list_params = ["kernel_size", "strides", "pool_size",
                    "output_size", "axis"]
 
 lyrs_of_int2list_params = ["Conv1D", "Conv2D", "Conv3D",
-                           "MaxPool1D", "MaxPool2D", "MaxPool3D",
+                           "MaxPooling1D", "MaxPooling2D", "MaxPooling3D",
                            "AveragePooling1D", "AveragePooling2D", "AveragePooling3D",
                            "AdaptiveAveragePooling1D", "AdaptiveAveragePooling2D", "AdaptiveAveragePooling3D",
                            "AdaptiveMaxPooling1D", "AdaptiveMaxPooling2D", "AdaptiveMaxPooling3D",
