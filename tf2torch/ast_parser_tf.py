@@ -967,6 +967,59 @@ class ASTParserTF(ASTParser):
 
         return input_var
 
+    def _handle_tf_shape_slicing(self, node: ast.Assign):
+        """Handle tf.shape(x)[dim] pattern to create shape_dim tensorop."""
+        result_var = node.targets[0].id
+
+        # Extract dimension index from subscript
+        if isinstance(node.value.slice, ast.Constant):
+            dim_idx = node.value.slice.value
+        elif isinstance(node.value.slice, ast.Index) and isinstance(node.value.slice.value, ast.Constant):
+            dim_idx = node.value.slice.value.value
+        else:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unsupported slice type in tf.shape subscript"
+            )
+            return
+
+        # Extract source tensor from tf.shape() arguments
+        if len(node.value.value.args) == 0:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: tf.shape() call missing argument"
+            )
+            return
+
+        source_arg = node.value.value.args[0]
+        if not isinstance(source_arg, ast.Name):
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unsupported source type in tf.shape()"
+            )
+            return
+
+        source_var = source_arg.id
+        # Determine source layers
+        source_layers = [self.module_of_output[source_var]] if source_var in self.module_of_output else ['INPUT']
+
+        # Create shape_dim tensorop
+        shape_tensorop_param = {
+            "tns_type": "shape_dim",
+            "reduce_dim": dim_idx,
+            "layers_of_tensors": source_layers,
+            "name": result_var
+        }
+        tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+        self.buml_model.add_tensor_op(tns_obj)
+        self.module_of_output[result_var] = result_var
+
+    def _is_tf_shape_slicing(self, node: ast.Assign):
+        """Check if this is a tf.shape(x)[dim] pattern."""
+        return (isinstance(node.value.value, ast.Call) and
+                hasattr(node.value.value.func, 'attr') and
+                node.value.value.func.attr == 'shape' and
+                hasattr(node.value.value.func, 'value') and
+                isinstance(node.value.value.func.value, ast.Name) and
+                node.value.value.func.value.id == 'tf')
+
     def handle_forward_slicing(self, node: ast.Assign):
         """
         Handle slicing operations such as:
@@ -982,59 +1035,9 @@ class ASTParserTF(ASTParser):
             None, but populates the BUML model
         """
         # Special handling for tf.shape(x)[dim] pattern
-        if (isinstance(node.value.value, ast.Call) and
-            hasattr(node.value.value.func, 'attr') and
-            node.value.value.func.attr == 'shape' and
-            hasattr(node.value.value.func, 'value') and
-            isinstance(node.value.value.func.value, ast.Name) and
-            node.value.value.func.value.id == 'tf'):
-
-            # This is tf.shape(x)[dim] - create shape_dim tensorop
-            result_var = node.targets[0].id
-
-            # Extract dimension index from subscript
-            if isinstance(node.value.slice, ast.Constant):
-                dim_idx = node.value.slice.value
-            elif isinstance(node.value.slice, ast.Index) and isinstance(node.value.slice.value, ast.Constant):
-                dim_idx = node.value.slice.value.value
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: Unsupported slice type in tf.shape subscript"
-                )
-                return
-
-            # Extract source tensor from tf.shape() arguments
-            if len(node.value.value.args) > 0:
-                source_arg = node.value.value.args[0]
-                if isinstance(source_arg, ast.Name):
-                    source_var = source_arg.id
-                    # Determine source layers
-                    if source_var in self.module_of_output:
-                        source_layers = [self.module_of_output[source_var]]
-                    else:
-                        source_layers = ['INPUT']
-
-                    # Create shape_dim tensorop
-                    shape_tensorop_param = {
-                        "tns_type": "shape_dim",
-                        "reduce_dim": dim_idx,
-                        "layers_of_tensors": source_layers,
-                        "name": result_var
-                    }
-                    tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
-                    self.buml_model.add_tensor_op(tns_obj)
-                    self.module_of_output[result_var] = result_var
-                    return
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: Unsupported source type in tf.shape()"
-                    )
-                    return
-            else:
-                self.migration_warnings.append(
-                    f"Line {node.lineno}: tf.shape() call missing argument"
-                )
-                return
+        if self._is_tf_shape_slicing(node):
+            self._handle_tf_shape_slicing(node)
+            return
 
         # Regular slicing handling
         if not isinstance(node.value.value, ast.Name):
@@ -1363,6 +1366,52 @@ class ASTParserTF(ASTParser):
         if is_nested_call:
             self.is_processing_nested_outer = False
 
+    def _create_shape_dim_tensorop_for_reshape(self, source_var, dim_idx):
+        """Create shape_dim tensorop for reshape argument and return operation name."""
+        source_layers = [self.module_of_output[source_var]] if source_var in self.module_of_output else ['INPUT']
+
+        op_name = f"op_{self.tensor_op_counter}"
+        shape_tensorop_param = {
+            "tns_type": "shape_dim",
+            "reduce_dim": dim_idx,
+            "layers_of_tensors": source_layers,
+            "name": op_name
+        }
+        tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+        self.buml_model.add_tensor_op(tns_obj)
+        self.module_of_output[op_name] = op_name
+        self.tensor_op_counter += 1
+        return op_name
+
+    def _extract_shape_subscript_info(self, arg, node):
+        """Extract dimension index and source variable from tf.shape(x)[dim] pattern."""
+        # Extract dimension index from subscript
+        if isinstance(arg.slice, ast.Constant):
+            dim_idx = arg.slice.value
+        elif isinstance(arg.slice, ast.Index) and isinstance(arg.slice.value, ast.Constant):
+            dim_idx = arg.slice.value.value
+        else:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unsupported slice type in tf.shape subscript"
+            )
+            return None, None
+
+        # Extract source tensor from tf.shape() arguments
+        if len(arg.value.args) == 0:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: tf.shape() call missing argument"
+            )
+            return None, None
+
+        source_arg = arg.value.args[0]
+        if not isinstance(source_arg, ast.Name):
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unsupported source type in tf.shape()"
+            )
+            return None, None
+
+        return dim_idx, source_arg.id
+
     def _process_reshape_arg(self, arg, node):
         """
         Process single reshape argument, handling tf.shape()[dim] calls and variables.
@@ -1379,12 +1428,10 @@ class ASTParserTF(ASTParser):
         """
         # Handle List nodes (e.g., [batch_size, -1] in tf.reshape(x, [batch_size, -1]))
         if isinstance(arg, ast.List):
-            # Recursively process each element of the list
             return [self._process_reshape_arg(el, node) for el in arg.elts]
 
         # Handle tf.shape(x)[dim] subscript pattern
         if isinstance(arg, ast.Subscript):
-            # Check if subscripted value is a call to tf.shape
             if (isinstance(arg.value, ast.Call) and
                 hasattr(arg.value.func, 'attr') and
                 arg.value.func.attr == 'shape' and
@@ -1392,79 +1439,29 @@ class ASTParserTF(ASTParser):
                 isinstance(arg.value.func.value, ast.Name) and
                 arg.value.func.value.id == 'tf'):
 
-                # Extract dimension index from subscript
-                if isinstance(arg.slice, ast.Constant):
-                    dim_idx = arg.slice.value
-                elif isinstance(arg.slice, ast.Index) and isinstance(arg.slice.value, ast.Constant):
-                    dim_idx = arg.slice.value.value
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: Unsupported slice type in tf.shape subscript"
-                    )
-                    return -1
-
-                # Extract source tensor from tf.shape() arguments
-                if len(arg.value.args) > 0:
-                    source_arg = arg.value.args[0]
-                    if isinstance(source_arg, ast.Name):
-                        source_var = source_arg.id
-                        # Determine source layers
-                        if source_var in self.module_of_output:
-                            source_layers = [self.module_of_output[source_var]]
-                        else:
-                            source_layers = ['INPUT']
-
-                        # Create shape_dim tensorop with generated name
-                        op_name = f"op_{self.tensor_op_counter}"
-                        shape_tensorop_param = {
-                            "tns_type": "shape_dim",
-                            "reduce_dim": dim_idx,
-                            "layers_of_tensors": source_layers,
-                            "name": op_name
-                        }
-                        tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
-                        self.buml_model.add_tensor_op(tns_obj)
-                        self.module_of_output[op_name] = op_name
-                        self.tensor_op_counter += 1
-                        return op_name
-                    else:
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: Unsupported source type in tf.shape()"
-                        )
-                        return -1
-                else:
-                    self.migration_warnings.append(
-                        f"Line {node.lineno}: tf.shape() call missing argument"
-                    )
-                    return -1
+                dim_idx, source_var = self._extract_shape_subscript_info(arg, node)
+                if dim_idx is not None and source_var is not None:
+                    return self._create_shape_dim_tensorop_for_reshape(source_var, dim_idx)
+                return -1
 
         # Handle Name nodes (variables that might reference shape dims)
-        elif isinstance(arg, ast.Name):
+        if isinstance(arg, ast.Name):
             var_name = arg.id
-            # Check if this variable is a shape_dim operation result
             if var_name in self.module_of_output:
                 layer_name = self.module_of_output[var_name]
-                if layer_name.startswith('op_'):
-                    # This is an operation result, use it directly
-                    return layer_name
-                else:
-                    # Regular variable, try to get its value
-                    return self.param_value(arg)
-            else:
-                # Unknown variable, use as-is (might be defined elsewhere)
-                return var_name
+                return layer_name if layer_name.startswith('op_') else self.param_value(arg)
+            return var_name
 
         # Handle Constant nodes (literal values like -1, 64, etc.)
-        elif isinstance(arg, ast.Constant):
+        if isinstance(arg, ast.Constant):
             return arg.value
 
         # Handle older Python AST Num nodes
-        elif isinstance(arg, ast.Num):
+        if isinstance(arg, ast.Num):
             return arg.n
 
         # Fallback to param_value for other cases
-        else:
-            return self.param_value(arg)
+        return self.param_value(arg)
 
     def _handle_initial_state_keyword(self, module_obj, module_name, kw):
         """Handle initial_state keyword argument for RNN layers."""
