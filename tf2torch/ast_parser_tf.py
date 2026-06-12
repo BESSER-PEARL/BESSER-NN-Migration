@@ -894,13 +894,19 @@ class ASTParserTF(ASTParser):
                 if var1 and var1 != "_":
                     self.rnn_output_vars[module_name] = var1
                     self.module_of_output[var1] = module_name
+
+                # Check if forward/backward components are used separately
+                uses_separate_components = (var2 and var2 != "_") or (var3 and var3 != "_")
+                if uses_separate_components and module_obj:
+                    # Mark that this layer should NOT auto-concatenate hidden states
+                    module_obj.skip_hidden_concat = True
+
                 # Both var2 and var3 are hidden states (forward and backward)
-                # They both point to the same layer with __hidden suffix
-                # The template will handle concatenating them
+                # Track with separate suffixes so they can be extracted individually
                 if var2 and var2 != "_":
-                    self.module_of_output[var2] = module_name + "__hidden"
+                    self.module_of_output[var2] = module_name + "__hidden_forward"
                 if var3 and var3 != "_":
-                    self.module_of_output[var3] = module_name + "__hidden"
+                    self.module_of_output[var3] = module_name + "__hidden_backward"
             else:
                 # LSTM: out, h, c = self.lstm(x)
                 if var1 and var1 != "_":
@@ -925,16 +931,24 @@ class ASTParserTF(ASTParser):
             if var1 and var1 != "_":
                 self.rnn_output_vars[module_name] = var1
                 self.module_of_output[var1] = module_name
-            # var2 and var4 are forward and backward hidden states
+
+            # Check if forward/backward components are used separately (not just discarded with _)
+            uses_separate_components = (var2 and var2 != "_") or (var4 and var4 != "_")
+            if uses_separate_components and module_obj:
+                # Mark that this layer should NOT auto-concatenate hidden states
+                # because the TF code accesses forward/backward separately
+                module_obj.skip_hidden_concat = True
+
+            # var2 and var4 are forward and backward hidden states - track with original TF names
             if var2 and var2 != "_":
-                self.module_of_output[var2] = module_name + "__hidden"
+                self.module_of_output[var2] = module_name + "__hidden_forward"
             if var4 and var4 != "_":
-                self.module_of_output[var4] = module_name + "__hidden"
+                self.module_of_output[var4] = module_name + "__hidden_backward"
             # var3 and var5 are forward and backward cell states
             if var3 and var3 != "_":
-                self.module_of_output[var3] = module_name + "__cell"
+                self.module_of_output[var3] = module_name + "__cell_forward"
             if var5 and var5 != "_":
-                self.module_of_output[var5] = module_name + "__cell"
+                self.module_of_output[var5] = module_name + "__cell_backward"
 
     def _determine_rnn_output_var(self, node):
         """Determine which variable holds the main RNN output."""
