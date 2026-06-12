@@ -2457,6 +2457,20 @@ class ASTParserTF(ASTParser):
         elif isinstance(next_module, TensorOp):
             if next_module.tns_type in ("interpolate", "pad"):
                 next_cnn = True
+            # Check if next is a permute that would cancel our auto permute_out
+            elif next_module.tns_type == "permute" and hasattr(next_module, 'permute_dim'):
+                # For Conv1D: auto permute_out is [0,2,1], canceling permute is also [0,2,1]
+                # For Conv2D: auto permute_out is [0,2,3,1], canceling permute is also [0,2,3,1]
+                # For Conv3D: auto permute_out is [0,2,3,4,1], canceling permute is also [0,2,3,4,1]
+                canceling_permutes = {
+                    3: [0, 2, 1],           # Conv1D
+                    4: [0, 2, 3, 1],        # Conv2D
+                    5: [0, 2, 3, 4, 1]      # Conv3D
+                }
+                perm_dim = next_module.permute_dim
+                if perm_dim in canceling_permutes.values():
+                    # This permute cancels our auto permute_out, treat as CNN
+                    next_cnn = True
 
         # Check if current module is CNN or spatial tensorop
         if isinstance(module, Layer):
