@@ -308,19 +308,22 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
         (not isinstance(output_var, list) and input_var != output_var)):
         lyr_obj.input_reused = True
 
-        # Determine if input is the original network input or from another module
-        if input_var in module_of_output:
-            # Input variable is produced by some module - check if it comes before or after
-            producing_module_name = module_of_output[input_var]
-            producing_module = next((m for m in modules_list if m.name == producing_module_name), None)
-            if producing_module:
-                producing_index = modules_list.index(producing_module)
-                if producing_index < current_index:
-                    # Producing module comes BEFORE - input from that module
-                    lyr_obj.name_module_input = producing_module_name
-                else:
-                    # Producing module comes AFTER - input is original network input
-                    lyr_obj.name_module_input = 'INPUT'
-        else:
-            # Input variable not produced by any module - original network input
-            lyr_obj.name_module_input = 'INPUT'
+        # Only set name_module_input if it wasn't already set during parsing
+        # (to avoid overwriting correct values with stale module_of_output data)
+        if not hasattr(lyr_obj, 'name_module_input') or lyr_obj.name_module_input is None:
+            # Determine if input is the original network input or from another module
+            if input_var in module_of_output:
+                # Input variable is produced by some module - check if it comes before or after
+                producing_module_name = module_of_output[input_var]
+                producing_module = next((m for m in modules_list if m.name == producing_module_name), None)
+                if producing_module:
+                    producing_index = modules_list.index(producing_module)
+                    if producing_index < current_index:
+                        # Producing module comes BEFORE - input from that module
+                        lyr_obj.name_module_input = producing_module_name
+                    else:
+                        # Producing module comes AFTER - input is original network input
+                        lyr_obj.name_module_input = 'INPUT'
+            else:
+                # Input variable not produced by any module - original network input
+                lyr_obj.name_module_input = 'INPUT'

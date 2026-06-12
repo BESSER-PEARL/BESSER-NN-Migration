@@ -1604,7 +1604,9 @@ class ASTParserTF(ASTParser):
                             module_obj.input_reused = True
 
                 # NOW update module_of_output
-                self.module_of_output[node.targets[0].id] = module_name
+                output_var = node.targets[0].id
+                self.module_of_output[output_var] = module_name
+
 
                 # Check for initial_state keyword argument (for RNN layers)
                 if module_obj and hasattr(module_obj, 'return_type'):
