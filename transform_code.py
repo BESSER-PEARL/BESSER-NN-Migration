@@ -297,6 +297,10 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
     if layer_name not in inputs_outputs:
         return
 
+    # Skip identity tensorops - they should preserve exact variable names
+    if hasattr(lyr_obj, 'tns_type') and lyr_obj.tns_type == 'identity':
+        return
+
     # Handle both single output and tuple output (list)
     input_var = inputs_outputs[layer_name][0]
     output_var = inputs_outputs[layer_name][1]

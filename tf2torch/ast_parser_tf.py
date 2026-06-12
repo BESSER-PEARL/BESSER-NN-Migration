@@ -235,6 +235,10 @@ class ASTParserTF(ASTParser):
             self.buml_model.add_tensor_op(tns_obj)
             self.module_of_output[target_var] = tensorop_param["name"]
 
+            # Track inputs/outputs for binops (used by set_remaining_params)
+            # Input: first operand variable, Output: assignment target variable
+            self.inputs_outputs[tensorop_param["name"]] = [left_var if isinstance(left_var, str) else str(left_var), target_var]
+
             # Update prev_layer_output for TensorOps
             self.prev_layer_output = target_var
 
@@ -749,31 +753,44 @@ class ASTParserTF(ASTParser):
     def handle_forward_variable_assignment(self, node: ast.Assign):
         """
         Handle simple variable assignments like inp = x or r = x (residual).
-        Tracks variable aliasing and marks source as reused for later operations.
+        Creates an identity TensorOp to preserve the assignment in generated code.
 
         Parameters:
             node (ast.Assign): The AST node representing the assignment
 
         Returns:
-            None, but updates tracking dictionaries
+            None, but creates a TensorOp and updates tracking dictionaries
         """
         target_var = node.targets[0].id
         source_var = node.value.id
 
-        # If source is tracked in module_of_output, propagate it to target
-        if source_var in self.module_of_output:
-            source_module = self.module_of_output[source_var]
-            self.module_of_output[target_var] = source_module
+        # Create an identity operation to preserve this assignment
+        # This ensures "residual = x" becomes "residual = x" in PyTorch
+        from besser.BUML.metamodel.nn import TensorOp
 
-            # Track that this variable has been saved for later use (residual connection)
-            # The NEXT operation that modifies source_var should use a new output variable
-            # We'll set a flag that the next layer/op processing can check
-            if not hasattr(self, '_variables_saved_for_residual'):
-                self._variables_saved_for_residual = set()
-            self._variables_saved_for_residual.add(source_var)
+        # Create identity tensorop with name_module_input to track source
+        identity_op = TensorOp(
+            name=target_var,
+            tns_type='identity',
+            layers_of_tensors=[],  # Will use name_module_input instead
+            input_reused=True  # Mark as reusing input so BESSER uses tensorop name as output var
+        )
+
+        # Set name_module_input to indicate where the input comes from
+        if source_var in self.module_of_output:
+            identity_op.name_module_input = self.module_of_output[source_var]
         else:
-            # Source is not tracked, mark as network input with special marker
-            self.module_of_output[target_var] = 'INPUT'
+            # Source is the network input
+            identity_op.name_module_input = 'INPUT'
+
+        self.buml_model.modules.append(identity_op)
+        self.module_of_output[target_var] = target_var  # Identity op outputs to target_var
+        self.inputs_outputs[target_var] = [source_var, target_var]  # Track input/output
+
+        # Track that this variable has been saved for later use (residual connection)
+        if not hasattr(self, '_variables_saved_for_residual'):
+            self._variables_saved_for_residual = set()
+        self._variables_saved_for_residual.add(source_var)
 
         self.previous_assign = node
 
@@ -2252,6 +2269,25 @@ class ASTParserTF(ASTParser):
                     # Single output: normal tracking
                     target_var = node.targets[0].id
                     self.module_of_output[target_var] = op_name
+
+                    # Track inputs/outputs for all tensorops using actual TF variable names
+                    # This preserves original code patterns (e.g., x = tf.add(x, y) → input='x', output='x')
+                    if 'layers_of_tensors' in tensorop_param and tensorop_param['layers_of_tensors']:
+                        # Find the variable name that the first input layer produces
+                        first_layer = tensorop_param['layers_of_tensors'][0]
+                        input_var = None
+
+                        # Reverse lookup: search module_of_output to find which variable this layer produces
+                        for var, mod_name in self.module_of_output.items():
+                            if mod_name == first_layer:
+                                input_var = var
+                                break
+
+                        # Fallback if not found (shouldn't happen, but be safe)
+                        if input_var is None:
+                            input_var = 'x'
+
+                        self.inputs_outputs[op_name] = [input_var, target_var]
 
     def _create_dropout_layer(self, tensorop_param, node):
         """Create a Dropout layer from tf.nn.dropout."""
