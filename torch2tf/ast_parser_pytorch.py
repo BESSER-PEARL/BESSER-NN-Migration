@@ -171,6 +171,10 @@ class ASTParserTorch(ASTParser):
         if self.forward_node and self.lstm_cell_vars:
             self._mark_unused_cell_states(self.forward_node)
 
+        # Store bidirectional concat variable names in the model for code generation
+        if hasattr(self, '_bidirectional_concat_var_names'):
+            self.buml_model.bidirectional_concat_var_names = self._bidirectional_concat_var_names
+
     def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
         """
         Extract the subscript/slice pattern from an AST Subscript node as a string.
@@ -779,11 +783,16 @@ class ASTParserTorch(ASTParser):
             self.rnn_hidden_vars[module_name] = var2
             # Track hidden state with special suffix to distinguish from output sequence
             self.module_of_output[var2] = module_name + "__hidden"
+            # Store in inputs_outputs for generator to use original variable name
+            # For RNN tuple output (out, h), store hidden state with __hidden suffix
+            self.inputs_outputs[module_name + "__hidden"] = [None, var2]
         if var3 and var3 != "_":
             # Track cell state for LSTM with special suffix
             self.module_of_output[var3] = module_name + "__cell"
             # Store cell state variable name to check if it's used later
             self.lstm_cell_vars[module_name] = var3
+            # Store in inputs_outputs for generator
+            self.inputs_outputs[module_name + "__cell"] = [None, var3]
 
     def _determine_rnn_return_type(self, node, module_name):
         """Determine RNN return type and main output variable based on underscore pattern."""
@@ -1211,6 +1220,20 @@ class ASTParserTorch(ASTParser):
                 self._update_hidden_as_output(lyr_obj, prev_module_name)
             else:
                 lyr_obj.return_type = "hidden"
+                # Store the result variable name for this hidden state subscript
+                # For multi-layer RNN, h[-1] extracts last layer's hidden state
+                # In TF this is already the output, but we need to preserve the variable name
+                # BUT: Don't handle bidirectional RNNs here - let the bidirectional logic handle them
+                if not (hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional):
+                    layer_lookup_name = prev_module_name
+                    if layer_lookup_name.endswith("__hidden"):
+                        layer_lookup_name = layer_lookup_name[:-8]
+                    # Store in inputs_outputs with __hidden suffix
+                    self.inputs_outputs[layer_lookup_name + "__hidden"] = [subscripted_var, result_var]
+                    self.module_of_output[result_var] = prev_module_name
+                    self.variable_aliases[result_var] = subscripted_var
+                    self.previous_assign = node
+                    return True  # Signal that we've handled this
         elif isinstance(node.value.slice, ast.Tuple) and len(node.value.slice.elts) == 3:
             if lyr_obj.return_type == "full":
                 self._handle_non_rnn_slicing(node, subscripted_var, result_var)
@@ -1277,6 +1300,12 @@ class ASTParserTorch(ASTParser):
                 # Track with direction suffix so they're different
                 self.module_of_output[result_var] = layer_lookup_name + suffix
                 self.variable_aliases[result_var] = subscripted_var
+
+                # Store in inputs_outputs so generator can use original variable name
+                # Key: layer_name__forward or layer_name__backward
+                # Value: [source_var, result_var]
+                self.inputs_outputs[layer_lookup_name + suffix] = [subscripted_var, result_var]
+
                 self.previous_assign = node
                 return
 
@@ -2326,11 +2355,19 @@ class ASTParserTorch(ASTParser):
         return indices
 
     def _handle_bidirectional_concat_output(self, node, source_layer_name):
-        """Track output variable for bidirectional concat."""
+        """Track output variable for bidirectional concat to preserve original name."""
         output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
         if output_var:
+            # Store the original PyTorch concat variable name so it can be used
+            # by the RNN layer as its hidden output variable
             concat_module = "bidirectional_concat_" + source_layer_name
             self.module_of_output[output_var] = concat_module
+
+            # Mark that this layer should use the original concat variable name
+            # This will be picked up when generating layer details
+            if not hasattr(self, '_bidirectional_concat_var_names'):
+                self._bidirectional_concat_var_names = {}
+            self._bidirectional_concat_var_names[source_layer_name] = output_var
         return output_var is not None
 
     def _check_bidirectional_rnn_concat(self, ops_args, layers_of_tensors, node):
@@ -2457,18 +2494,23 @@ class ASTParserTorch(ASTParser):
         # Early check for bidirectional RNN concat to avoid creating subscript tensorops
         if self._is_bidirectional_rnn_subscript_concat(ops_args):
             # Skip creating TensorOp - template already generates bidirectional concat
-            # Track output variable with special marker ONLY if it's a direct layer input (not used in tensorops)
+            # Track output variable to use as the concat result variable name
             output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
             if output_var:
                 var_name = ops_args[0].value.id
                 source_module = self.module_of_output[var_name]
-                # Create a synthetic tensorop entry so other tensorops can reference it
-                op_name = f"op_{self.tensor_op_counter}"
-                self.tensor_op_counter += 1
-                # Track as bidirectional_concat marker for direct layer usage
-                self.module_of_output[output_var] = "bidirectional_concat_" + source_module.replace("__hidden", "")
-                # Also create variable alias for tensorop references
-                self.variable_aliases[op_name] = output_var
+                base_module = source_module.replace("__hidden", "")
+
+                # Store the original PyTorch concat variable name so it can be used
+                # by the RNN layer as its hidden output variable
+                concat_module = "bidirectional_concat_" + base_module
+                self.module_of_output[output_var] = concat_module
+
+                # Mark that this layer should use the original concat variable name
+                # This will be picked up when generating layer details
+                if not hasattr(self, '_bidirectional_concat_var_names'):
+                    self._bidirectional_concat_var_names = {}
+                self._bidirectional_concat_var_names[base_module] = output_var
             return None
 
         self._update_prev_layer_return_type_if_subscript(ops_args)
