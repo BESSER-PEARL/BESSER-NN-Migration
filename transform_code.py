@@ -273,8 +273,8 @@ def set_static_params(lyr_type: str, lyr_params: dict,
 
 
 def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
-                         module_of_output: dict, modules_list: list = None,
-                         current_index: int = None):
+                         module_of_output: dict, modules_list: list,
+                         current_index: int):
     """
     It sets the 'input_reused' and 'name_module_input' layer parameters.
 
@@ -282,8 +282,8 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
         lyr_obj (Layer): The buml layer object.
         inputs_outputs (dict): It stores input and output variables
             of layers.
-        module_of_output (dict): It stores name of layers given their
-            output var.
+        module_of_output (dict): Maps output variable names to the module
+            that produces them.
         modules_list (list): The list of all modules in execution order.
         current_index (int): The index of the current layer in modules_list.
 
@@ -297,30 +297,30 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
     if layer_name not in inputs_outputs:
         return
 
-    if (not isinstance(inputs_outputs[layer_name][1], list) and
-        inputs_outputs[layer_name][0] != inputs_outputs[layer_name][1]):
-        input_var = inputs_outputs[layer_name][0]
-        if input_var in module_of_output:
-            lyr_in_out = module_of_output[input_var]
+    # Handle both single output and tuple output (list)
+    input_var = inputs_outputs[layer_name][0]
+    output_var = inputs_outputs[layer_name][1]
 
-            # Special case: INPUT marker for network input
-            if lyr_in_out == 'INPUT':
-                lyr_obj.input_reused = True
-                lyr_obj.name_module_input = 'INPUT'
-            # Check temporal ordering: the referenced module must come before this one
-            elif modules_list is not None and current_index is not None:
-                referenced_module = next((m for m in modules_list if m.name == lyr_in_out), None)
-                if referenced_module:
-                    referenced_index = modules_list.index(referenced_module)
-                    # Only set name_module_input if the referenced module comes before
-                    if referenced_index < current_index:
-                        lyr_obj.input_reused = True
-                        lyr_obj.name_module_input = lyr_in_out
-            else:
-                # Fallback to old behavior if indices not provided
-                lyr_obj.input_reused = True
-                lyr_obj.name_module_input = lyr_in_out
+    # Check if input is different from output(s)
+    # For tuple outputs (RNN): check if input is not in the output tuple
+    # For single output: check if input != output
+    if ((isinstance(output_var, list) and input_var not in output_var) or
+        (not isinstance(output_var, list) and input_var != output_var)):
+        lyr_obj.input_reused = True
+
+        # Determine if input is the original network input or from another module
+        if input_var in module_of_output:
+            # Input variable is produced by some module - check if it comes before or after
+            producing_module_name = module_of_output[input_var]
+            producing_module = next((m for m in modules_list if m.name == producing_module_name), None)
+            if producing_module:
+                producing_index = modules_list.index(producing_module)
+                if producing_index < current_index:
+                    # Producing module comes BEFORE - input from that module
+                    lyr_obj.name_module_input = producing_module_name
+                else:
+                    # Producing module comes AFTER - input is original network input
+                    lyr_obj.name_module_input = 'INPUT'
         else:
-            # Input variable not in module_of_output means it's the original network input
-            lyr_obj.input_reused = True
+            # Input variable not produced by any module - original network input
             lyr_obj.name_module_input = 'INPUT'

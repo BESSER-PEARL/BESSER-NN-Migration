@@ -152,10 +152,9 @@ class ASTParser(ast.NodeVisitor):
         # Third pass: set remaining params
         for i, module in enumerate(self.buml_model.modules):
             if isinstance(module, Layer) or hasattr(module, 'input_reused'):
-                set_remaining_params(
-                    module, self.inputs_outputs, self.module_of_output,
-                    self.buml_model.modules, i
-                )
+                set_remaining_params(module, self.inputs_outputs,
+                                   self.module_of_output,
+                                   self.buml_model.modules, i)
 
         # Handle tuple returns
         if hasattr(self, 'pytorch_return_vars') and self.pytorch_return_vars:
