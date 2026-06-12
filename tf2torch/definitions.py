@@ -112,4 +112,5 @@ lyrs_of_int2list_params = ["Conv1D", "Conv2D", "Conv3D",
                            "LayerNormalization"]
 
 layers_buml2tf = {"LinearLayer": "Dense", "SimpleRNNLayer": "RNN",
-                  "LSTMLayer": "LSTM", "GRULayer": "GRU"}
+                  "LSTMLayer": "LSTM", "GRULayer": "GRU",
+                  "LayerNormLayer": "LayerNormalization"}
