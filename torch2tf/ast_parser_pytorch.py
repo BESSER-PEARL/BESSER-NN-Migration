@@ -785,14 +785,16 @@ class ASTParserTorch(ASTParser):
             self.module_of_output[var2] = module_name + "__hidden"
             # Store in inputs_outputs for generator to use original variable name
             # For RNN tuple output (out, h), store hidden state with __hidden suffix
-            self.inputs_outputs[module_name + "__hidden"] = [None, var2]
+            # Use var2 as both input and output to preserve the original unpacked variable name
+            self.inputs_outputs[module_name + "__hidden"] = [var2, var2]
         if var3 and var3 != "_":
             # Track cell state for LSTM with special suffix
             self.module_of_output[var3] = module_name + "__cell"
             # Store cell state variable name to check if it's used later
             self.lstm_cell_vars[module_name] = var3
             # Store in inputs_outputs for generator
-            self.inputs_outputs[module_name + "__cell"] = [None, var3]
+            # Use var3 as both input and output to preserve the original unpacked variable name
+            self.inputs_outputs[module_name + "__cell"] = [var3, var3]
 
     def _determine_rnn_return_type(self, node, module_name):
         """Determine RNN return type and main output variable based on underscore pattern."""
@@ -1217,9 +1219,12 @@ class ASTParserTorch(ASTParser):
 
             if has_output and has_hidden:
                 lyr_obj.return_type = "both"
-                self._update_hidden_as_output(lyr_obj, prev_module_name)
+                # Do NOT update hidden as output - when both are used, sequences remain primary output
+                # The hidden state is accessible via __hidden suffix
             else:
                 lyr_obj.return_type = "hidden"
+                # Only update when hidden is the ONLY output used
+                self._update_hidden_as_output(lyr_obj, prev_module_name)
                 # Store the result variable name for this hidden state subscript
                 # For multi-layer RNN, h[-1] extracts last layer's hidden state
                 # In TF this is already the output, but we need to preserve the variable name
