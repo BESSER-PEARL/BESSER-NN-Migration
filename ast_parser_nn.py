@@ -281,10 +281,23 @@ class ASTParser(ast.NodeVisitor):
 
         # Check if return value is a Call (e.g., return self.fc(x)) or BinOp (e.g., return x1 + x2)
         if isinstance(node.value, (ast.Call, ast.BinOp)):
+            # Extract input variable name from the call/expression to use as output variable
+            output_var_name = '_return_output'  # Default fallback
+
+            if isinstance(node.value, ast.Call) and node.value.args:
+                # Get the first argument's name (e.g., 'out' from self.fc(out))
+                first_arg = node.value.args[0]
+                if isinstance(first_arg, ast.Name):
+                    output_var_name = first_arg.id
+            elif isinstance(node.value, ast.BinOp):
+                # For BinOp, try to get left operand name
+                if isinstance(node.value.left, ast.Name):
+                    output_var_name = node.value.left.id
+
             # Create a synthetic assignment node for processing
             # This allows reusing the existing assignment processing logic
             synthetic_assign = ast.Assign(
-                targets=[ast.Name(id='_return_output', ctx=ast.Store())],
+                targets=[ast.Name(id=output_var_name, ctx=ast.Store())],
                 value=node.value
             )
             # Copy location info from original node
