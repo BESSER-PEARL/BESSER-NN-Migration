@@ -208,11 +208,12 @@ def param_to_list(lyr_type: str, lyr_params: dict, params_to_convert: list,
 
     if lyr_type in layers_of_params:
         for param in lyr_params:
-            if lyr_type.endswith("2D") or lyr_type.endswith("3D"):
+            # Check for 2D/3D layers (case-insensitive: Conv2d, Conv2D, MaxPool2d, MaxPool2D, etc.)
+            if lyr_type.lower().endswith("2d") or lyr_type.lower().endswith("3d"):
                 # For 2D/3D layers, convert any param in params_to_convert to a list of appropriate dimension
                 if (param in params_to_convert and
                     isinstance(lyr_params[param], int)):
-                    dim = 2 if lyr_type.endswith("2D") else 3
+                    dim = 2 if lyr_type.lower().endswith("2d") else 3
                     lyr_params[param] = [lyr_params[param]] * dim
             else:
                 # For 1D layers, convert to single-element list
