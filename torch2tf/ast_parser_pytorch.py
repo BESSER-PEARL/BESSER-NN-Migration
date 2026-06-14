@@ -999,19 +999,27 @@ class ASTParserTorch(ASTParser):
             # Source is network input
             source_module = 'INPUT'
 
+        # Generate unique name for identity tensorop to avoid overwrites in modules_details
+        # When same variable is assigned multiple times (e.g., r = x appears 4 times for residuals),
+        # each needs a unique tensorop name, but all should output to the same variable via inputs_outputs
+        if not hasattr(self, '_identity_counter'):
+            self._identity_counter = {}
+        self._identity_counter[target_var] = self._identity_counter.get(target_var, 0) + 1
+        unique_name = f"{target_var}_identity_{self._identity_counter[target_var]}"
+
         # Create an identity TensorOp to generate the assignment in output code
         # This will output: target_var = source_var
         identity_op = mm_classes.TensorOp(
-            name=target_var,
+            name=unique_name,
             tns_type="identity",
             layers_of_tensors=[source_module]
         )
 
-        # Store input/output vars for generator
-        self.inputs_outputs[target_var] = [source_var, target_var]
+        # Store input/output vars for generator - use target_var as output so all map to same variable
+        self.inputs_outputs[unique_name] = [source_var, target_var]
 
-        # Track the target variable
-        self.module_of_output[target_var] = target_var
+        # Track the target variable - map to the unique tensorop name
+        self.module_of_output[target_var] = unique_name
 
         # Mark source as reused (branching point for residual/wide-deep patterns)
         if not hasattr(self, '_variables_saved_for_residual'):
