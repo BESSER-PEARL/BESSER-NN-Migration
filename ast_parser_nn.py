@@ -266,8 +266,12 @@ class ASTParser(ast.NodeVisitor):
 
     def visit_Return(self, node: ast.Return):
         """
-        It visits return statements. If the return value is a module call, binary operation,
-        or tuple, it processes it accordingly.
+        It visits return statements. Converts complex return expressions into synthetic
+        assignments to ensure they are fully processed.
+
+        The variable name used for the synthetic assignment doesn't matter since it's the
+        last operation in forward() and won't be used elsewhere. The key is ensuring the
+        expression is fully processed and preserved.
 
         Parameters:
             node (ast.Return): The AST node representing a return statement.
@@ -275,29 +279,22 @@ class ASTParser(ast.NodeVisitor):
         Returns:
             None, but processes the return value and tracks multiple return values.
         """
+        print(f"[DEBUG visit_Return] node.value type: {type(node.value).__name__}")
+
         # Only process if we're in a class (forward method) and input_nn_type is subclassing
         if not self.in_class or self.input_nn_type != "subclassing":
+            print(f"[DEBUG visit_Return] Skipping: in_class={self.in_class}, input_nn_type={self.input_nn_type}")
             return
 
-        # Check if return value is a Call (e.g., return self.fc(x)) or BinOp (e.g., return x1 + x2)
-        if isinstance(node.value, (ast.Call, ast.BinOp)):
-            # Extract input variable name from the call/expression to use as output variable
-            output_var_name = '_return_output'  # Default fallback
-
-            if isinstance(node.value, ast.Call) and node.value.args:
-                # Get the first argument's name (e.g., 'out' from self.fc(out))
-                first_arg = node.value.args[0]
-                if isinstance(first_arg, ast.Name):
-                    output_var_name = first_arg.id
-            elif isinstance(node.value, ast.BinOp):
-                # For BinOp, try to get left operand name
-                if isinstance(node.value.left, ast.Name):
-                    output_var_name = node.value.left.id
+        # Handle expressions that need to be converted to assignments to ensure full processing
+        # Use '_return_output' as the synthetic variable name (doesn't matter since it's the last op)
+        if isinstance(node.value, (ast.Call, ast.BinOp, ast.Subscript, ast.UnaryOp, ast.IfExp)):
+            print(f"[DEBUG visit_Return] Creating synthetic assignment for expression: _return_output = <{type(node.value).__name__}>")
 
             # Create a synthetic assignment node for processing
             # This allows reusing the existing assignment processing logic
             synthetic_assign = ast.Assign(
-                targets=[ast.Name(id=output_var_name, ctx=ast.Store())],
+                targets=[ast.Name(id='_return_output', ctx=ast.Store())],
                 value=node.value
             )
             # Copy location info from original node
@@ -305,7 +302,7 @@ class ASTParser(ast.NodeVisitor):
             synthetic_assign.col_offset = node.col_offset
             self.visit_Assign(synthetic_assign)
 
-        # Handle tuple returns (e.g., return rep, recon)
+        # Handle tuple returns (e.g., return a, b)
         elif isinstance(node.value, ast.Tuple):
             # Track the tuple of return variables from PyTorch source
             pytorch_return_vars = []
@@ -317,6 +314,26 @@ class ASTParser(ast.NodeVisitor):
             if not hasattr(self, 'pytorch_return_vars'):
                 self.pytorch_return_vars = []
             self.pytorch_return_vars = pytorch_return_vars
+            print(f"[DEBUG visit_Return] Tuple return: {pytorch_return_vars}")
+
+        # Handle simple name returns (e.g., return x) - no processing needed
+        elif isinstance(node.value, ast.Name):
+            print(f"[DEBUG visit_Return] Simple name return: {node.value.id} - no processing needed")
+
+        # Handle constants (e.g., return None, return 5) - no processing needed
+        elif isinstance(node.value, (ast.Constant, ast.Num)) or node.value is None:
+            print(f"[DEBUG visit_Return] Constant/None return - no processing needed")
+
+        # Handle other types (List, Dict, etc.) - create synthetic assignment to be safe
+        else:
+            print(f"[DEBUG visit_Return] Other return type ({type(node.value).__name__}) - creating synthetic assignment")
+            synthetic_assign = ast.Assign(
+                targets=[ast.Name(id='_return_output', ctx=ast.Store())],
+                value=node.value
+            )
+            synthetic_assign.lineno = node.lineno
+            synthetic_assign.col_offset = node.col_offset
+            self.visit_Assign(synthetic_assign)
 
 
     def handle_sequential_nn(self, node: ast.Assign):
