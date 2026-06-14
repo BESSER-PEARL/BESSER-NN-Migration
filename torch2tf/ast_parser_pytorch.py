@@ -1288,12 +1288,23 @@ class ASTParserTorch(ASTParser):
                 self.inputs_outputs[prev_module_name][1] = hidden_var
 
     def _determine_rnn_slice_return_type(self, node, lyr_obj, prev_module_name, subscripted_var, result_var):
-        """Determine RNN return type based on slicing pattern."""
-        if isinstance(node.value.slice, ast.UnaryOp):
-            has_output = prev_module_name in self.rnn_output_vars
-            has_hidden = prev_module_name in self.rnn_hidden_vars
+        """Determine RNN return type based on slicing pattern.
 
-            print(f"[DEBUG _determine_rnn_slice_return_type] prev_module_name={prev_module_name}, subscripted_var={subscripted_var}, result_var={result_var}")
+        Args:
+            prev_module_name: Module name WITH suffix (e.g., 'rnn1__hidden'), used for module_of_output tracking
+        """
+        if isinstance(node.value.slice, ast.UnaryOp):
+            # Strip suffix for lookup in rnn_output_vars/rnn_hidden_vars (which use base layer names)
+            base_layer_name = prev_module_name
+            if base_layer_name.endswith("__hidden"):
+                base_layer_name = base_layer_name[:-8]
+            elif base_layer_name.endswith("__cell"):
+                base_layer_name = base_layer_name[:-6]
+
+            has_output = base_layer_name in self.rnn_output_vars
+            has_hidden = base_layer_name in self.rnn_hidden_vars
+
+            print(f"[DEBUG _determine_rnn_slice_return_type] prev_module_name={prev_module_name}, base_layer_name={base_layer_name}, subscripted_var={subscripted_var}, result_var={result_var}")
             print(f"[DEBUG _determine_rnn_slice_return_type] has_output={has_output}, has_hidden={has_hidden}")
             print(f"[DEBUG _determine_rnn_slice_return_type] rnn_output_vars keys: {list(self.rnn_output_vars.keys())}")
             print(f"[DEBUG _determine_rnn_slice_return_type] rnn_hidden_vars keys: {list(self.rnn_hidden_vars.keys())}")
@@ -1313,18 +1324,16 @@ class ASTParserTorch(ASTParser):
                     return True
             else:
                 lyr_obj.return_type = "hidden"
-                # Only update when hidden is the ONLY output used
-                self._update_hidden_as_output(lyr_obj, prev_module_name)
+                # Only update when hidden is the ONLY output used (use base_layer_name)
+                self._update_hidden_as_output(lyr_obj, base_layer_name)
                 # Store the result variable name for this hidden state subscript
                 # For multi-layer RNN, h[-1] extracts last layer's hidden state
                 # In TF this is already the output, but we need to preserve the variable name
                 # BUT: Don't handle bidirectional RNNs here - let the bidirectional logic handle them
                 if not (hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional):
-                    layer_lookup_name = prev_module_name
-                    if layer_lookup_name.endswith("__hidden"):
-                        layer_lookup_name = layer_lookup_name[:-8]
                     # Store in inputs_outputs with __hidden suffix
-                    self.inputs_outputs[layer_lookup_name + "__hidden"] = [subscripted_var, result_var]
+                    self.inputs_outputs[base_layer_name + "__hidden"] = [subscripted_var, result_var]
+                    # IMPORTANT: Use prev_module_name WITH suffix to preserve __hidden in module_of_output
                     self.module_of_output[result_var] = prev_module_name
                     self.variable_aliases[result_var] = subscripted_var
                     self.previous_assign = node
@@ -1384,8 +1393,8 @@ class ASTParserTorch(ASTParser):
             self._handle_non_rnn_slicing(node, subscripted_var, result_var)
             return
 
-        # Determine RNN return type based on slice pattern (use base layer name without suffix)
-        if self._determine_rnn_slice_return_type(node, lyr_obj, layer_lookup_name, subscripted_var, result_var):
+        # Determine RNN return type based on slice pattern (pass prev_module_name WITH suffix, not layer_lookup_name)
+        if self._determine_rnn_slice_return_type(node, lyr_obj, prev_module_name, subscripted_var, result_var):
             return
 
         # Check if this is a bidirectional RNN subscript pattern (h[-2] or h[-1])
@@ -2646,14 +2655,18 @@ class ASTParserTorch(ASTParser):
             return None
 
         actual_vars = self._resolve_concat_variables(variables)
+        print(f"[DEBUG _extract_concatenate_params] variables={variables}, actual_vars={actual_vars}")
 
         layers_of_tensors = [self.module_of_output[actual_var] for actual_var in actual_vars]
+        print(f"[DEBUG _extract_concatenate_params] layers_of_tensors={layers_of_tensors}")
+        print(f"[DEBUG _extract_concatenate_params] module_of_output keys={list(self.module_of_output.keys())}")
         cat_dim = self.param_value(node.value.keywords[0].value)
 
         if self._check_bidirectional_rnn_concat(ops_args, layers_of_tensors, node):
             return None
 
         var_types = self._determine_rnn_var_types(layers_of_tensors, actual_vars)
+        print(f"[DEBUG _extract_concatenate_params] var_types={var_types}")
 
         return {
             "tns_type": "concatenate",
