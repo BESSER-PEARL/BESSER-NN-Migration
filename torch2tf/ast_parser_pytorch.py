@@ -981,32 +981,44 @@ class ASTParserTorch(ASTParser):
     def handle_forward_variable_assignment(self, node: ast.Assign):
         """
         Handle simple variable assignments like inp = x or r = x (residual).
-        Tracks variable aliasing and marks source as reused for later operations.
+        Creates an identity TensorOp to preserve the assignment in generated code.
 
         Parameters:
             node (ast.Assign): The AST node representing the assignment
 
         Returns:
-            None, but updates tracking dictionaries
+            None, but creates identity TensorOp and updates tracking
         """
         target_var = node.targets[0].id
         source_var = node.value.id
 
-        # If source is tracked in module_of_output, propagate it to target
+        # Determine source module
         if source_var in self.module_of_output:
             source_module = self.module_of_output[source_var]
-            self.module_of_output[target_var] = source_module
-
-            # Track that this variable has been saved for later use (residual connection)
-            # The NEXT operation that modifies source_var should use a new output variable
-            # We'll set a flag that the next layer/op processing can check
-            if not hasattr(self, '_variables_saved_for_residual'):
-                self._variables_saved_for_residual = set()
-            self._variables_saved_for_residual.add(source_var)
         else:
-            # Source is not tracked, mark as network input with special marker
-            self.module_of_output[target_var] = 'INPUT'
+            # Source is network input
+            source_module = 'INPUT'
 
+        # Create an identity TensorOp to generate the assignment in output code
+        # This will output: target_var = source_var
+        identity_op = mm_classes.TensorOp(
+            name=target_var,
+            tns_type="identity",
+            layers_of_tensors=[source_module]
+        )
+
+        # Store input/output vars for generator
+        self.inputs_outputs[target_var] = [source_var, target_var]
+
+        # Track the target variable
+        self.module_of_output[target_var] = target_var
+
+        # Mark source as reused (branching point for residual/wide-deep patterns)
+        if not hasattr(self, '_variables_saved_for_residual'):
+            self._variables_saved_for_residual = set()
+        self._variables_saved_for_residual.add(source_var)
+
+        self.buml_model.modules.append(identity_op)
         self.previous_assign = node
 
     def _extract_binop_operand(self, operand, node, side):
