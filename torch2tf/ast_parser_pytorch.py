@@ -727,7 +727,7 @@ class ASTParserTorch(ASTParser):
 
     def _process_intermediate_layer(self, module_name, layer_name, current_input, i):
         """Process intermediate layer in multi-layer RNN."""
-        temp_var = self.TEMP_MLRNN.format(module_name, i)
+        temp_var = self.TEMP_MLRNN.format(module_name, i + 1)
         self.inputs_outputs[layer_name] = [current_input, temp_var]
         self.module_of_output[temp_var] = layer_name
 
