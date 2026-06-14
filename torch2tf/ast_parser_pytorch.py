@@ -1212,6 +1212,25 @@ class ASTParserTorch(ASTParser):
         tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
         self.buml_model.add_tensor_op(tns_obj)
         self.module_of_output[var_name] = var_name
+        # Store in inputs_outputs to preserve variable names from original code
+        # For shape_dim, we need to track what variable the shape is extracted from
+        # so the TensorFlow generator can use the correct source variable
+        source_var = None
+        if source_module == 'INPUT':
+            # For INPUT, we need to find the actual input parameter name
+            # Look for the first layer's input variable or use 'x' as default
+            for module_name in self.module_of_output.values():
+                if module_name in self.inputs_outputs:
+                    source_var = self.inputs_outputs[module_name][0]
+                    break
+            if source_var is None:
+                source_var = 'x'  # Default forward parameter name
+        elif source_module in self.inputs_outputs:
+            source_var = self.inputs_outputs[source_module][1]  # Use output of that module
+        else:
+            source_var = source_module
+
+        self.inputs_outputs[var_name] = [source_var, var_name]
 
     def handle_forward_shape_unpacking(self, node: ast.Assign):
         """
