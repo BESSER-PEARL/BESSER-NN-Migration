@@ -1304,11 +1304,6 @@ class ASTParserTorch(ASTParser):
             has_output = base_layer_name in self.rnn_output_vars
             has_hidden = base_layer_name in self.rnn_hidden_vars
 
-            print(f"[DEBUG _determine_rnn_slice_return_type] prev_module_name={prev_module_name}, base_layer_name={base_layer_name}, subscripted_var={subscripted_var}, result_var={result_var}")
-            print(f"[DEBUG _determine_rnn_slice_return_type] has_output={has_output}, has_hidden={has_hidden}")
-            print(f"[DEBUG _determine_rnn_slice_return_type] rnn_output_vars keys: {list(self.rnn_output_vars.keys())}")
-            print(f"[DEBUG _determine_rnn_slice_return_type] rnn_hidden_vars keys: {list(self.rnn_hidden_vars.keys())}")
-
             if has_output and has_hidden:
                 lyr_obj.return_type = "both"
                 # Do NOT update hidden as output - when both are used, sequences remain primary output
@@ -1332,7 +1327,17 @@ class ASTParserTorch(ASTParser):
                 # BUT: Don't handle bidirectional RNNs here - let the bidirectional logic handle them
                 if not (hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional):
                     # Store in inputs_outputs with __hidden suffix
-                    self.inputs_outputs[base_layer_name + "__hidden"] = [subscripted_var, result_var]
+                    # In TensorFlow, h[-1] becomes just h (no subscripting needed)
+                    # For auto-generated temp vars, use subscripted_var for both to prevent dead code
+                    # For user-defined vars, preserve the assignment for code readability
+                    if result_var.startswith('_subscript_temp_'):
+                        # Auto-generated: don't create assignment, use source var directly
+                        target_var = subscripted_var
+                    else:
+                        # User-defined: preserve variable name with assignment
+                        target_var = result_var
+
+                    self.inputs_outputs[base_layer_name + "__hidden"] = [subscripted_var, target_var]
                     # IMPORTANT: Use prev_module_name WITH suffix to preserve __hidden in module_of_output
                     self.module_of_output[result_var] = prev_module_name
                     self.variable_aliases[result_var] = subscripted_var
@@ -1379,7 +1384,6 @@ class ASTParserTorch(ASTParser):
             return
 
         prev_module_name = self.module_of_output[subscripted_var]
-        print(f"[DEBUG handle_forward_slicing] prev_module_name={prev_module_name}")
         # Strip __hidden or __cell suffix to get actual layer name
         layer_lookup_name = prev_module_name
         if layer_lookup_name.endswith("__hidden"):
