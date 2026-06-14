@@ -1158,6 +1158,10 @@ class ASTParserTorch(ASTParser):
         output_var = node.targets[0].id
         self.module_of_output[output_var] = tensorop_param["name"]
 
+        # Store input/output variable names for TensorFlow generation
+        self.inputs_outputs[tensorop_param["name"]] = [None, output_var]
+        print(f"[DEBUG handle_forward_binop] Set inputs_outputs[{tensorop_param['name']}] = [None, {output_var}]")
+
         # Update prev_layer_output for TensorOps
         self.prev_layer_output = output_var
 
