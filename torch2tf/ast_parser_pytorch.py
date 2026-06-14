@@ -1783,7 +1783,7 @@ class ASTParserTorch(ASTParser):
         if not merged:
             self._create_standalone_activation(node, module_name)
 
-    def _handle_module_layer_reuse(self, node, module_name, module_obj):
+    def _handle_module_layer_reuse(self, node, module_name, module_obj, original_inputs_outputs=None):
         """Handle layer reuse by creating synthetic copy with current call's input tracking."""
         import copy
         # Use per-layer reuse counter for clearer naming (dropout_use_1, dropout_use_2, ...)
@@ -1800,6 +1800,10 @@ class ASTParserTorch(ASTParser):
 
         # Set inputs_outputs for synthetic layer with current call's input/output
         self.inputs_outputs[synthetic_name] = [input_var, output_var]
+
+        # Restore original inputs_outputs for the base layer (from first use)
+        if original_inputs_outputs:
+            self.inputs_outputs[module_name] = original_inputs_outputs
 
         # Copy name_module_input from original module (set before module_of_output overwrite)
         # This has the correct input source
@@ -1856,6 +1860,9 @@ class ASTParserTorch(ASTParser):
         # Save input source BEFORE overwriting module_of_output (for layer reuse)
         input_source_module = self.module_of_output.get(input_var) if input_var in self.module_of_output else None
 
+        # Save original inputs_outputs BEFORE overwriting (for layer reuse restoration)
+        original_inputs_outputs = self.inputs_outputs.get(module_name)
+
         print(f"[DEBUG _process_module_api] module_name={module_name}, input_var={input_var}, output_var={output_var}, input_source_module={input_source_module}")
 
         self.inputs_outputs[module_name] = [input_var, output_var]
@@ -1882,7 +1889,7 @@ class ASTParserTorch(ASTParser):
                 module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
             if module_obj and module_obj in self.buml_model.modules:
-                self._handle_module_layer_reuse(node, module_name, module_obj)
+                self._handle_module_layer_reuse(node, module_name, module_obj, original_inputs_outputs)
             elif module_obj:
                 self.buml_model.modules.append(module_obj)
 
