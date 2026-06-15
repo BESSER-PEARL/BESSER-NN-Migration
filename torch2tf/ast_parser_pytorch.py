@@ -1315,6 +1315,19 @@ class ASTParserTorch(ASTParser):
                     # Track as variable alias - result_var is just an alias for subscripted_var
                     self.module_of_output[result_var] = prev_module_name
                     self.variable_aliases[result_var] = subscripted_var
+
+                    # Update inputs_outputs to preserve variable name assignment
+                    # For auto-generated temp vars, use subscripted_var for both to prevent dead code
+                    # For user-defined vars, preserve the assignment (x = h) for code readability
+                    if result_var.startswith('_subscript_temp_'):
+                        # Auto-generated: don't create assignment, use source var directly
+                        target_var = subscripted_var
+                    else:
+                        # User-defined: preserve variable name with assignment
+                        target_var = result_var
+
+                    self.inputs_outputs[prev_module_name] = [subscripted_var, target_var]
+
                     self.previous_assign = node
                     return True
             else:
