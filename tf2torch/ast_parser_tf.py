@@ -1457,7 +1457,7 @@ class ASTParserTF(ASTParser):
                     self.previous_assign = synthetic_node
                 return
 
-        # Handle nested calls
+        # Handle nested calls and subscripts in arguments
         is_nested_call = False
         if isinstance(node.value, ast.Call) and node.value.args:
             if isinstance(node.value.args[0], ast.Call):
@@ -1476,6 +1476,24 @@ class ASTParserTF(ASTParser):
                 self.previous_assign = inner_node
 
                 # Replace inner call with temp variable in outer call
+                node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+                is_nested_call = True
+            elif isinstance(node.value.args[0], ast.Subscript):
+                # Subscript in argument detected: process subscript first
+                subscript_node = node.value.args[0]
+                temp_name = f"_subscript_arg_{self.tensor_op_counter}"
+                self.tensor_op_counter += 1
+                temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+
+                # Create synthetic node for subscript
+                subscript_assign = ast.Assign(targets=[temp_target], value=subscript_node)
+                subscript_assign.lineno = node.lineno
+                subscript_assign.col_offset = node.col_offset
+                # Process the subscript using handle_forward_slicing
+                self.handle_forward_slicing(subscript_assign)
+                self.previous_assign = subscript_assign
+
+                # Replace subscript with temp variable in outer call
                 node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
                 is_nested_call = True
 
