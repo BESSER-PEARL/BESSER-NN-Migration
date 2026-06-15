@@ -2560,7 +2560,28 @@ class ASTParserTF(ASTParser):
         # Check if current module is CNN or spatial tensorop
         if isinstance(module, Layer):
             if module.__class__.__name__ in cnns:
-                current_cnn = True
+                # Special case: BatchNormLayer is only CNN if prev layer was also CNN
+                # (i.e., it operates on spatial data, not vectors)
+                if module.__class__.__name__ == "BatchNormLayer":
+                    # First determine prev_cnn to check if BatchNorm should be treated as CNN
+                    temp_prev_cnn = False
+                    if module.name_module_input:
+                        prev_module_name = module.name_module_input
+                        temp_prev_module = next((obj for obj in modules if
+                                            obj.name == prev_module_name), None)
+                        if temp_prev_module and isinstance(temp_prev_module, Layer):
+                            if temp_prev_module.__class__.__name__ in cnns:
+                                temp_prev_cnn = True
+                        elif temp_prev_module and isinstance(temp_prev_module, TensorOp):
+                            if temp_prev_module.tns_type in ("interpolate", "pad"):
+                                temp_prev_cnn = True
+
+                    # Only treat BatchNorm as CNN if previous layer was CNN
+                    if temp_prev_cnn:
+                        current_cnn = True
+                else:
+                    current_cnn = True
+
                 if module.name_module_input:
                     prev_module_name = module.name_module_input
                     prev_module = next((obj for obj in modules if
