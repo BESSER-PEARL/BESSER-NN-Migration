@@ -880,6 +880,12 @@ class ASTParserTF(ASTParser):
                 self.rnn_hidden_vars[module_name] = var2
                 # Track hidden state with special suffix to distinguish from output sequence
                 self.module_of_output[var2] = module_name + "__hidden"
+                # Store in inputs_outputs for generator to use original variable name
+                # Use var2 as both input and output to preserve the original unpacked variable name
+                self.inputs_outputs[module_name + "__hidden"] = [var2, var2]
+            elif var2 == "_":
+                # Store "_" to tell generator to use underscore instead of auto-generating a name
+                self.inputs_outputs[module_name + "__hidden"] = ["_", "_"]
 
         elif num_targets == 3:
             var1 = node.targets[0].elts[0].id if isinstance(node.targets[0].elts[0], ast.Name) else None
@@ -916,9 +922,19 @@ class ASTParserTF(ASTParser):
                     self.rnn_hidden_vars[module_name] = var2
                     # Track hidden state with special suffix to distinguish from output sequence
                     self.module_of_output[var2] = module_name + "__hidden"
+                    # Store in inputs_outputs for generator to use original variable name
+                    self.inputs_outputs[module_name + "__hidden"] = [var2, var2]
+                elif var2 == "_":
+                    # Store "_" to tell generator to use underscore
+                    self.inputs_outputs[module_name + "__hidden"] = ["_", "_"]
                 if var3 and var3 != "_":
                     # Track cell state for LSTM with special suffix
                     self.module_of_output[var3] = module_name + "__cell"
+                    # Store in inputs_outputs for generator to use original variable name
+                    self.inputs_outputs[module_name + "__cell"] = [var3, var3]
+                elif var3 == "_":
+                    # Store "_" to tell generator to use underscore
+                    self.inputs_outputs[module_name + "__cell"] = ["_", "_"]
 
         elif num_targets == 5:
             # Bidirectional LSTM: out, fwd_h, fwd_c, bwd_h, bwd_c = self.bilstm(x)
