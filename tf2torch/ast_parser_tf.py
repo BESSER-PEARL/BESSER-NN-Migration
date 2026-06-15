@@ -1759,42 +1759,26 @@ class ASTParserTF(ASTParser):
 
     def _try_merge_activation(self, node, module_name):
         """Try to merge activation with previous layer. Returns (merged, prev_layer_name)."""
-        if not hasattr(self, 'previous_assign') or not self.previous_assign:
-            return False, None
-
-        if not hasattr(self.previous_assign.value.func, 'attr'):
-            return False, None
-
-        prev_lyr_name = self.previous_assign.value.func.attr
-        prev_lyr_obj = self._get_layer_by_name(prev_lyr_name)
-        if not prev_lyr_obj:
-            return False, None
-
-        actv = self.activation_functions[module_name]
-        # actv might already be the BUML name (relu) or TF name (relu)
-        actv_func = actv if actv in tf_actv_func_mapping.values() else actv
-
-        prev_lyr_obj.actv_func = actv_func
-        output_var = node.targets[0].id
-        self.module_of_output[output_var] = prev_lyr_name
-        return True, prev_lyr_name
+        # For TensorFlow: standalone activation layers (layers.ReLU(), layers.Activation('sigmoid'))
+        # should NOT be merged - they should preserve their original layer names.
+        # Only inline activations (Dense(activation='relu')) would already be part of the layer.
+        # Since standalone activations are separate layer calls, we don't merge them.
+        return False, None
 
     def _create_standalone_activation(self, node, module_name):
         """Create standalone activation layer."""
-        unique_name = f"{module_name}_{self.tensor_op_counter}"
-        self.tensor_op_counter += 1
-
+        # Preserve original module name for standalone activations
         actv = self.activation_functions[module_name]
         # actv might already be the BUML name (relu) or need mapping
         actv_func = actv if actv in tf_actv_func_mapping.values() else actv
 
-        actv_lyr = mm_classes.GeneralLayer(name=unique_name, actv_func=actv_func)
+        actv_lyr = mm_classes.GeneralLayer(name=module_name, actv_func=actv_func)
         self.buml_model.modules.append(actv_lyr)
 
         input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
         output_var = node.targets[0].id
-        self.inputs_outputs[unique_name] = [input_var, output_var]
-        self.module_of_output[output_var] = unique_name
+        self.inputs_outputs[module_name] = [input_var, output_var]
+        self.module_of_output[output_var] = module_name
 
     def _handle_module_activation(self, node, module_name):
         """Handle module API activation layers with merge logic."""
