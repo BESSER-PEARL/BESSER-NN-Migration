@@ -1374,12 +1374,8 @@ class ASTParserTorch(ASTParser):
         subscripted_var = node.value.value.id
         result_var = node.targets[0].id
 
-        print(f"[DEBUG handle_forward_slicing] subscripted_var={subscripted_var}, result_var={result_var}")
-        print(f"[DEBUG handle_forward_slicing] module_of_output keys: {list(self.module_of_output.keys())}")
-
         # Look up which module produced this variable
         if subscripted_var not in self.module_of_output:
-            print(f"[DEBUG handle_forward_slicing] NOT in module_of_output -> calling _handle_non_rnn_slicing")
             self._handle_non_rnn_slicing(node, subscripted_var, result_var)
             return
 
