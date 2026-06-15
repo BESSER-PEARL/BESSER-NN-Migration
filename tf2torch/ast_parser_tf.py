@@ -342,21 +342,36 @@ class ASTParserTF(ASTParser):
         return False
 
     def _handle_module_layer_reuse(self, node, module_name, module_obj):
-        """Handle layer reuse by creating synthetic copy."""
-        import copy
-        synthetic_name = f"{module_name}_use_{self.tensor_op_counter}"
-        self.tensor_op_counter += 1
+        """Handle layer reuse - reuse stateless layers, copy stateful ones."""
+        # Stateless layers can be reused without creating copies
+        # These layers have no trainable parameters or internal state that changes during training
+        stateless_layer_types = ("DropoutLayer", "GeneralLayer")  # GeneralLayer is for activations
 
-        synthetic_module = copy.copy(module_obj)
-        synthetic_module.name = synthetic_name
+        layer_class_name = module_obj.__class__.__name__
 
-        if module_name in self.inputs_outputs:
-            self.inputs_outputs[synthetic_name] = self.inputs_outputs[module_name]
+        if layer_class_name in stateless_layer_types:
+            # Reuse the same layer - append the same module object again
+            # This will generate multiple calls to the same layer instance in forward()
+            output_var = node.targets[0].id
+            self.module_of_output[output_var] = module_name
+            # Append the same module again so it appears in the forward pass
+            self.buml_model.modules.append(module_obj)
+        else:
+            # Stateful layers (Dense, Conv, RNN, etc.) need copies for reuse
+            import copy
+            synthetic_name = f"{module_name}_use_{self.tensor_op_counter}"
+            self.tensor_op_counter += 1
 
-        output_var = node.targets[0].id
-        self.module_of_output[output_var] = synthetic_name
+            synthetic_module = copy.copy(module_obj)
+            synthetic_module.name = synthetic_name
 
-        self.buml_model.modules.append(synthetic_module)
+            if module_name in self.inputs_outputs:
+                self.inputs_outputs[synthetic_name] = self.inputs_outputs[module_name]
+
+            output_var = node.targets[0].id
+            self.module_of_output[output_var] = synthetic_name
+
+            self.buml_model.modules.append(synthetic_module)
 
     def _handle_layer_reuse_in_concat(self, layer_obj, arg, layer_name):
         """Handle layer reuse in concatenation."""
