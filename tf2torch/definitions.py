@@ -88,18 +88,20 @@ loss_func_mapping = {"CategoricalCrossentropy": "crossentropy",
                     "MeanSquaredError": "mse"}
 
 
-pos_params = {"Dense": ["units", "activation"],
-              "Embedding": ["input_dim", "output_dim"],
-              "SimpleRNN": ["units", "activation"],
-              "LSTM": ["units", "activation"],
-              "GRU": ["units", "activation"],
-              "Conv": ["filters", "kernel_size", "strides", "padding"],
-              "AveragePooling": ["pool_size", "strides", "padding"],
-              "MaxPooling": ["pool_size", "strides", "padding"],
-              "AdaptiveAveragePooling": ["output_size"],
-              "AdaptiveMaxPooling": ["output_size"],
-              "Dropout ": ["rate"],
-              "LayerNormalization": ["axis"]}
+pos_params = {
+    "Dense": ["units", "activation", "use_bias"],
+    "Embedding": ["input_dim", "output_dim"],
+    "SimpleRNN": ["units", "activation"],
+    "LSTM": ["units", "activation"],
+    "GRU": ["units", "activation"],
+    "Conv": ["filters", "kernel_size", "strides", "padding"],
+    "AveragePooling": ["pool_size", "strides", "padding"],
+    "MaxPooling": ["pool_size", "strides", "padding"],
+    "AdaptiveAveragePooling": ["output_size"],
+    "AdaptiveMaxPooling": ["output_size"],
+    "Dropout ": ["rate"],
+    "LayerNormalization": ["axis"]
+}
 
 int2list_params = ["kernel_size", "strides", "pool_size",
                    "output_size", "axis"]
