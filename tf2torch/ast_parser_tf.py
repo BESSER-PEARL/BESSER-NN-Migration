@@ -2732,6 +2732,13 @@ def process_params(lyr_type: str, lyr_params: dict):
         elif param in ["dropout", "recurrent_dropout"]:
             # Skip dropout params - handled separately above
             pass
+        elif param == "mask_zero":
+            # TensorFlow Embedding mask_zero → PyTorch padding_idx
+            # mask_zero=True → padding_idx=0 (TF always masks at index 0)
+            # mask_zero=False → no padding_idx
+            if lyr_params[param] is True:
+                updated_lyr_params["padding_idx"] = 0
+            # If mask_zero=False, don't add padding_idx (leave as None)
         elif param in params_mapping:
             updated_lyr_params[params_mapping[param]] = lyr_params[param]
         elif param in ["units", "positional_params", "name"]:

@@ -46,7 +46,6 @@ params_mapping = {
 
 # TF-specific parameters that don't exist in PyTorch and should be silently ignored
 excluded_params = [
-    "mask_zero",  # Embedding: TF-specific masking, no direct PyTorch equivalent
     "time_major",  # RNN: TF-specific, PyTorch uses batch_first instead
     "unroll",  # RNN: TF-specific optimization hint
     "go_backwards",  # RNN: TF-specific, rare usage
