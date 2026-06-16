@@ -41,7 +41,7 @@ class ASTParser(ast.NodeVisitor):
 
         self.input_nn_type: str = input_nn_type
         self.only_nn: bool = only_nn
-        self.buml_model: NN = NN(name="my_nn") #the name will be updated later
+        self.buml_model: NN = NN(name="my_nn")  # the name will be updated later
         self.previous_assign: ast.AST | None = None
 
         self.data_config: dict = {"config": {}, "train_data": {},
@@ -116,7 +116,7 @@ class ASTParser(ast.NodeVisitor):
 
         # Set 'input_reused' and 'name_module_input' layer parameters
         self.set_remaining_lyr_params()
-        # Add permute before and after conv blocks to make TF and Pytorch eqv
+        # Add permute before and after conv blocks to make TF and PyTorch equivalent
         self.add_permute_dim()
         # Add squeeze after global pooling layers (TF to PyTorch specific)
         if hasattr(self, 'add_squeeze_for_global_pooling'):
@@ -279,18 +279,13 @@ class ASTParser(ast.NodeVisitor):
         Returns:
             None, but processes the return value and tracks multiple return values.
         """
-        print(f"[DEBUG visit_Return] node.value type: {type(node.value).__name__}")
-
         # Only process if we're in a class (forward method) and input_nn_type is subclassing
         if not self.in_class or self.input_nn_type != "subclassing":
-            print(f"[DEBUG visit_Return] Skipping: in_class={self.in_class}, input_nn_type={self.input_nn_type}")
             return
 
         # Handle expressions that need to be converted to assignments to ensure full processing
         # Use '_return_output' as the synthetic variable name (doesn't matter since it's the last op)
         if isinstance(node.value, (ast.Call, ast.BinOp, ast.Subscript, ast.UnaryOp, ast.IfExp)):
-            print(f"[DEBUG visit_Return] Creating synthetic assignment for expression: _return_output = <{type(node.value).__name__}>")
-
             # Create a synthetic assignment node for processing
             # This allows reusing the existing assignment processing logic
             synthetic_assign = ast.Assign(
@@ -314,19 +309,17 @@ class ASTParser(ast.NodeVisitor):
             if not hasattr(self, 'pytorch_return_vars'):
                 self.pytorch_return_vars = []
             self.pytorch_return_vars = pytorch_return_vars
-            print(f"[DEBUG visit_Return] Tuple return: {pytorch_return_vars}")
 
-        # Handle simple name returns (e.g., return x) - no processing needed
+        # Handle simple name returns (e.g., return x): no processing needed
         elif isinstance(node.value, ast.Name):
-            print(f"[DEBUG visit_Return] Simple name return: {node.value.id} - no processing needed")
+            pass  # No processing needed
 
-        # Handle constants (e.g., return None, return 5) - no processing needed
+        # Handle constants (e.g., return None, return 5): no processing needed
         elif isinstance(node.value, (ast.Constant, ast.Num)) or node.value is None:
-            print(f"[DEBUG visit_Return] Constant/None return - no processing needed")
+            pass  # No processing needed
 
-        # Handle other types (List, Dict, etc.) - create synthetic assignment to be safe
+        # Handle other types (List, Dict, etc.): create synthetic assignment to be safe
         else:
-            print(f"[DEBUG visit_Return] Other return type ({type(node.value).__name__}) - creating synthetic assignment")
             synthetic_assign = ast.Assign(
                 targets=[ast.Name(id='_return_output', ctx=ast.Store())],
                 value=node.value
@@ -615,7 +608,7 @@ class ASTParser(ast.NodeVisitor):
         """
         if isinstance(call_node.func, ast.Name):
             layer_type = call_node.func.id
-        else: #isinstance(call_node.func, ast.Attribute):
+        else:  # isinstance(call_node.func, ast.Attribute):
             layer_type = call_node.func.attr
 
         params = self.extract_layer_params(call_node)

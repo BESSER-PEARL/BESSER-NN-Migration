@@ -62,10 +62,10 @@ def parse_arguments_transform():
 def str2bool(v):
     """
     Parse bool from a string input
-    
+
     Parameters:
     ----------
-    value(str): The bool in a string format.
+    v(str): The bool in a string format.
 
     Returns:
     -------
@@ -151,7 +151,7 @@ def transform(args: argparse.Namespace, framework: str,
         for module in nn_obj.modules:
             if isinstance(module, Layer):
                 buml_model.add_layer(module)
-            #automatically appends to modules
+            # automatically appends to modules
             elif isinstance(module, NN):
                 buml_model.add_sub_nn(module)
             else:
@@ -196,7 +196,7 @@ def param_to_list(lyr_type: str, lyr_params: dict, params_to_convert: list,
 
     Parameters:
         lyr_type (str): The type of the layer.
-        lyr_params (dict): A dictionnary of all the layer parameters and their
+        lyr_params (dict): A dictionary of all the layer parameters and their
             values.
         params_to_convert (list): The list of parameters to be converted.
         layers_of_params (list): The list of layers that need their params
@@ -230,7 +230,7 @@ def process_positional_params(lyr_type: str, lyr_params: dict,
 
     Parameters:
         lyr_type (str): The type of the layer.
-        lyr_params (dict): A dictionnary of all the layer parameters
+        lyr_params (dict): A dictionary of all the layer parameters
             and their values.
         pos_params (dict): A dictionary storing the as keys layers 
             types and as values the names of their positional params.
@@ -242,12 +242,10 @@ def process_positional_params(lyr_type: str, lyr_params: dict,
         (e for e in pos_params if lyr_type.startswith(e)), None
     )
     if lyr_of_pos_parm and lyr_params["positional_params"]:
-        counter = 0
         pos_params_with_values = {}
-        for pos_arg in lyr_params["positional_params"]:
-            par = pos_params[lyr_of_pos_parm][counter]
+        for i, pos_arg in enumerate(lyr_params["positional_params"]):
+            par = pos_params[lyr_of_pos_parm][i]
             pos_params_with_values[par] = pos_arg
-            counter+=1
         lyr_params.update(pos_params_with_values)
     lyr_params.pop("positional_params")
 
@@ -255,19 +253,19 @@ def process_positional_params(lyr_type: str, lyr_params: dict,
 def set_static_params(lyr_type: str, lyr_params: dict,
                       static_params: dict):
     """
-    It handles the parameters that are retreived from the layer type.
+    It handles the parameters that are retrieved from the layer type.
     Ex: For a MaxPool1D layer, 'pooling_type' ('max) and 'dimension ('1D')
     are retrieved.
 
     Parameters:
         lyr_type (str): The type of the layer.
-        lyr_params (dict): A dictionnary of all the layer parameters
+        lyr_params (dict): A dictionary of all the layer parameters
             and their values.
-        static_params (dict): A dictionary storing as keys the layers 
+        static_params (dict): A dictionary storing as keys the layers
             types and as values their fixed params.
 
     Returns:
-        Nones
+        None
     """
     if lyr_type in static_params:
         lyr_params.update(static_params[lyr_type])
@@ -298,7 +296,7 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
     if layer_name not in inputs_outputs:
         return
 
-    # Skip identity tensorops - they should preserve exact variable names
+    # Skip identity tensorops: they should preserve exact variable names
     if hasattr(lyr_obj, 'tns_type') and lyr_obj.tns_type == 'identity':
         return
 
@@ -318,17 +316,17 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
         if not hasattr(lyr_obj, 'name_module_input') or lyr_obj.name_module_input is None:
             # Determine if input is the original network input or from another module
             if input_var in module_of_output:
-                # Input variable is produced by some module - check if it comes before or after
+                # Input variable is produced by some module: check if it comes before or after
                 producing_module_name = module_of_output[input_var]
                 producing_module = next((m for m in modules_list if m.name == producing_module_name), None)
                 if producing_module:
                     producing_index = modules_list.index(producing_module)
                     if producing_index < current_index:
-                        # Producing module comes BEFORE - input from that module
+                        # Producing module comes BEFORE (input from that module)
                         lyr_obj.name_module_input = producing_module_name
                     else:
-                        # Producing module comes AFTER - input is original network input
+                        # Producing module comes AFTER (input is original network input)
                         lyr_obj.name_module_input = 'INPUT'
             else:
-                # Input variable not produced by any module - original network input
+                # Input variable not produced by any module (original network input)
                 lyr_obj.name_module_input = 'INPUT'

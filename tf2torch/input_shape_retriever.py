@@ -271,7 +271,7 @@ def extract_and_modify_code(file_path: str, shape: tuple | None,
 
     for mdl_name, mdl_details in input_shape_all.items():
         if input_shape_from_call.get(mdl_details[-1], None):
-            # Skip overwrite for LayerNormalization - it has axis info in position [2]
+            # Skip overwrite for LayerNormalization: it has axis info in position [2]
             # and full shape in position [1]
             if mdl_details[0] == 'LayerNormalization':
                 continue
@@ -305,7 +305,7 @@ def extract_dict_from_output(output: str):
     Returns:
         A python dictionary or None if not found.
     """
-    # Regular expression to match the first dictionary-like structure
+    # Regular expression to match the first dictionary like structure
     # Match everything starting with `{` and ending with `}`, considering
     # nested braces
     match = re.search(r'\{.*\}', output.strip())

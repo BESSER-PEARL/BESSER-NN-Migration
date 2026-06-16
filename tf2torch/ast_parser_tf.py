@@ -6,6 +6,7 @@ It also extracts data and model configuration attributes.
 
 
 import ast
+import copy
 import sys
 sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 import besser.BUML.metamodel.nn as mm_classes
@@ -49,7 +50,7 @@ def infer_batchnorm_params(buml_model):
 
         # Check if it's a conv layer
         if layer_class in ["Conv1D", "Conv2D", "Conv3D"]:
-            # Extract dimension from class name (Conv1D -> 1D)
+            # Extract dimension from class name (Conv1D yields 1D)
             dim = layer_class[-2:]  # Gets "1D", "2D", or "3D"
             num_features = layer.out_channels
             return {"dimension": dim, "num_features": num_features}
@@ -350,7 +351,7 @@ class ASTParserTF(ASTParser):
         layer_class_name = module_obj.__class__.__name__
 
         if layer_class_name in stateless_layer_types:
-            # Reuse the same layer - append the same module object again
+            # Reuse the same layer: append the same module object again
             # This will generate multiple calls to the same layer instance in forward()
             output_var = node.targets[0].id
             self.module_of_output[output_var] = module_name
@@ -358,7 +359,6 @@ class ASTParserTF(ASTParser):
             self.buml_model.modules.append(module_obj)
         else:
             # Stateful layers (Dense, Conv, RNN, etc.) need copies for reuse
-            import copy
             synthetic_name = f"{module_name}_use_{self.tensor_op_counter}"
             self.tensor_op_counter += 1
 
@@ -375,7 +375,6 @@ class ASTParserTF(ASTParser):
 
     def _handle_layer_reuse_in_concat(self, layer_obj, arg, layer_name):
         """Handle layer reuse in concatenation."""
-        import copy
         self.layer_reuse_count[layer_name] = self.layer_reuse_count.get(layer_name, 0) + 1
         use_count = self.layer_reuse_count[layer_name]
 
@@ -514,13 +513,13 @@ class ASTParserTF(ASTParser):
             # Inline tensor operation (e.g., x.squeeze(0))
             return self.extract_inline_tensorop(operand_node, node)
         elif isinstance(operand_node, ast.Subscript):
-            # Subscript operation (e.g., x[:, -1])
+            # Subscript operation (e.g., x[:, last_index])
             temp_name = self.TEMP_SUBSCRIPT.format(self.tensor_op_counter)
             self.tensor_op_counter += 1
             self.handle_subscript_operation(operand_node, temp_name, node)
             return temp_name
         elif isinstance(operand_node, ast.BinOp):
-            # Nested binary operation - recursively handle it
+            # Nested binary operation: recursively handle it
             temp_name = self.TEMP_BINOP.format(self.tensor_op_counter)
             self.tensor_op_counter += 1
             temp_target = ast.Name(id=temp_name, ctx=ast.Store())
@@ -586,7 +585,7 @@ class ASTParserTF(ASTParser):
         if isinstance(call_node.func.value, ast.Name):
             # Check if this is a functional call (tf.operation) or method call (tensor.operation)
             if call_node.func.value.id == 'tf':
-                # Functional call like tf.squeeze(out, axis=1) - tensor is in args[0]
+                # Functional call like tf.squeeze(out, axis=1): tensor is in args[0]
                 if call_node.args:
                     first_arg = call_node.args[0]
                     if isinstance(first_arg, ast.Name):
@@ -596,7 +595,7 @@ class ASTParserTF(ASTParser):
                         return self.extract_inline_tensorop(first_arg, parent_node)
                 return "x"
             else:
-                # Method call like out.squeeze(1) - tensor is the object
+                # Method call like out.squeeze(1): tensor is the object
                 return call_node.func.value.id
         elif isinstance(call_node.func.value, ast.Call):
             return self.extract_inline_tensorop(call_node.func.value, parent_node)
@@ -688,11 +687,11 @@ class ASTParserTF(ASTParser):
                 else:
                     return f"{lower}:{upper}" if lower or upper else ":"
             elif isinstance(slice_node, ast.Tuple):
-                # Multi-dimensional slicing like [:, -1, :]
+                # Multi-dimensional slicing like [:, last_index, :]
                 elements = [slice_to_string(elt) for elt in slice_node.elts]
                 return ", ".join(elements)
             else:
-                # Single index like -1 or 0
+                # Single index like last_index or 0
                 return ast.unparse(slice_node)
 
         pattern = slice_to_string(subscript_node.slice)
@@ -899,7 +898,7 @@ class ASTParserTF(ASTParser):
                 # Use var2 as both input and output to preserve the original unpacked variable name
                 self.inputs_outputs[module_name + "__hidden"] = [var2, var2]
             elif var2 == "_":
-                # Store "_" to tell generator to use underscore instead of auto-generating a name
+                # Store "_" to tell generator to use underscore instead of auto generating a name
                 self.inputs_outputs[module_name + "__hidden"] = ["_", "_"]
 
         elif num_targets == 3:
@@ -919,7 +918,7 @@ class ASTParserTF(ASTParser):
                 # Check if forward/backward components are used separately
                 uses_separate_components = (var2 and var2 != "_") or (var3 and var3 != "_")
                 if uses_separate_components and module_obj:
-                    # Mark that this layer should NOT auto-concatenate hidden states
+                    # Mark that this layer should NOT auto concatenate hidden states
                     module_obj.skip_hidden_concat = True
 
                 # Both var2 and var3 are hidden states (forward and backward)
@@ -970,7 +969,7 @@ class ASTParserTF(ASTParser):
                 # because the TF code accesses forward/backward separately
                 module_obj.skip_hidden_concat = True
 
-            # var2 and var4 are forward and backward hidden states - track with original TF names
+            # var2 and var4 are forward and backward hidden states: track with original TF names
             if var2 and var2 != "_":
                 self.module_of_output[var2] = module_name + "__hidden_forward"
             if var4 and var4 != "_":
@@ -1208,8 +1207,8 @@ class ASTParserTF(ASTParser):
 
     def handle_init(self, node: ast.Assign):
         """
-        It retrieves the sub_nn layers and stores them in the 'sub_nn' 
-        dict. It also retreives the layers and their parameters and 
+        It retrieves the sub_nn layers and stores them in the 'sub_nn'
+        dict. It also retrieves the layers and their parameters and
         stores them in the 'layers' dict.
 
         Parameters:
@@ -1226,14 +1225,14 @@ class ASTParserTF(ASTParser):
             if module_type == "Sequential":
                 self.handle_sequential_layers(node, module_name)
 
-        #simple calls to layers
+        # simple calls to layers
         elif (isinstance(node.value, ast.Call) and
             isinstance(node.value.func, ast.Attribute)):
             # Check for tf.keras.Sequential
             if (hasattr(node.value.func, 'attr') and
                 node.value.func.attr == "Sequential"):
                 self.handle_sequential_layers(node, module_name)
-                # Don't return - let modules.clear() execute below
+                # Don't return: let modules.clear() execute below
             else:
                 lyr_type, lyr_params = self.extract_layer(node.value)
 
@@ -1241,7 +1240,7 @@ class ASTParserTF(ASTParser):
                 if lyr_type in actv_fun_mapping:
                     # Store activation function for later use in forward pass
                     if lyr_type == "Activation":
-                        # layers.Activation('relu') - extract activation name from first arg
+                        # layers.Activation('relu'): extract activation name from first arg
                         if len(node.value.args) > 0 and isinstance(node.value.args[0], ast.Constant):
                             actv_name = node.value.args[0].value
                         else:
@@ -1254,7 +1253,7 @@ class ASTParserTF(ASTParser):
                 else:
                     # Regular layer processing
 
-                    if len(node.value.args)>0: #rnn bidirectional
+                    if len(node.value.args) > 0:  # rnn bidirectional
                         if (isinstance(node.value.args[0], ast.Call) and
                             node.value.func.attr == "Bidirectional"):
                             lyr = node.value.args[0]
@@ -1269,8 +1268,10 @@ class ASTParserTF(ASTParser):
 
                     # Warn about recurrent_dropout having no PyTorch equivalent
                     if has_recurrent_dropout:
-                        print(f"WARNING: TensorFlow layer '{module_name}' has recurrent_dropout parameter, "
-                              f"which has no equivalent in PyTorch LSTM/GRU/SimpleRNN. This parameter is not migrated.")
+                        self.migration_warnings.append(
+                            f"TensorFlow layer '{module_name}' has recurrent_dropout parameter, "
+                            f"which has no equivalent in PyTorch LSTM/GRU/SimpleRNN. This parameter is not migrated."
+                        )
 
                     if not lyr_type.startswith("ZeroPadding"):
                         # Add Dropout layer to __init__ if dropout param was present
@@ -1295,7 +1296,7 @@ class ASTParserTF(ASTParser):
                         buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
                         self.buml_model.add_layer(buml_layer)
 
-        #to get the proper order from forward the method
+        # to get the proper order from forward the method
         self.buml_model.modules.clear()
 
 
@@ -1357,7 +1358,7 @@ class ASTParserTF(ASTParser):
                         layer_id += 1
                     continue
 
-                if len(elt.args)>0: #rnn bidirectional
+                if len(elt.args) > 0:  # rnn bidirectional
                     if (isinstance(elt.args[0], ast.Call) and
                         isinstance(elt.func, ast.Attribute)):
                         if  elt.func.attr == "Bidirectional":
@@ -1372,8 +1373,10 @@ class ASTParserTF(ASTParser):
 
                 # Warn about recurrent_dropout having no PyTorch equivalent
                 if has_recurrent_dropout:
-                    print(f"WARNING: Sequential layer has recurrent_dropout parameter, "
-                          f"which has no equivalent in PyTorch LSTM/GRU/SimpleRNN. This parameter is not migrated.")
+                    self.migration_warnings.append(
+                        "Sequential layer has recurrent_dropout parameter, "
+                        "which has no equivalent in PyTorch LSTM/GRU/SimpleRNN. This parameter is not migrated."
+                    )
 
                 if not lyr_type.startswith("ZeroPadding"):
                     # Add Dropout layer before RNN if dropout param was present
@@ -1651,14 +1654,14 @@ class ASTParserTF(ASTParser):
         if isinstance(node.value.func.value, ast.Name):
             if node.value.func.value.id == "self":
                 module_name = node.value.func.attr
-                #populate inputs_outputs and module_of_output
+                # populate inputs_outputs and module_of_output
                 # Handle different argument types (Name, Call, etc.)
                 if node.value.args:
                     arg = node.value.args[0]
                     if isinstance(arg, ast.Name):
                         input_var = arg.id
                     elif isinstance(arg, ast.Call):
-                        # Nested call - use the temp variable created earlier
+                        # Nested call: use the temp variable created earlier
                         input_var = f"_nested_temp_{self.tensor_op_counter - 1}"
                     else:
                         input_var = "x"
@@ -1714,13 +1717,13 @@ class ASTParserTF(ASTParser):
                 elif module_obj:
                     self.buml_model.modules.append(module_obj)
             else:
-                #tensorops or tf.nn.* activations
+                # tensorops or tf.nn.* activations
                 # Check if it's tf.nn.<activation>
                 if (isinstance(node.value.func.value, ast.Attribute) and
                     node.value.func.value.attr == "nn" and
                     isinstance(node.value.func.value.value, ast.Name) and
                     node.value.func.value.value.id == "tf"):
-                    # This is tf.nn.* - check if activation
+                    # This is tf.nn.*: check if activation
                     func_name = node.value.func.attr
                     if func_name in tf_actv_func_mapping:
                         self.handle_tf_activation(node, func_name)
@@ -1790,16 +1793,14 @@ class ASTParserTF(ASTParser):
             if input_var in self.module_of_output:
                 self.module_of_output[node.targets[0].id] = self.module_of_output[input_var]
 
-    def _try_merge_activation(self, node, module_name):
-        """Try to merge activation with previous layer. Returns (merged, prev_layer_name)."""
-        # For TensorFlow: standalone activation layers (layers.ReLU(), layers.Activation('sigmoid'))
-        # should NOT be merged - they should preserve their original layer names.
-        # Only inline activations (Dense(activation='relu')) would already be part of the layer.
-        # Since standalone activations are separate layer calls, we don't merge them.
-        return False, None
+    def _handle_module_activation(self, node, module_name):
+        """
+        Handle module API activation layers.
 
-    def _create_standalone_activation(self, node, module_name):
-        """Create standalone activation layer."""
+        For TensorFlow: standalone activation layers (layers.ReLU(), layers.Activation('sigmoid'))
+        are never merged with previous layers to preserve their original layer names.
+        Only inline activations (Dense(activation='relu')) would already be part of the layer.
+        """
         # Preserve original module name for standalone activations
         actv = self.activation_functions[module_name]
         # actv might already be the BUML name (relu) or need mapping
@@ -1812,12 +1813,6 @@ class ASTParserTF(ASTParser):
         output_var = node.targets[0].id
         self.inputs_outputs[module_name] = [input_var, output_var]
         self.module_of_output[output_var] = module_name
-
-    def _handle_module_activation(self, node, module_name):
-        """Handle module API activation layers with merge logic."""
-        merged, _ = self._try_merge_activation(node, module_name)
-        if not merged:
-            self._create_standalone_activation(node, module_name)
 
     def _extract_source_variable(self, op_args, node, op_type):
         """
@@ -2287,7 +2282,9 @@ class ASTParserTF(ASTParser):
         elif op_type == "resize":
             tensorop_param = self._extract_resize(node, op_args)
         else:
-            print(f"{op_type} is not recognized!")
+            self.migration_warnings.append(
+                f"TensorOp type '{op_type}' is not recognized and will be skipped."
+            )
 
         # Handle dropout as a layer instead of tensorop
         if (tensorop_param and
@@ -2658,7 +2655,7 @@ def transform_layer(lyr_type: str, lyr_params: dict,
 
     Parameters:
         lyr_type (str): The type of the layer (TensorFlow).
-        lyr_params (dict): A dictionnary storing the layer parameters and
+        lyr_params (dict): A dictionary storing the layer parameters and
             their values.
         padding_amount (int | None): It  keeps track of padding in
             ZeroPadding layer. In TF, padding is added to conv layers
@@ -2692,7 +2689,7 @@ def process_params(lyr_type: str, lyr_params: dict):
 
     Parameters:
         lyr_type (str): The type of the layer (TensorFlow).
-        lyr_params (dict): A dictionnary storing the layer parameters and
+        lyr_params (dict): A dictionary storing the layer parameters and
             their values.
 
     Returns:
@@ -2730,7 +2727,7 @@ def process_params(lyr_type: str, lyr_params: dict):
             # Skip these, handled below to determine return_type
             pass
         elif param in ["dropout", "recurrent_dropout"]:
-            # Skip dropout params - handled separately above
+            # Skip dropout params: handled separately above
             pass
         elif param == "mask_zero":
             # TensorFlow Embedding mask_zero → PyTorch padding_idx
@@ -2771,7 +2768,7 @@ def set_conv_padding(layer_type, lyr_params, padding_amount):
 
     Parameters:
         lyr_type (str): The type of the layer (TensorFlow).
-        lyr_params (dict): A dictionnary storing the layer parameters and
+        lyr_params (dict): A dictionary storing the layer parameters and
             their values.
         padding_amount (int | None): It  keeps track of padding in
             ZeroPadding layer. In TF, padding is added to conv layers
@@ -2789,7 +2786,7 @@ def set_conv_padding(layer_type, lyr_params, padding_amount):
         # Handle TF padding='same' -> calculate PyTorch padding amount
         # Note: At this point params haven't been mapped yet, so use TF names
         if "padding" in lyr_params and lyr_params["padding"] == "same":
-            # For 'same' padding with stride=1: padding = (kernel_size - 1) // 2
+            # For 'same' padding with stride=1: padding = (kernel_size minus 1) // 2
             # This formula works for most common cases
             # Use pool_size for pooling layers, kernel_size for conv layers
             size_param = "pool_size" if layer_type.startswith(("MaxPooling", "AveragePooling")) else "kernel_size"

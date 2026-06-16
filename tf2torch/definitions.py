@@ -44,7 +44,7 @@ params_mapping = {
     "use_bias": "bias"
 }
 
-# TF-specific parameters that don't exist in PyTorch and should be silently ignored
+# TensorFlow specific parameters that don't exist in PyTorch and should be silently ignored
 excluded_params = [
     "time_major",  # RNN: TF-specific, PyTorch uses batch_first instead
     "unroll",  # RNN: TF-specific optimization hint
@@ -98,19 +98,22 @@ pos_params = {
     "MaxPooling": ["pool_size", "strides", "padding"],
     "AdaptiveAveragePooling": ["output_size"],
     "AdaptiveMaxPooling": ["output_size"],
-    "Dropout ": ["rate"],
+    "Dropout": ["rate"],
     "LayerNormalization": ["axis"]
 }
 
 int2list_params = ["kernel_size", "strides", "pool_size",
                    "output_size", "axis"]
 
-lyrs_of_int2list_params = ["Conv1D", "Conv2D", "Conv3D",
-                           "MaxPooling1D", "MaxPooling2D", "MaxPooling3D",
-                           "AveragePooling1D", "AveragePooling2D", "AveragePooling3D",
-                           "AdaptiveAveragePooling1D", "AdaptiveAveragePooling2D", "AdaptiveAveragePooling3D",
-                           "AdaptiveMaxPooling1D", "AdaptiveMaxPooling2D", "AdaptiveMaxPooling3D",
-                           "LayerNormalization"]
+lyrs_of_int2list_params = [
+    "Conv1D", "Conv2D", "Conv3D",
+    "MaxPooling1D", "MaxPooling2D", "MaxPooling3D",
+    "AveragePooling1D", "AveragePooling2D", "AveragePooling3D",
+    "AdaptiveAveragePooling1D", "AdaptiveAveragePooling2D",
+    "AdaptiveAveragePooling3D", "AdaptiveMaxPooling1D",
+    "AdaptiveMaxPooling2D", "AdaptiveMaxPooling3D",
+    "LayerNormalization"
+]
 
 layers_buml2tf = {"LinearLayer": "Dense", "SimpleRNNLayer": "RNN",
                   "LSTMLayer": "LSTM", "GRULayer": "GRU",

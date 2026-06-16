@@ -38,6 +38,5 @@ def main():
     pytorch_model.generate()
 
 
-
 if __name__ == "__main__":
     main()

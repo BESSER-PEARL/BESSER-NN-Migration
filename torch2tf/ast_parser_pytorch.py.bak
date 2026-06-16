@@ -4,7 +4,6 @@ written in PyTorch and transforms it to a BUML model.
 It also extracts data and model configuration attributes.
 """
 import ast
-import copy
 import sys
 sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 from besser.BUML.metamodel.nn import NN, Layer
@@ -240,6 +239,7 @@ class ASTParserTorch(ASTParser):
         resolved_var = self._resolve_variable_alias(source_var)
         source_module = self.module_of_output.get(resolved_var, resolved_var)
 
+        print(f"[DEBUG create_subscript_tensorop] source_var={source_var}, resolved_var={resolved_var}, source_module={source_module}, output_var={output_var}, op_name={op_name}")
 
         # Strip __hidden or __cell suffix from source_module for tensorop
         if source_module.endswith("__hidden"):
@@ -251,6 +251,8 @@ class ASTParserTorch(ASTParser):
         self.buml_model.modules.append(subscript_op)
         self.inputs_outputs[op_name] = [resolved_var, output_var]
         self.module_of_output[output_var] = op_name
+        print(f"[DEBUG create_subscript_tensorop] Set inputs_outputs[{op_name}] = [{resolved_var}, {output_var}]")
+        print(f"[DEBUG create_subscript_tensorop] Set module_of_output[{output_var}] = {op_name}")
         # Update prev_layer_output so next operation can detect branching
         self.prev_layer_output = output_var
 
@@ -292,11 +294,13 @@ class ASTParserTorch(ASTParser):
         subscripted_var = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else None
         subscript_assign = self._create_temp_assignment(temp_name, subscript_node, node)
 
+        print(f"[DEBUG handle_subscript] subscripted_var={subscripted_var}, temp_name={temp_name}, is_rnn={self._is_rnn_subscript(subscripted_var)}")
 
         if self._is_rnn_subscript(subscripted_var):
             self.handle_forward_slicing(subscript_assign)
         else:
             subscript_pattern = self.extract_subscript_pattern(subscript_node)
+            print(f"[DEBUG handle_subscript] Creating subscript tensorop: var={subscripted_var}, pattern={subscript_pattern}, temp={temp_name}")
             self.create_subscript_tensorop(subscripted_var, subscript_pattern, temp_name)
 
         self.previous_assign = subscript_assign
@@ -355,7 +359,7 @@ class ASTParserTorch(ASTParser):
         """
         It retrieves the sub_nn layers, adds their activation functions
         as parameters and stores them in the 'sub_nn' dict. It also
-        retrieves the layers and their parameters and stores them in
+        retreives the layers and their parameters and stores them in
         the 'layers' dict.
 
         Parameters:
@@ -659,7 +663,7 @@ class ASTParserTorch(ASTParser):
 
         inner_call = node.value.args[0]
 
-        # Check if inner call is a no-op squeeze: if so, skip intermediate and use base var
+        # Check if inner call is a no-op squeeze - if so, skip intermediate and use base var
         if self._is_noop_squeeze(inner_call):
             base_var = inner_call.func.value.id
             node.value.args[0] = ast.Name(id=base_var, ctx=ast.Load())
@@ -779,10 +783,14 @@ class ASTParserTorch(ASTParser):
             var2 = node.targets[0].elts[1].id
             var3 = None
 
+        print(f"[DEBUG _extract_tuple_target_vars] module_name={module_name}, var1={var1}, var2={var2}, var3={var3}")
 
         if var1 and var1 != "_":
             self.rnn_output_vars[module_name] = var1
             self.module_of_output[var1] = module_name
+            print(f"[DEBUG _extract_tuple_target_vars] Set rnn_output_vars[{module_name}] = {var1}")
+        else:
+            print(f"[DEBUG _extract_tuple_target_vars] SKIPPED var1 (is underscore or None)")
 
         if var2 and var2 != "_":
             self.rnn_hidden_vars[module_name] = var2
@@ -792,9 +800,13 @@ class ASTParserTorch(ASTParser):
             # For RNN tuple output (out, h), store hidden state with __hidden suffix
             # Use var2 as both input and output to preserve the original unpacked variable name
             self.inputs_outputs[module_name + "__hidden"] = [var2, var2]
+            print(f"[DEBUG _extract_tuple_target_vars] Set rnn_hidden_vars[{module_name}] = {var2}, inputs_outputs[{module_name}__hidden] = [{var2}, {var2}]")
         elif var2 == "_":
             # Store "_" to tell generator to use underscore instead of auto-generating a name
             self.inputs_outputs[module_name + "__hidden"] = ["_", "_"]
+            print(f"[DEBUG _extract_tuple_target_vars] var2 is underscore, stored inputs_outputs[{module_name}__hidden] = ['_', '_']")
+        else:
+            print(f"[DEBUG _extract_tuple_target_vars] SKIPPED var2 (is None)")
 
         if var3 and var3 != "_":
             # Track cell state for LSTM with special suffix
@@ -804,9 +816,13 @@ class ASTParserTorch(ASTParser):
             # Store in inputs_outputs for generator
             # Use var3 as both input and output to preserve the original unpacked variable name
             self.inputs_outputs[module_name + "__cell"] = [var3, var3]
+            print(f"[DEBUG _extract_tuple_target_vars] Set lstm_cell_vars[{module_name}] = {var3}, inputs_outputs[{module_name}__cell] = [{var3}, {var3}]")
         elif var3 == "_":
             # Store "_" to tell generator to use underscore instead of auto-generating a name
             self.inputs_outputs[module_name + "__cell"] = ["_", "_"]
+            print(f"[DEBUG _extract_tuple_target_vars] var3 is underscore, stored inputs_outputs[{module_name}__cell] = ['_', '_']")
+        else:
+            print(f"[DEBUG _extract_tuple_target_vars] SKIPPED var3 (is None)")
 
     def _determine_rnn_return_type(self, node, module_name):
         """Determine RNN return type and main output variable based on underscore pattern."""
@@ -819,6 +835,7 @@ class ASTParserTorch(ASTParser):
 
         lyr_obj = self._get_layer_by_name(module_name)
 
+        print(f"[DEBUG _determine_rnn_return_type] module={module_name}, first_is_underscore={first_is_underscore}, second_is_underscore={second_is_underscore}, num_elts={num_elts}")
 
         if first_is_underscore and not second_is_underscore:
             rnn_out = node.targets[0].elts[1].elts[0].id if isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].id
@@ -832,6 +849,7 @@ class ASTParserTorch(ASTParser):
                     lyr_obj.return_type = "both"
                 else:
                     lyr_obj.return_type = "full"
+            print(f"[DEBUG _determine_rnn_return_type] Set return_type={'both' if (num_elts == 3 or isinstance(node.targets[0].elts[1], ast.Tuple)) else 'full'}, rnn_out={rnn_out}")
         else:
             rnn_out = node.targets[0].elts[0].id
             if lyr_obj:
@@ -868,7 +886,7 @@ class ASTParserTorch(ASTParser):
                 # LSTM case: rnn(x, (h0, c0))
                 self._current_rnn_initial_hidden = "tuple_state"
             else:
-                # Complex expression (not supported yet)
+                # Complex expression - not supported yet
                 self._current_rnn_initial_hidden = None
         else:
             self._current_rnn_initial_hidden = None
@@ -919,7 +937,7 @@ class ASTParserTorch(ASTParser):
         # Handle initial hidden state (hx parameter) for seq2seq patterns
         if module_obj and hasattr(self, '_current_rnn_initial_hidden') and self._current_rnn_initial_hidden:
             if self._current_rnn_initial_hidden == "tuple_state":
-                # LSTM case with (h, c) tuple: need to extract the source from the tuple elements
+                # LSTM case with (h, c) tuple - need to extract the source from the tuple elements
                 # For now, we'll need to track this during argument parsing
                 if len(node.value.args) > 1 and isinstance(node.value.args[1], ast.Tuple):
                     if len(node.value.args[1].elts) > 0 and isinstance(node.value.args[1].elts[0], ast.Name):
@@ -954,7 +972,7 @@ class ASTParserTorch(ASTParser):
         if module_obj and rnn_in in self.module_of_output:
             module_obj.name_module_input = self.module_of_output[rnn_in]
         elif module_obj and rnn_in == 'x':
-            # First layer using network input: don't set name_module_input
+            # First layer using network input - don't set name_module_input
             pass
 
         self.buml_model.modules.append(module_obj)
@@ -997,10 +1015,10 @@ class ASTParserTorch(ASTParser):
             layers_of_tensors=[source_module]
         )
 
-        # Store input/output vars for generator: use target_var as output so all map to same variable
+        # Store input/output vars for generator - use target_var as output so all map to same variable
         self.inputs_outputs[unique_name] = [source_var, target_var]
 
-        # Track the target variable: map to the unique tensorop name
+        # Track the target variable - map to the unique tensorop name
         self.module_of_output[target_var] = unique_name
 
         # Mark source as reused (branching point for residual/wide-deep patterns)
@@ -1162,6 +1180,7 @@ class ASTParserTorch(ASTParser):
 
         # Store input/output variable names for TensorFlow generation
         self.inputs_outputs[tensorop_param["name"]] = [None, output_var]
+        print(f"[DEBUG handle_forward_binop] Set inputs_outputs[{tensorop_param['name']}] = [None, {output_var}]")
 
         # Update prev_layer_output for TensorOps
         self.prev_layer_output = output_var
@@ -1240,7 +1259,7 @@ class ASTParserTorch(ASTParser):
             attr_name = node.value.attr
 
             if attr_name == 'shape':
-                # Get source module: if not found and it's 'x', use 'INPUT'
+                # Get source module - if not found and it's 'x', use 'INPUT'
                 if source_var in self.module_of_output:
                     source_module = self.module_of_output[source_var]
                 elif source_var == 'x':
@@ -1255,7 +1274,9 @@ class ASTParserTorch(ASTParser):
     def _handle_non_rnn_slicing(self, node, subscripted_var, result_var):
         """Create subscript TensorOp for non-RNN slicing operations."""
         subscript_pattern = self.extract_subscript_pattern(node.value)
+        print(f"[DEBUG _handle_non_rnn_slicing] subscripted_var={subscripted_var}, result_var={result_var}, pattern={subscript_pattern}")
         self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
+        print(f"[DEBUG _handle_non_rnn_slicing] After create_subscript_tensorop, module_of_output[{result_var}] = {self.module_of_output.get(result_var, 'NOT SET')}")
         self.previous_assign = node
 
     def _update_hidden_as_output(self, lyr_obj, prev_module_name):
@@ -1285,13 +1306,13 @@ class ASTParserTorch(ASTParser):
 
             if has_output and has_hidden:
                 lyr_obj.return_type = "both"
-                # Do NOT update hidden as output: when both are used, sequences remain primary output
+                # Do NOT update hidden as output - when both are used, sequences remain primary output
                 # The hidden state is accessible via __hidden suffix
                 # But if we're slicing the hidden state (h1[-1]), we need to preserve that variable
                 # In TF, the hidden state is already the last layer, so h1[-1] becomes just h1
                 # We need to track this as a simple variable assignment
                 if prev_module_name.endswith("__hidden"):
-                    # Track as variable alias: result_var is just an alias for subscripted_var
+                    # Track as variable alias - result_var is just an alias for subscripted_var
                     self.module_of_output[result_var] = prev_module_name
                     self.variable_aliases[result_var] = subscripted_var
 
@@ -1316,7 +1337,7 @@ class ASTParserTorch(ASTParser):
                 # Store the result variable name for this hidden state subscript
                 # For multi-layer RNN, h[-1] extracts last layer's hidden state
                 # In TF this is already the output, but we need to preserve the variable name
-                # BUT: Don't handle bidirectional RNNs here (let the bidirectional logic handle them)
+                # BUT: Don't handle bidirectional RNNs here - let the bidirectional logic handle them
                 if not (hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional):
                     # Store in inputs_outputs with __hidden suffix
                     # In TensorFlow, h[-1] becomes just h (no subscripting needed)
@@ -1499,21 +1520,27 @@ class ASTParserTorch(ASTParser):
                         # Map transpose output variable back to transpose input's source layer
                         transpose_output_var = self.previous_assign.targets[0].id
                         transpose_input_var = self.previous_assign.value.func.value.id
+                        print(f"[DEBUG] Removing transpose: transpose_output_var={transpose_output_var}, transpose_input_var={transpose_input_var}")
                         if transpose_input_var in self.module_of_output:
                             transpose_input_source = self.module_of_output[transpose_input_var]
                             self.module_of_output[transpose_output_var] = transpose_input_source
+                            print(f"[DEBUG] Set module_of_output[{transpose_output_var}] = {transpose_input_source}")
 
                             # Update the current layer's inputs_outputs and name_module_input
                             # The current layer (lyr_name) was expecting transpose output, now should use transpose input
                             if lyr_name in self.inputs_outputs and self.inputs_outputs[lyr_name][0] == transpose_output_var:
                                 self.inputs_outputs[lyr_name][0] = transpose_input_var
+                                print(f"[DEBUG] Updated inputs_outputs[{lyr_name}][0] from {transpose_output_var} to {transpose_input_var}")
 
                             # Update the layer object's name_module_input to point to the source of transpose input
                             if hasattr(lyr_obj, 'name_module_input'):
+                                print(f"[DEBUG] layer.name_module_input BEFORE = {lyr_obj.name_module_input}")
                                 lyr_obj.name_module_input = transpose_input_source
+                                print(f"[DEBUG] Updated layer.name_module_input to {transpose_input_source}")
 
                         self.buml_model.tensor_ops.pop()
                         self.buml_model.modules.pop()
+                        print(f"[DEBUG] Removed transpose tensorop and module")
 
 
     def _extract_inline_base_var(self, call_node, parent_node):
@@ -1807,6 +1834,7 @@ class ASTParserTorch(ASTParser):
 
     def _handle_module_layer_reuse(self, node, module_name, module_obj, original_inputs_outputs=None):
         """Handle layer reuse by creating synthetic copy with current call's input tracking."""
+        import copy
         # Use per-layer reuse counter for clearer naming (dropout_use_1, dropout_use_2, ...)
         self.layer_reuse_count[module_name] = self.layer_reuse_count.get(module_name, 0) + 1
         use_count = self.layer_reuse_count[module_name]
@@ -1884,6 +1912,7 @@ class ASTParserTorch(ASTParser):
         # Save original inputs_outputs BEFORE overwriting (for layer reuse restoration)
         original_inputs_outputs = self.inputs_outputs.get(module_name)
 
+        print(f"[DEBUG _process_module_api] module_name={module_name}, input_var={input_var}, output_var={output_var}, input_source_module={input_source_module}")
 
         self.inputs_outputs[module_name] = [input_var, output_var]
         self.module_of_output[output_var] = module_name
@@ -2333,6 +2362,7 @@ class ASTParserTorch(ASTParser):
 
     def _handle_layer_reuse_in_concat(self, layer_obj, arg, layer_name):
         """Handle layer reuse in concatenation."""
+        import copy
         self.layer_reuse_count[layer_name] = self.layer_reuse_count.get(layer_name, 0) + 1
         use_count = self.layer_reuse_count[layer_name]
 
@@ -2365,7 +2395,7 @@ class ASTParserTorch(ASTParser):
         if is_inline:
             layer_obj.input_reused = True
 
-            # Track input for inline concat: use 'INPUT' marker if input is 'x'
+            # Track input for inline concat - use 'INPUT' marker if input is 'x'
             if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
                 input_var = arg.args[0].id
                 if input_var == 'x':
@@ -2373,7 +2403,7 @@ class ASTParserTorch(ASTParser):
                 elif input_var in self.module_of_output:
                     layer_obj.name_module_input = self.module_of_output[input_var]
         else:
-            # Regular layer call: handle normally
+            # Regular layer call - handle normally
             if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
                 input_var = arg.args[0].id
                 if input_var in self.module_of_output:
@@ -2611,7 +2641,7 @@ class ASTParserTorch(ASTParser):
 
         # Early check for bidirectional RNN concat to avoid creating subscript tensorops
         if self._is_bidirectional_rnn_subscript_concat(ops_args):
-            # Skip creating TensorOp: template already generates bidirectional concat
+            # Skip creating TensorOp - template already generates bidirectional concat
             # Track output variable to use as the concat result variable name
             output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
             if output_var:
@@ -2638,14 +2668,18 @@ class ASTParserTorch(ASTParser):
             return None
 
         actual_vars = self._resolve_concat_variables(variables)
+        print(f"[DEBUG _extract_concatenate_params] variables={variables}, actual_vars={actual_vars}")
 
         layers_of_tensors = [self.module_of_output[actual_var] for actual_var in actual_vars]
+        print(f"[DEBUG _extract_concatenate_params] layers_of_tensors={layers_of_tensors}")
+        print(f"[DEBUG _extract_concatenate_params] module_of_output keys={list(self.module_of_output.keys())}")
         cat_dim = self.param_value(node.value.keywords[0].value)
 
         if self._check_bidirectional_rnn_concat(ops_args, layers_of_tensors, node):
             return None
 
         var_types = self._determine_rnn_var_types(layers_of_tensors, actual_vars)
+        print(f"[DEBUG _extract_concatenate_params] var_types={var_types}")
 
         return {
             "tns_type": "concatenate",
@@ -2896,7 +2930,7 @@ def transform_layer(lyr_type: str, lyr_params: dict,
 
     Parameters:
         lyr_type (str): The type of the layer (PyTorch).
-        lyr_params (dict): A dictionary storing the layer parameters and
+        lyr_params (dict): A dictionnary storing the layer parameters and
             their values.
         lyr_name (str | None): The name of the layer.
 
@@ -2936,7 +2970,7 @@ def process_params(lyr_type: str, lyr_params: dict):
 
     Parameters:
         lyr_type (str): The type of the layer (PyTorch).
-        lyr_params (dict): A dictionary storing the layer parameters and
+        lyr_params (dict): A dictionnary storing the layer parameters and
             their values.
 
     Returns:

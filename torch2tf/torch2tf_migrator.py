@@ -2,11 +2,11 @@
 It converts PyTorch code to BUML code.
 
 Argument:
-    filename (str): Path to a TensorFlow file containing
+    filename (str): Path to a PyTorch file containing
         the code to transform.
     configfile (str, optional): Path to the configuration file that
         has the values of 'input_nn_type', 'output_nn_type', and 'only_nn'.
-    datashape (str):
+    datashape (str, optional): The shape of the input data (optional).
 """
 
 import sys
