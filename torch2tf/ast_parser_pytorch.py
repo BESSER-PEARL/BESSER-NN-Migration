@@ -89,6 +89,8 @@ class ASTParserTorch(ASTParser):
         self.variable_aliases = {}  # {alias_var: source_var}
         # Track multi-layer RNNs: {module_name: [layer_name_0, layer_name_1, ...]}
         self.multi_layer_rnns = {}
+        # Track original num_layers for multi-layer RNNs: {module_name: num_layers}
+        self.rnn_num_layers = {}
         # Track layer reuse count for creating unique reuse names
         self.layer_reuse_count = {}  # {layer_name: reuse_count}
         # Track the output variable of the immediately previous layer
@@ -340,6 +342,7 @@ class ASTParserTorch(ASTParser):
             self._add_rnn_layer(lyr_type, layer_params)
 
         self.multi_layer_rnns[module_name] = layer_names
+        self.rnn_num_layers[module_name] = num_layers
 
     def _create_single_layer(self, lyr_type, lyr_params, module_name):
         """Create single BUML layer."""
@@ -1318,7 +1321,8 @@ class ASTParserTorch(ASTParser):
         Args:
             prev_module_name: Module name WITH suffix (e.g., 'rnn1__hidden'), used for module_of_output tracking
         """
-        if isinstance(node.value.slice, ast.UnaryOp):
+        if isinstance(node.value.slice, ast.UnaryOp) or isinstance(node.value.slice, ast.Constant):
+            # Handle both negative (UnaryOp) and positive (Constant) integer indices
             base_layer_name = self._strip_rnn_suffix(prev_module_name)
 
             has_output = base_layer_name in self.rnn_output_vars
@@ -1351,17 +1355,54 @@ class ASTParserTorch(ASTParser):
         return module_name
 
     def _handle_bidirectional_rnn_slice(self, node, lyr_obj, layer_lookup_name, subscripted_var, result_var):
-        """Handle bidirectional RNN h[-2]/h[-1] subscript patterns."""
+        """Handle bidirectional RNN h[-2]/h[-1] or h[i] subscript patterns.
+
+        For bidirectional RNNs with num_layers=N:
+        - Negative indices: h[-2] = forward, h[-1] = backward (last layer)
+        - Positive indices: h[2*N-2] = forward, h[2*N-1] = backward (last layer)
+        """
         if not (lyr_obj and hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional):
             return False
-        if not (isinstance(node.value.slice, ast.UnaryOp) and isinstance(node.value.slice.operand, ast.Constant)):
+
+        # Handle negative indices: h[-2] (UnaryOp) or positive indices: h[2] (Constant)
+        if isinstance(node.value.slice, ast.UnaryOp) and isinstance(node.value.slice.operand, ast.Constant):
+            # Negative index case: h[-2] or h[-1]
+            slice_idx = -node.value.slice.operand.value if isinstance(node.value.slice.op, ast.USub) else node.value.slice.operand.value
+            if slice_idx not in [-2, -1]:
+                return False
+            suffix = "__forward" if slice_idx == -2 else "__backward"
+        elif isinstance(node.value.slice, ast.Constant):
+            # Positive index case: h[2] or h[3] for 2-layer bidirectional
+            slice_idx = node.value.slice.value
+
+            # Find the base module name to get num_layers
+            # layer_lookup_name might be 'lstm_layer_1', need to find 'lstm' in rnn_num_layers
+            base_module_name = None
+            for module_name in self.rnn_num_layers:
+                if layer_lookup_name in self.multi_layer_rnns.get(module_name, []):
+                    base_module_name = module_name
+                    break
+
+            if base_module_name:
+                num_layers = self.rnn_num_layers[base_module_name]
+            else:
+                num_layers = lyr_obj.num_layers if hasattr(lyr_obj, 'num_layers') else 1
+
+            # Calculate expected indices for last layer
+            # For num_layers=N bidirectional: indices are [0,1,...,2N-2,2N-1]
+            # Last layer forward = 2*N-2, backward = 2*N-1
+            expected_forward_idx = 2 * num_layers - 2
+            expected_backward_idx = 2 * num_layers - 1
+
+            if slice_idx == expected_forward_idx:
+                suffix = "__forward"
+            elif slice_idx == expected_backward_idx:
+                suffix = "__backward"
+            else:
+                return False
+        else:
             return False
 
-        slice_idx = -node.value.slice.operand.value if isinstance(node.value.slice.op, ast.USub) else node.value.slice.operand.value
-        if slice_idx not in [-2, -1]:
-            return False
-
-        suffix = "__forward" if slice_idx == -2 else "__backward"
         self.module_of_output[result_var] = layer_lookup_name + suffix
         self.variable_aliases[result_var] = subscripted_var
         self.inputs_outputs[layer_lookup_name + suffix] = [subscripted_var, result_var]
@@ -2503,8 +2544,14 @@ class ASTParserTorch(ASTParser):
 
         if all(isinstance(arg, ast.Subscript) for arg in ops_args):
             indices = self._extract_subscript_indices(ops_args)
-            if indices and set(indices) == {-2, -1}:
-                return self._handle_bidirectional_concat_output(node, source_layer_name)
+            if indices:
+                # Accept negative indices (-2, -1) or positive indices for last layer
+                # For num_layers=N bidirectional: last layer is [2*N-2, 2*N-1]
+                num_layers = source_layer.num_layers if hasattr(source_layer, 'num_layers') else 1
+                expected_positive_indices = {2 * num_layers - 2, 2 * num_layers - 1}
+
+                if set(indices) == {-2, -1} or set(indices) == expected_positive_indices:
+                    return self._handle_bidirectional_concat_output(node, source_layer_name)
 
         # For name-based patterns (h_forward, h_backward), also skip to avoid duplicate concat
         # The template automatically generates concat for bidirectional RNN hidden states
