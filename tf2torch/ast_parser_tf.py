@@ -172,15 +172,8 @@ class ASTParserTF(ASTParser):
         # Process as regular assignment
         self.visit_Assign(assign)
 
-    def handle_forward_binop(self, node: ast.Assign):
-        """
-        Handle binary operations in forward method (e.g., x + y, x * 2, a // b).
-        Creates TensorOp objects for arithmetic operations.
-        """
-        binop_node = node.value
-        op_type = binop_node.op.__class__.__name__
-
-        # Map Python AST op types to BUML tns_type
+    def _get_tf_binop_operation_type(self, binop_node, node):
+        """Map Python AST binop to BUML tensor operation type."""
         op_map = {
             'Add': 'binop_add',
             'Sub': 'binop_subtract',
@@ -188,16 +181,38 @@ class ASTParserTF(ASTParser):
             'Div': 'binop_divide',
             'FloorDiv': 'binop_floor_divide'
         }
+        op_type = binop_node.op.__class__.__name__
 
         if op_type not in op_map:
             self.migration_warnings.append(
                 f"Line {node.lineno}: Unsupported binary operation '{op_type}'. This operation will be skipped."
             )
+            return None
+        return op_map[op_type]
+
+    def _mark_residual_source_layers(self, tns_type, left_layer, right_layer):
+        """Mark source layers for residual connections (addition operations)."""
+        if tns_type != "binop_add":
+            return
+        if not isinstance(left_layer, str) or not isinstance(right_layer, str):
             return
 
-        tns_type = op_map[op_type]
+        for layer_name in [left_layer, right_layer]:
+            if layer_name and not isinstance(layer_name, (int, float)):
+                layer_obj = self._get_layer_by_name(layer_name)
+                if layer_obj:
+                    layer_obj.input_reused = True
 
-        # Extract operands (variable names or constant values)
+    def handle_forward_binop(self, node: ast.Assign):
+        """
+        Handle binary operations in forward method (e.g., x + y, x * 2, a // b).
+        Creates TensorOp objects for arithmetic operations.
+        """
+        binop_node = node.value
+        tns_type = self._get_tf_binop_operation_type(binop_node, node)
+        if tns_type is None:
+            return
+
         left_var = self._extract_binop_operand(binop_node.left, node, "left")
         right_var = self._extract_binop_operand(binop_node.right, node, "right")
 
@@ -207,27 +222,24 @@ class ASTParserTF(ASTParser):
             )
             return
 
-        # Get the layer/module names that produced these variables
-        # For constants (float/int), we use the value directly instead of a layer name
         left_layer = left_var if isinstance(left_var, (int, float)) else self.module_of_output.get(left_var)
         right_layer = right_var if isinstance(right_var, (int, float)) else self.module_of_output.get(right_var)
 
         if left_layer is None or right_layer is None:
             self.migration_warnings.append(
-                f"Line {node.lineno}: Cannot determine source layers for binary operation. Make sure both operands are defined earlier."
+                f"Line {node.lineno}: Cannot determine source layers for binary operation. "
+                f"Make sure both operands are defined earlier."
             )
             return
 
-        # Determine if variables are output or hidden for RNNs with return_type="both"
         var_types = self._determine_binop_var_types(left_layer, right_layer, left_var, right_var)
 
-        # Create TensorOp
         target_var = node.targets[0].id
         tensorop_param = {
             "name": f"op_{self.tensor_op_counter}",
             "tns_type": tns_type,
             "layers_of_tensors": [left_layer, right_layer],
-            "actual_vars": var_types  # Track which component (output/hidden) each refers to
+            "actual_vars": var_types
         }
         self.tensor_op_counter += 1
 
@@ -236,22 +248,12 @@ class ASTParserTF(ASTParser):
             self.buml_model.add_tensor_op(tns_obj)
             self.module_of_output[target_var] = tensorop_param["name"]
 
-            # Track inputs/outputs for binops (used by set_remaining_params)
-            # Input: first operand variable, Output: assignment target variable
-            self.inputs_outputs[tensorop_param["name"]] = [left_var if isinstance(left_var, str) else str(left_var), target_var]
-
-            # Update prev_layer_output for TensorOps
+            self.inputs_outputs[tensorop_param["name"]] = [
+                left_var if isinstance(left_var, str) else str(left_var), target_var
+            ]
             self.prev_layer_output = target_var
 
-            # Mark source layers for residual connections
-            # When we have x = a + b where a and b are from different layers,
-            # mark both source layers so their inputs are preserved
-            if tns_type == "binop_add" and isinstance(left_layer, str) and isinstance(right_layer, str):
-                for layer_name in [left_layer, right_layer]:
-                    if layer_name and not isinstance(layer_name, (int, float)):
-                        layer_obj = self._get_layer_by_name(layer_name)
-                        if layer_obj:
-                            layer_obj.input_reused = True
+            self._mark_residual_source_layers(tns_type, left_layer, right_layer)
 
         except Exception as e:
             self.migration_warnings.append(
@@ -808,6 +810,30 @@ class ASTParserTF(ASTParser):
 
         self.previous_assign = node
 
+    def _configure_rnn_module(self, module_obj, module_name, rnn_in):
+        """Configure RNN module with hx_source and input_reused settings."""
+        if not module_obj:
+            return
+
+        if hasattr(self, '_current_rnn_initial_hidden_source') and self._current_rnn_initial_hidden_source:
+            module_obj.hx_source = self._current_rnn_initial_hidden_source
+
+        if hasattr(self, 'prev_layer_output') and self.prev_layer_output:
+            if rnn_in != self.prev_layer_output:
+                module_obj.input_reused = True
+
+        dropout_layer_name = f"{module_name}_dropout"
+        dropout_module = next((obj for obj in self.buml_model.layers if obj.name == dropout_layer_name), None)
+        if dropout_module:
+            self.buml_model.modules.append(dropout_module)
+
+    def _append_rnn_module(self, module_obj, node, module_name):
+        """Append RNN module to buml_model, handling reuse if needed."""
+        if module_obj and module_obj in self.buml_model.modules:
+            self._handle_module_layer_reuse(node, module_name, module_obj)
+        elif module_obj:
+            self.buml_model.modules.append(module_obj)
+
     def handle_forward_tuple_assignment(self, node: ast.Assign):
         """
         Handle RNN tuple assignments such as:
@@ -820,165 +846,120 @@ class ASTParserTF(ASTParser):
         Returns:
             None, but populates the BUML model and tracks RNN variables
         """
-        # Check if this is a method call (e.g., x.max(dim=1)) vs module call (e.g., self.rnn(x))
         if hasattr(node.value.func, 'value') and isinstance(node.value.func.value, ast.Name):
-            caller_id = node.value.func.value.id
-            if caller_id != "self":
+            if node.value.func.value.id != "self":
                 self.extract_tensorop(node)
                 return
 
         module_name = node.value.func.attr
-
-        # Get module object first so we can check if it's bidirectional
         module_obj = self._get_layer_by_name(module_name)
 
-        # Extract and track tuple target variables
         self._extract_tuple_target_vars(node, module_name, module_obj)
-
-        # Determine main output variable
         rnn_out = self._determine_rnn_output_var(node)
-
-        # Extract input argument (also detects initial_state keyword arg)
         rnn_in = self._extract_rnn_input_arg(node)
 
-        # Update tracking structures
         self.inputs_outputs[module_name] = [rnn_in, rnn_out]
         if not module_obj:
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
-        # Add hx_source parameter if initial_state detected
-        if module_obj and hasattr(self, '_current_rnn_initial_hidden_source') and self._current_rnn_initial_hidden_source:
-            # Store reference to source layer as RNN attribute
-            module_obj.hx_source = self._current_rnn_initial_hidden_source
+        self._configure_rnn_module(module_obj, module_name, rnn_in)
+        self._append_rnn_module(module_obj, node, module_name)
 
-        # Mark input_reused when RNN input differs from previous layer output
-        # This ensures unique variable names for multiple RNNs using the same input
-        if module_obj and hasattr(self, 'prev_layer_output') and self.prev_layer_output:
-            if rnn_in != self.prev_layer_output:
-                module_obj.input_reused = True
-
-        # Add Dropout module before RNN if dropout layer exists
-        if module_obj:
-            dropout_layer_name = f"{module_name}_dropout"
-            dropout_module = next((obj for obj in self.buml_model.layers if obj.name == dropout_layer_name), None)
-            if dropout_module:
-                self.buml_model.modules.append(dropout_module)
-
-        if module_obj and module_obj in self.buml_model.modules:
-            self._handle_module_layer_reuse(node, module_name, module_obj)
-        elif module_obj:
-            self.buml_model.modules.append(module_obj)
-
-        # Update prev_layer_output to track the RNN output for next layer
         self.prev_layer_output = rnn_out
         self.previous_assign = node
 
+    def _get_var_id(self, target_elt):
+        """Safely extract variable ID from AST target element."""
+        return target_elt.id if isinstance(target_elt, ast.Name) else None
+
+    def _track_rnn_output_var(self, var, module_name):
+        """Track RNN output variable."""
+        if var and var != "_":
+            self.rnn_output_vars[module_name] = var
+            self.module_of_output[var] = module_name
+
+    def _track_rnn_hidden_var(self, var, module_name):
+        """Track RNN hidden state variable."""
+        if var and var != "_":
+            self.rnn_hidden_vars[module_name] = var
+            self.module_of_output[var] = module_name + "__hidden"
+            self.inputs_outputs[module_name + "__hidden"] = [var, var]
+        elif var == "_":
+            self.inputs_outputs[module_name + "__hidden"] = ["_", "_"]
+
+    def _track_lstm_cell_var(self, var, module_name):
+        """Track LSTM cell state variable."""
+        if var and var != "_":
+            self.module_of_output[var] = module_name + "__cell"
+            self.inputs_outputs[module_name + "__cell"] = [var, var]
+        elif var == "_":
+            self.inputs_outputs[module_name + "__cell"] = ["_", "_"]
+
+    def _handle_2_target_rnn(self, node, module_name):
+        """Handle SimpleRNN or GRU: out, h = self.rnn(x)"""
+        var1 = self._get_var_id(node.targets[0].elts[0])
+        var2 = self._get_var_id(node.targets[0].elts[1])
+
+        self._track_rnn_output_var(var1, module_name)
+        self._track_rnn_hidden_var(var2, module_name)
+
+    def _handle_bidirectional_rnn_3_targets(self, node, module_name, module_obj):
+        """Handle Bidirectional RNN: out, forward_h, backward_h = self.encoder(x)"""
+        var1, var2, var3 = (self._get_var_id(node.targets[0].elts[i]) for i in range(3))
+
+        self._track_rnn_output_var(var1, module_name)
+
+        uses_separate_components = (var2 and var2 != "_") or (var3 and var3 != "_")
+        if uses_separate_components and module_obj:
+            module_obj.skip_hidden_concat = True
+
+        if var2 and var2 != "_":
+            self.module_of_output[var2] = module_name + "__hidden_forward"
+        if var3 and var3 != "_":
+            self.module_of_output[var3] = module_name + "__hidden_backward"
+
+    def _handle_lstm_3_targets(self, node, module_name):
+        """Handle LSTM: out, h, c = self.lstm(x)"""
+        var1, var2, var3 = (self._get_var_id(node.targets[0].elts[i]) for i in range(3))
+
+        self._track_rnn_output_var(var1, module_name)
+        self._track_rnn_hidden_var(var2, module_name)
+        self._track_lstm_cell_var(var3, module_name)
+
+    def _handle_bidirectional_lstm_5_targets(self, node, module_name, module_obj):
+        """Handle Bidirectional LSTM: out, fwd_h, fwd_c, bwd_h, bwd_c = self.bilstm(x)"""
+        vars = [self._get_var_id(node.targets[0].elts[i]) for i in range(5)]
+        var1, var2, var3, var4, var5 = vars
+
+        self._track_rnn_output_var(var1, module_name)
+
+        uses_separate_components = (var2 and var2 != "_") or (var4 and var4 != "_")
+        if uses_separate_components and module_obj:
+            module_obj.skip_hidden_concat = True
+
+        if var2 and var2 != "_":
+            self.module_of_output[var2] = module_name + "__hidden_forward"
+        if var4 and var4 != "_":
+            self.module_of_output[var4] = module_name + "__hidden_backward"
+        if var3 and var3 != "_":
+            self.module_of_output[var3] = module_name + "__cell_forward"
+        if var5 and var5 != "_":
+            self.module_of_output[var5] = module_name + "__cell_backward"
+
     def _extract_tuple_target_vars(self, node, module_name, module_obj=None):
         """Extract and track output/hidden variables from tuple assignment targets."""
-        # Handle cases like:
-        # out, h = self.rnn(x)  # 2 elements
-        # out, h, c = self.lstm(x)  # 3 elements (LSTM)
-        # out, forward_h, backward_h = self.bidirectional_rnn(x)  # 3 elements (Bidirectional)
-
         num_targets = len(node.targets[0].elts)
 
         if num_targets == 2:
-            # SimpleRNN or GRU: out, h = self.rnn(x)
-            var1 = node.targets[0].elts[0].id if isinstance(node.targets[0].elts[0], ast.Name) else None
-            var2 = node.targets[0].elts[1].id if isinstance(node.targets[0].elts[1], ast.Name) else None
-
-            if var1 and var1 != "_":
-                self.rnn_output_vars[module_name] = var1
-                self.module_of_output[var1] = module_name
-            if var2 and var2 != "_":
-                self.rnn_hidden_vars[module_name] = var2
-                # Track hidden state with special suffix to distinguish from output sequence
-                self.module_of_output[var2] = module_name + "__hidden"
-                # Store in inputs_outputs for generator to use original variable name
-                # Use var2 as both input and output to preserve the original unpacked variable name
-                self.inputs_outputs[module_name + "__hidden"] = [var2, var2]
-            elif var2 == "_":
-                # Store "_" to tell generator to use underscore instead of auto generating a name
-                self.inputs_outputs[module_name + "__hidden"] = ["_", "_"]
-
+            self._handle_2_target_rnn(node, module_name)
         elif num_targets == 3:
-            var1 = node.targets[0].elts[0].id if isinstance(node.targets[0].elts[0], ast.Name) else None
-            var2 = node.targets[0].elts[1].id if isinstance(node.targets[0].elts[1], ast.Name) else None
-            var3 = node.targets[0].elts[2].id if isinstance(node.targets[0].elts[2], ast.Name) else None
-
-            # Check if this is a bidirectional RNN
             is_bidirectional = module_obj and hasattr(module_obj, 'bidirectional') and module_obj.bidirectional
-
             if is_bidirectional:
-                # Bidirectional RNN: out, forward_h, backward_h = self.encoder(x)
-                if var1 and var1 != "_":
-                    self.rnn_output_vars[module_name] = var1
-                    self.module_of_output[var1] = module_name
-
-                # Check if forward/backward components are used separately
-                uses_separate_components = (var2 and var2 != "_") or (var3 and var3 != "_")
-                if uses_separate_components and module_obj:
-                    # Mark that this layer should NOT auto concatenate hidden states
-                    module_obj.skip_hidden_concat = True
-
-                # Both var2 and var3 are hidden states (forward and backward)
-                # Track with separate suffixes so they can be extracted individually
-                if var2 and var2 != "_":
-                    self.module_of_output[var2] = module_name + "__hidden_forward"
-                if var3 and var3 != "_":
-                    self.module_of_output[var3] = module_name + "__hidden_backward"
+                self._handle_bidirectional_rnn_3_targets(node, module_name, module_obj)
             else:
-                # LSTM: out, h, c = self.lstm(x)
-                if var1 and var1 != "_":
-                    self.rnn_output_vars[module_name] = var1
-                    self.module_of_output[var1] = module_name
-                if var2 and var2 != "_":
-                    self.rnn_hidden_vars[module_name] = var2
-                    # Track hidden state with special suffix to distinguish from output sequence
-                    self.module_of_output[var2] = module_name + "__hidden"
-                    # Store in inputs_outputs for generator to use original variable name
-                    self.inputs_outputs[module_name + "__hidden"] = [var2, var2]
-                elif var2 == "_":
-                    # Store "_" to tell generator to use underscore
-                    self.inputs_outputs[module_name + "__hidden"] = ["_", "_"]
-                if var3 and var3 != "_":
-                    # Track cell state for LSTM with special suffix
-                    self.module_of_output[var3] = module_name + "__cell"
-                    # Store in inputs_outputs for generator to use original variable name
-                    self.inputs_outputs[module_name + "__cell"] = [var3, var3]
-                elif var3 == "_":
-                    # Store "_" to tell generator to use underscore
-                    self.inputs_outputs[module_name + "__cell"] = ["_", "_"]
-
+                self._handle_lstm_3_targets(node, module_name)
         elif num_targets == 5:
-            # Bidirectional LSTM: out, fwd_h, fwd_c, bwd_h, bwd_c = self.bilstm(x)
-            var1 = node.targets[0].elts[0].id if isinstance(node.targets[0].elts[0], ast.Name) else None
-            var2 = node.targets[0].elts[1].id if isinstance(node.targets[0].elts[1], ast.Name) else None
-            var3 = node.targets[0].elts[2].id if isinstance(node.targets[0].elts[2], ast.Name) else None
-            var4 = node.targets[0].elts[3].id if isinstance(node.targets[0].elts[3], ast.Name) else None
-            var5 = node.targets[0].elts[4].id if isinstance(node.targets[0].elts[4], ast.Name) else None
-
-            if var1 and var1 != "_":
-                self.rnn_output_vars[module_name] = var1
-                self.module_of_output[var1] = module_name
-
-            # Check if forward/backward components are used separately (not just discarded with _)
-            uses_separate_components = (var2 and var2 != "_") or (var4 and var4 != "_")
-            if uses_separate_components and module_obj:
-                # Mark that this layer should NOT auto-concatenate hidden states
-                # because the TF code accesses forward/backward separately
-                module_obj.skip_hidden_concat = True
-
-            # var2 and var4 are forward and backward hidden states: track with original TF names
-            if var2 and var2 != "_":
-                self.module_of_output[var2] = module_name + "__hidden_forward"
-            if var4 and var4 != "_":
-                self.module_of_output[var4] = module_name + "__hidden_backward"
-            # var3 and var5 are forward and backward cell states
-            if var3 and var3 != "_":
-                self.module_of_output[var3] = module_name + "__cell_forward"
-            if var5 and var5 != "_":
-                self.module_of_output[var5] = module_name + "__cell_backward"
+            self._handle_bidirectional_lstm_5_targets(node, module_name, module_obj)
 
     def _determine_rnn_output_var(self, node):
         """Determine which variable holds the main RNN output."""
@@ -996,6 +977,26 @@ class ASTParserTF(ASTParser):
                     return second_elem.id
 
         return "x"  # Fallback
+
+    def _extract_hidden_var_from_initial_state(self, kw_value):
+        """Extract hidden state variable from initial_state argument."""
+        if isinstance(kw_value, ast.List) and len(kw_value.elts) >= 1:
+            return kw_value.elts[0].id if isinstance(kw_value.elts[0], ast.Name) else None
+        elif isinstance(kw_value, ast.Name):
+            return kw_value.id
+        return None
+
+    def _track_initial_state_source(self, h_var, node):
+        """Track source layer for RNN initial_state and add migration warning."""
+        if not h_var or h_var not in self.module_of_output:
+            return
+
+        source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
+        self._current_rnn_initial_hidden_source = source_module
+        self.migration_warnings.append(
+            f"Line {node.lineno}: RNN called with initial_state from layer '{source_module}'. "
+            f"This will be migrated to PyTorch using the corresponding hidden state variable."
+        )
 
     def _extract_rnn_input_arg(self, node):
         """
@@ -1022,30 +1023,8 @@ class ASTParserTF(ASTParser):
         self._current_rnn_initial_hidden_source = None
         for kw in node.value.keywords:
             if kw.arg == "initial_state":
-                if isinstance(kw.value, ast.List):
-                    # LSTM case: initial_state=[h, c]
-                    # Need to find which layer produced these variables
-                    if len(kw.value.elts) >= 1:
-                        h_var = kw.value.elts[0].id if isinstance(kw.value.elts[0], ast.Name) else None
-                        if h_var and h_var in self.module_of_output:
-                            # Find source layer by looking up the variable
-                            source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
-                            # Store reference to source layer instead of variable names
-                            self._current_rnn_initial_hidden_source = source_module
-                            self.migration_warnings.append(
-                                f"Line {node.lineno}: RNN called with initial_state from layer '{source_module}'. "
-                                f"This will be migrated to PyTorch using the corresponding hidden state variables."
-                            )
-                elif isinstance(kw.value, ast.Name):
-                    # Single variable: initial_state=h
-                    h_var = kw.value.id
-                    if h_var in self.module_of_output:
-                        source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
-                        self._current_rnn_initial_hidden_source = source_module
-                        self.migration_warnings.append(
-                            f"Line {node.lineno}: RNN called with initial_state from layer '{source_module}'. "
-                            f"This will be migrated to PyTorch using the corresponding hidden state variable."
-                        )
+                h_var = self._extract_hidden_var_from_initial_state(kw.value)
+                self._track_initial_state_source(h_var, node)
                 break
 
         # Check for second positional argument (less common in TF but possible)
@@ -1111,6 +1090,29 @@ class ASTParserTF(ASTParser):
                 isinstance(node.value.value.func.value, ast.Name) and
                 node.value.value.func.value.id == 'tf')
 
+    def _get_layer_lookup_name(self, module_name):
+        """Strip __hidden or __cell suffix from module name."""
+        if module_name.endswith("__hidden"):
+            return module_name[:-8]
+        elif module_name.endswith("__cell"):
+            return module_name[:-6]
+        return module_name
+
+    def _process_rnn_slicing(self, node, subscripted_var, result_var, prev_module_name):
+        """Process slicing on RNN layer outputs."""
+        layer_lookup_name = self._get_layer_lookup_name(prev_module_name)
+        lyr_obj = self._get_layer_by_name(layer_lookup_name)
+
+        if not lyr_obj or not hasattr(lyr_obj, 'return_type'):
+            self._handle_non_rnn_slicing(node, subscripted_var, result_var)
+            return
+
+        self._handle_non_rnn_slicing(node, subscripted_var, result_var)
+
+        if result_var not in self.module_of_output:
+            self.module_of_output[result_var] = prev_module_name
+        self.variable_aliases[result_var] = subscripted_var
+
     def handle_forward_slicing(self, node: ast.Assign):
         """
         Handle slicing operations such as:
@@ -1125,54 +1127,19 @@ class ASTParserTF(ASTParser):
         Returns:
             None, but populates the BUML model
         """
-        # Special handling for tf.shape(x)[dim] pattern
         if self._is_tf_shape_slicing(node):
             self._handle_tf_shape_slicing(node)
             return
 
-        # Regular slicing handling
-        if not isinstance(node.value.value, ast.Name):
-            # Complex subscript base, handle as regular subscript
-            subscripted_var = None
-        else:
-            subscripted_var = node.value.value.id
-
+        subscripted_var = node.value.value.id if isinstance(node.value.value, ast.Name) else None
         result_var = node.targets[0].id
 
-        # Look up which module produced this variable
         if not subscripted_var or subscripted_var not in self.module_of_output:
             self._handle_non_rnn_slicing(node, subscripted_var, result_var)
             return
 
         prev_module_name = self.module_of_output[subscripted_var]
-        # Strip __hidden or __cell suffix to get actual layer name
-        layer_lookup_name = prev_module_name
-        if layer_lookup_name.endswith("__hidden"):
-            layer_lookup_name = layer_lookup_name[:-8]
-        elif layer_lookup_name.endswith("__cell"):
-            layer_lookup_name = layer_lookup_name[:-6]
-        lyr_obj = self._get_layer_by_name(layer_lookup_name)
-
-        # If not an RNN layer, handle as regular subscript
-        if not lyr_obj or not hasattr(lyr_obj, 'return_type'):
-            self._handle_non_rnn_slicing(node, subscripted_var, result_var)
-            return
-
-        # For RNN layers, determine if this is a timestep selection
-        if self._is_timestep_selection(node):
-            # This might indicate we need return_type='last'
-            # But in TensorFlow, return_type is already set during layer creation
-            # We just create the subscript TensorOp
-            self._handle_non_rnn_slicing(node, subscripted_var, result_var)
-        else:
-            # Regular slicing on RNN output
-            self._handle_non_rnn_slicing(node, subscripted_var, result_var)
-
-        # Track the result variable
-        # Don't overwrite if create_subscript_tensorop already set it to the TensorOp name
-        if result_var not in self.module_of_output:
-            self.module_of_output[result_var] = prev_module_name
-        self.variable_aliases[result_var] = subscripted_var
+        self._process_rnn_slicing(node, subscripted_var, result_var, prev_module_name)
         self.previous_assign = node
 
     def _handle_non_rnn_slicing(self, node, subscripted_var, result_var):
@@ -1205,6 +1172,44 @@ class ASTParserTF(ASTParser):
 
         return False
 
+    def _handle_init_activation_layer(self, module_name, lyr_type, node):
+        """Handle standalone activation layers in __init__."""
+        if lyr_type == "Activation":
+            if len(node.value.args) > 0 and isinstance(node.value.args[0], ast.Constant):
+                actv_name = node.value.args[0].value
+            else:
+                actv_name = "relu"
+            self.activation_functions[module_name] = actv_name
+        else:
+            self.activation_functions[module_name] = actv_fun_mapping[lyr_type]
+
+    def _extract_bidirectional_layer(self, node, lyr_type, lyr_params):
+        """Extract bidirectional RNN layer parameters."""
+        if len(node.value.args) > 0:
+            if (isinstance(node.value.args[0], ast.Call) and
+                node.value.func.attr == "Bidirectional"):
+                lyr = node.value.args[0]
+                lyr_type, lyr_params = self.extract_layer(lyr)
+                lyr_params["bidirectional"] = True
+        return lyr_type, lyr_params
+
+    def _add_init_layer_with_params(self, lyr_type, lyr_params, module_name, dropout_rate):
+        """Add layer with optional dropout and parameter inference."""
+        if dropout_rate is not None:
+            dropout_layer = getattr(mm_classes, "DropoutLayer")(
+                name=f"{module_name}_dropout",
+                rate=dropout_rate
+            )
+            self.buml_model.add_layer(dropout_layer)
+
+        if lyr_type == "BatchNormLayer":
+            lyr_params.update(infer_batchnorm_params(self.buml_model))
+        elif lyr_type == "LayerNormLayer":
+            lyr_params.update(infer_layernorm_params(self.buml_model))
+
+        buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+        self.buml_model.add_layer(buml_layer)
+
     def handle_init(self, node: ast.Assign):
         """
         It retrieves the sub_nn layers and stores them in the 'sub_nn'
@@ -1219,54 +1224,27 @@ class ASTParserTF(ASTParser):
             None, but populates the BUML model.
         """
         module_name = node.targets[0].attr
-        if (isinstance(node.value, ast.Call) and
-            isinstance(node.value.func, ast.Name)):
-            module_type = node.value.func.id
-            if module_type == "Sequential":
+
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+            if node.value.func.id == "Sequential":
                 self.handle_sequential_layers(node, module_name)
 
-        # simple calls to layers
-        elif (isinstance(node.value, ast.Call) and
-            isinstance(node.value.func, ast.Attribute)):
-            # Check for tf.keras.Sequential
-            if (hasattr(node.value.func, 'attr') and
-                node.value.func.attr == "Sequential"):
+        elif isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute):
+            if hasattr(node.value.func, 'attr') and node.value.func.attr == "Sequential":
                 self.handle_sequential_layers(node, module_name)
-                # Don't return: let modules.clear() execute below
             else:
                 lyr_type, lyr_params = self.extract_layer(node.value)
 
-                # Handle standalone activation layers (layers.ReLU, layers.Activation, etc.)
                 if lyr_type in actv_fun_mapping:
-                    # Store activation function for later use in forward pass
-                    if lyr_type == "Activation":
-                        # layers.Activation('relu'): extract activation name from first arg
-                        if len(node.value.args) > 0 and isinstance(node.value.args[0], ast.Constant):
-                            actv_name = node.value.args[0].value
-                        else:
-                            actv_name = "relu"  # default
-                        self.activation_functions[module_name] = actv_name
-                    else:
-                        # layers.ReLU(), layers.Sigmoid(), etc.
-                        self.activation_functions[module_name] = actv_fun_mapping[lyr_type]
-                    # Skip the rest of layer processing for activations
+                    self._handle_init_activation_layer(module_name, lyr_type, node)
                 else:
-                    # Regular layer processing
-
-                    if len(node.value.args) > 0:  # rnn bidirectional
-                        if (isinstance(node.value.args[0], ast.Call) and
-                            node.value.func.attr == "Bidirectional"):
-                            lyr = node.value.args[0]
-                            lyr_type, lyr_params = self.extract_layer(lyr)
-                            lyr_params["bidirectional"] = True
+                    lyr_type, lyr_params = self._extract_bidirectional_layer(node, lyr_type, lyr_params)
 
                     lyr_type, lyr_params, padding_amount, dropout_rate, has_recurrent_dropout = transform_layer(
                         lyr_type, lyr_params, self.padding_amount, module_name
                     )
-
                     self.padding_amount = padding_amount
 
-                    # Warn about recurrent_dropout having no PyTorch equivalent
                     if has_recurrent_dropout:
                         self.migration_warnings.append(
                             f"TensorFlow layer '{module_name}' has recurrent_dropout parameter, "
@@ -1274,31 +1252,72 @@ class ASTParserTF(ASTParser):
                         )
 
                     if not lyr_type.startswith("ZeroPadding"):
-                        # Add Dropout layer to __init__ if dropout param was present
-                        if dropout_rate is not None:
-                            dropout_layer_name = f"{module_name}_dropout"
-                            dropout_layer = getattr(mm_classes, "DropoutLayer")(
-                                name=dropout_layer_name,
-                                rate=dropout_rate
-                            )
-                            self.buml_model.add_layer(dropout_layer)
+                        self._add_init_layer_with_params(lyr_type, lyr_params, module_name, dropout_rate)
 
-                        # Infer BatchNorm params from previous layers if needed
-                        if lyr_type == "BatchNormLayer":
-                            inferred_params = infer_batchnorm_params(self.buml_model)
-                            lyr_params.update(inferred_params)
-
-                        # Infer LayerNorm params from previous layers if needed
-                        if lyr_type == "LayerNormLayer":
-                            inferred_params = infer_layernorm_params(self.buml_model)
-                            lyr_params.update(inferred_params)
-
-                        buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-                        self.buml_model.add_layer(buml_layer)
-
-        # to get the proper order from forward the method
         self.buml_model.modules.clear()
 
+
+    def _flatten_nested_sequential(self, seq_name, layer_id, elt, subnn):
+        """Process and flatten a nested Sequential layer."""
+        nested_seq_name = f"{seq_name}_nested_{layer_id}"
+        nested_node = ast.Assign(targets=[ast.Name(id=nested_seq_name)], value=elt)
+        self.handle_sequential_layers(nested_node, nested_seq_name)
+
+        nested_subnn = next((obj for obj in self.buml_model.sub_nns if
+                            obj.name == nested_seq_name), None)
+        if nested_subnn:
+            for nested_layer in nested_subnn.layers:
+                nested_layer.name = f"layer_{layer_id}"
+                subnn.add_layer(nested_layer)
+                layer_id += 1
+            self.buml_model.sub_nns.remove(nested_subnn)
+        return layer_id
+
+    def _handle_sequential_activation(self, lyr_type, layer_id, subnn):
+        """Handle activation layer in Sequential model."""
+        actv_func = actv_fun_mapping[lyr_type]
+        if subnn.layers and hasattr(subnn.layers[-1], 'actv_func'):
+            subnn.layers[-1].actv_func = actv_func
+            return layer_id
+        else:
+            actv_layer = getattr(mm_classes, "GeneralLayer")(
+                name=f"layer_{layer_id}",
+                actv_func=actv_func
+            )
+            subnn.add_layer(actv_layer)
+            return layer_id + 1
+
+    def _extract_bidirectional_params(self, elt, lyr_type, lyr_params):
+        """Extract parameters for bidirectional RNN layers."""
+        if len(elt.args) > 0:
+            if (isinstance(elt.args[0], ast.Call) and
+                isinstance(elt.func, ast.Attribute) and
+                elt.func.attr == "Bidirectional"):
+                lyr = elt.args[0]
+                lyr_type, lyr_params = self.extract_layer(lyr)
+                lyr_params["bidirectional"] = True
+        return lyr_type, lyr_params
+
+    def _add_sequential_layer(self, lyr_type, lyr_params, layer_id, dropout_rate, subnn):
+        """Add a layer to the Sequential subnn, including optional dropout."""
+        if dropout_rate is not None:
+            dropout_layer = getattr(mm_classes, "DropoutLayer")(
+                name=f"layer_{layer_id}",
+                rate=dropout_rate
+            )
+            subnn.add_layer(dropout_layer)
+            layer_id += 1
+
+        lyr_params["name"] = f"layer_{layer_id}"
+
+        if lyr_type == "BatchNormLayer":
+            lyr_params.update(infer_batchnorm_params(subnn))
+        elif lyr_type == "LayerNormLayer":
+            lyr_params.update(infer_layernorm_params(subnn))
+
+        subnn_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+        subnn.add_layer(subnn_layer)
+        return layer_id + 1
 
     def handle_sequential_layers(self, node: ast.Assign, seq_name: str):
         """
@@ -1316,62 +1335,26 @@ class ASTParserTF(ASTParser):
         """
         subnn: NN = NN(name=seq_name)
         layer_id = 1
-        # Extract layers within Sequential
+
         for elt in node.value.args[0].elts:
             if isinstance(elt, ast.Call):
                 lyr_type, lyr_params = self.extract_layer(elt)
 
-                # Handle nested Sequential
                 if lyr_type == "Sequential":
-                    # Create a synthetic node for nested Sequential
-                    nested_seq_name = f"{seq_name}_nested_{layer_id}"
-                    # Recursively process nested Sequential
-                    nested_node = ast.Assign(targets=[ast.Name(id=nested_seq_name)], value=elt)
-                    self.handle_sequential_layers(nested_node, nested_seq_name)
-                    # Get the nested subnn that was just created and flatten its layers into parent
-                    nested_subnn = next((obj for obj in self.buml_model.sub_nns if
-                                        obj.name == nested_seq_name), None)
-                    if nested_subnn:
-                        # Flatten: add nested Sequential's layers directly to parent Sequential
-                        # Rename layers to avoid conflicts and update layer_id counter
-                        for nested_layer in nested_subnn.layers:
-                            nested_layer.name = f"layer_{layer_id}"
-                            subnn.add_layer(nested_layer)
-                            layer_id += 1
-                        # Remove the nested subnn from model since we flattened it
-                        self.buml_model.sub_nns.remove(nested_subnn)
+                    layer_id = self._flatten_nested_sequential(seq_name, layer_id, elt, subnn)
                     continue
 
-                # Handle activation layers (ReLU, Sigmoid, etc.)
                 if lyr_type in actv_fun_mapping:
-                    actv_func = actv_fun_mapping[lyr_type]
-                    # Check if previous layer supports inline activation
-                    if subnn.layers and hasattr(subnn.layers[-1], 'actv_func'):
-                        subnn.layers[-1].actv_func = actv_func
-                    else:
-                        # Create standalone activation layer
-                        actv_layer = getattr(mm_classes, "GeneralLayer")(
-                            name=f"layer_{layer_id}",
-                            actv_func=actv_func
-                        )
-                        subnn.add_layer(actv_layer)
-                        layer_id += 1
+                    layer_id = self._handle_sequential_activation(lyr_type, layer_id, subnn)
                     continue
 
-                if len(elt.args) > 0:  # rnn bidirectional
-                    if (isinstance(elt.args[0], ast.Call) and
-                        isinstance(elt.func, ast.Attribute)):
-                        if  elt.func.attr == "Bidirectional":
-                            lyr = elt.args[0]
-                            lyr_type, lyr_params = self.extract_layer(lyr)
-                            lyr_params["bidirectional"] = True
+                lyr_type, lyr_params = self._extract_bidirectional_params(elt, lyr_type, lyr_params)
 
                 lyr_type, lyr_params, padding_amount, dropout_rate, has_recurrent_dropout = transform_layer(
                     lyr_type, lyr_params, self.padding_amount
                 )
                 self.padding_amount = padding_amount
 
-                # Warn about recurrent_dropout having no PyTorch equivalent
                 if has_recurrent_dropout:
                     self.migration_warnings.append(
                         "Sequential layer has recurrent_dropout parameter, "
@@ -1379,31 +1362,7 @@ class ASTParserTF(ASTParser):
                     )
 
                 if not lyr_type.startswith("ZeroPadding"):
-                    # Add Dropout layer before RNN if dropout param was present
-                    if dropout_rate is not None:
-                        dropout_layer_name = f"layer_{layer_id}"
-                        dropout_layer = getattr(mm_classes, "DropoutLayer")(
-                            name=dropout_layer_name,
-                            rate=dropout_rate
-                        )
-                        subnn.add_layer(dropout_layer)
-                        layer_id += 1
-
-                    lyr_params["name"] = f"layer_{layer_id}"
-
-                    # Infer BatchNorm params from previous layers if needed
-                    if lyr_type == "BatchNormLayer":
-                        inferred_params = infer_batchnorm_params(subnn)
-                        lyr_params.update(inferred_params)
-
-                    # Infer LayerNorm params from previous layers if needed
-                    if lyr_type == "LayerNormLayer":
-                        inferred_params = infer_layernorm_params(subnn)
-                        lyr_params.update(inferred_params)
-
-                    subnn_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-                    subnn.add_layer(subnn_layer)
-                    layer_id+=1
+                    layer_id = self._add_sequential_layer(lyr_type, lyr_params, layer_id, dropout_rate, subnn)
 
             elif isinstance(elt, ast.Name):
                 subnn_obj = next((obj for obj in self.buml_model.sub_nns if
@@ -1426,6 +1385,65 @@ class ASTParserTF(ASTParser):
         chain.reverse()
         return chain
 
+    def _process_chained_call(self, node, chain):
+        """Process a chained call by decomposing into individual calls."""
+        for i, call in enumerate(chain):
+            is_last = (i == len(chain) - 1)
+            if is_last:
+                synthetic_node = ast.Assign(targets=node.targets, value=call)
+            else:
+                temp_name = f"_chain_temp_{self.tensor_op_counter}_{i}"
+                temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+                synthetic_node = ast.Assign(targets=[temp_target], value=call)
+
+                if i + 1 < len(chain):
+                    next_call = chain[i + 1]
+                    next_func_value = next_call.func.value
+
+                    if isinstance(next_func_value, ast.Name):
+                        if next_call.args:
+                            next_call.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+                    elif isinstance(next_func_value, ast.Call):
+                        next_call.func.value = ast.Name(id=temp_name, ctx=ast.Load())
+            synthetic_node.lineno = node.lineno
+            synthetic_node.col_offset = node.col_offset
+            self.process_single_call(synthetic_node)
+            self.previous_assign = synthetic_node
+
+    def _extract_nested_call(self, node):
+        """Extract nested call from arguments and process it."""
+        inner_call = node.value.args[0]
+        temp_name = f"_nested_temp_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+
+        inner_node = ast.Assign(
+            targets=[ast.Name(id=temp_name, ctx=ast.Store())],
+            value=inner_call
+        )
+        inner_node.lineno = node.lineno
+        inner_node.col_offset = node.col_offset
+        self.handle_forward_simple_call(inner_node)
+        self.previous_assign = inner_node
+
+        node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+
+    def _extract_subscript_arg(self, node):
+        """Extract subscript from arguments and process it."""
+        subscript_node = node.value.args[0]
+        temp_name = f"_subscript_arg_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+
+        subscript_assign = ast.Assign(
+            targets=[ast.Name(id=temp_name, ctx=ast.Store())],
+            value=subscript_node
+        )
+        subscript_assign.lineno = node.lineno
+        subscript_assign.col_offset = node.col_offset
+        self.handle_forward_slicing(subscript_assign)
+        self.previous_assign = subscript_assign
+
+        node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+
     def handle_forward_simple_call(self, node: ast.Assign):
         """
         Processes forward method assignments including chained calls.
@@ -1433,74 +1451,18 @@ class ASTParserTF(ASTParser):
         if isinstance(node.value, ast.Call) and hasattr(node.value.func, 'value'):
             if isinstance(node.value.func.value, ast.Call):
                 chain = self.decompose_chained_call(node)
-                for i, call in enumerate(chain):
-                    is_last = (i == len(chain) - 1)
-                    if is_last:
-                        synthetic_node = ast.Assign(targets=node.targets, value=call)
-                    else:
-                        temp_name = f"_chain_temp_{self.tensor_op_counter}_{i}"
-                        temp_target = ast.Name(id=temp_name, ctx=ast.Store())
-                        synthetic_node = ast.Assign(targets=[temp_target], value=call)
-
-                        # Update next call based on whether it's functional or method call
-                        if i + 1 < len(chain):
-                            next_call = chain[i + 1]
-                            next_func_value = next_call.func.value
-
-                            if isinstance(next_func_value, ast.Name):
-                                # Functional call like layers.Activation(x) where x is in args[0]
-                                if next_call.args:
-                                    next_call.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
-                            elif isinstance(next_func_value, ast.Call):
-                                # Method call like result.transpose(...) where result is func.value
-                                next_call.func.value = ast.Name(id=temp_name, ctx=ast.Load())
-                    synthetic_node.lineno = node.lineno
-                    synthetic_node.col_offset = node.col_offset
-                    self.process_single_call(synthetic_node)
-                    self.previous_assign = synthetic_node
+                self._process_chained_call(node, chain)
                 return
 
-        # Handle nested calls and subscripts in arguments
         is_nested_call = False
         if isinstance(node.value, ast.Call) and node.value.args:
             if isinstance(node.value.args[0], ast.Call):
-                # Nested call detected: process inner call first
-                inner_call = node.value.args[0]
-                temp_name = f"_nested_temp_{self.tensor_op_counter}"
-                self.tensor_op_counter += 1
-                temp_target = ast.Name(id=temp_name, ctx=ast.Store())
-
-                # Create synthetic node for inner call
-                inner_node = ast.Assign(targets=[temp_target], value=inner_call)
-                inner_node.lineno = node.lineno
-                inner_node.col_offset = node.col_offset
-                # Recursively handle in case of multiple levels of nesting
-                self.handle_forward_simple_call(inner_node)
-                self.previous_assign = inner_node
-
-                # Replace inner call with temp variable in outer call
-                node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+                self._extract_nested_call(node)
                 is_nested_call = True
             elif isinstance(node.value.args[0], ast.Subscript):
-                # Subscript in argument detected: process subscript first
-                subscript_node = node.value.args[0]
-                temp_name = f"_subscript_arg_{self.tensor_op_counter}"
-                self.tensor_op_counter += 1
-                temp_target = ast.Name(id=temp_name, ctx=ast.Store())
-
-                # Create synthetic node for subscript
-                subscript_assign = ast.Assign(targets=[temp_target], value=subscript_node)
-                subscript_assign.lineno = node.lineno
-                subscript_assign.col_offset = node.col_offset
-                # Process the subscript using handle_forward_slicing
-                self.handle_forward_slicing(subscript_assign)
-                self.previous_assign = subscript_assign
-
-                # Replace subscript with temp variable in outer call
-                node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+                self._extract_subscript_arg(node)
                 is_nested_call = True
 
-        # Mark if this is a nested call's outer part
         if is_nested_call:
             self.is_processing_nested_outer = True
 
@@ -1646,6 +1608,81 @@ class ASTParserTF(ASTParser):
             module_obj.name_module_input = dropout_layer_name
             self.buml_model.modules.append(dropout_module)
 
+    def _extract_call_input_var(self, node):
+        """Extract input variable from call arguments."""
+        if not node.value.args:
+            return "x"
+
+        arg = node.value.args[0]
+        if isinstance(arg, ast.Name):
+            return arg.id
+        elif isinstance(arg, ast.Call):
+            return f"_nested_temp_{self.tensor_op_counter - 1}"
+        else:
+            return "x"
+
+    def _find_module_by_name(self, module_name):
+        """Find module object by name in layers or sub_nns."""
+        module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
+        if not module_obj:
+            module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
+        return module_obj
+
+    def _mark_split_input_reuse(self, module_obj, input_var):
+        """Mark input_reused if layer consumes a split output."""
+        if input_var in self.module_of_output:
+            source = self.module_of_output[input_var]
+            if isinstance(source, str) and "__split_" in source:
+                module_obj.input_reused = True
+
+    def _mark_rnn_hidden_usage(self, module_obj, input_var):
+        """Mark if layer uses RNN hidden state as input."""
+        if not (module_obj and input_var in self.module_of_output):
+            return
+
+        source_module = self.module_of_output[input_var]
+        if source_module in self.rnn_hidden_vars and self.rnn_hidden_vars[source_module] == input_var:
+            module_obj.use_rnn_hidden = True
+
+    def _is_tf_nn_activation(self, node):
+        """Check if node is a tf.nn.activation call."""
+        return (isinstance(node.value.func.value, ast.Attribute) and
+                node.value.func.value.attr == "nn" and
+                isinstance(node.value.func.value.value, ast.Name) and
+                node.value.func.value.value.id == "tf")
+
+    def _process_self_module_call(self, node, module_name):
+        """Process a call to a module defined in self (e.g., self.layer(x))."""
+        input_var = self._extract_call_input_var(node)
+        output_var = node.targets[0].id
+
+        self.inputs_outputs[module_name] = [input_var, output_var]
+        module_obj = self._find_module_by_name(module_name)
+
+        if module_obj:
+            self._set_module_input(module_obj, input_var)
+            self._mark_split_input_reuse(module_obj, input_var)
+
+        self.module_of_output[output_var] = module_name
+
+        if module_obj and hasattr(module_obj, 'return_type'):
+            for kw in node.value.keywords:
+                if kw.arg == "initial_state":
+                    self._handle_initial_state_keyword(module_obj, module_name, kw)
+                    break
+
+        self._mark_rnn_hidden_usage(module_obj, input_var)
+
+        if module_obj:
+            self._handle_dropout_before_module(module_obj, module_name)
+
+        if module_name in self.activation_functions:
+            self._handle_module_activation(node, module_name)
+        elif module_obj and module_obj in self.buml_model.modules:
+            self._handle_module_layer_reuse(node, module_name, module_obj)
+        elif module_obj:
+            self.buml_model.modules.append(module_obj)
+
     def process_single_call(self, node: ast.Assign):
         """
         Process a single (non-chained) call operation.
@@ -1654,92 +1691,24 @@ class ASTParserTF(ASTParser):
         if isinstance(node.value.func.value, ast.Name):
             if node.value.func.value.id == "self":
                 module_name = node.value.func.attr
-                # populate inputs_outputs and module_of_output
-                # Handle different argument types (Name, Call, etc.)
-                if node.value.args:
-                    arg = node.value.args[0]
-                    if isinstance(arg, ast.Name):
-                        input_var = arg.id
-                    elif isinstance(arg, ast.Call):
-                        # Nested call: use the temp variable created earlier
-                        input_var = f"_nested_temp_{self.tensor_op_counter - 1}"
-                    else:
-                        input_var = "x"
-                else:
-                    input_var = "x"
-                self.inputs_outputs[module_name] = [input_var,
-                                                    node.targets[0].id]
-                # Get module_obj BEFORE updating module_of_output
-                module_obj = next((obj for obj in self.buml_model.layers if
-                                   obj.name == module_name), None)
-                if not module_obj:
-                    subnns = self.buml_model.sub_nns
-                    module_obj = next((obj for obj in subnns if
-                                       obj.name == module_name), None)
-
-                # Set name_module_input BEFORE updating module_of_output (to avoid self-reference)
-                if module_obj:
-                    self._set_module_input(module_obj, input_var)
-                    # Mark input_reused if this layer consumes a split output
-                    if input_var in self.module_of_output:
-                        source = self.module_of_output[input_var]
-                        if isinstance(source, str) and "__split_" in source:
-                            module_obj.input_reused = True
-
-                # NOW update module_of_output
-                output_var = node.targets[0].id
-                self.module_of_output[output_var] = module_name
-
-
-                # Check for initial_state keyword argument (for RNN layers)
-                if module_obj and hasattr(module_obj, 'return_type'):
-                    for kw in node.value.keywords:
-                        if kw.arg == "initial_state":
-                            self._handle_initial_state_keyword(module_obj, module_name, kw)
-                            break
-
-                # Check for RNN hidden state usage
-                if module_obj and input_var in self.module_of_output:
-                    source_module = self.module_of_output[input_var]
-                    if source_module in self.rnn_hidden_vars and self.rnn_hidden_vars[source_module] == input_var:
-                        # Set a flag to indicate this layer uses RNN hidden state
-                        module_obj.use_rnn_hidden = True
-
-                # Add Dropout module before RNN/layer if dropout layer exists
-                if module_obj:
-                    self._handle_dropout_before_module(module_obj, module_name)
-
-                # Handle standalone activation layers (layers.ReLU, layers.Activation, etc.)
-                if module_name in self.activation_functions:
-                    self._handle_module_activation(node, module_name)
-                elif module_obj and module_obj in self.buml_model.modules:
-                    self._handle_module_layer_reuse(node, module_name, module_obj)
-                elif module_obj:
-                    self.buml_model.modules.append(module_obj)
+                self._process_self_module_call(node, module_name)
             else:
-                # tensorops or tf.nn.* activations
-                # Check if it's tf.nn.<activation>
-                if (isinstance(node.value.func.value, ast.Attribute) and
-                    node.value.func.value.attr == "nn" and
-                    isinstance(node.value.func.value.value, ast.Name) and
-                    node.value.func.value.value.id == "tf"):
-                    # This is tf.nn.*: check if activation
+                if self._is_tf_nn_activation(node):
                     func_name = node.value.func.attr
                     if func_name in tf_actv_func_mapping:
                         self.handle_tf_activation(node, func_name)
                     else:
-                        # Not an activation, treat as tensorop
                         self.extract_tensorop(node)
                 else:
                     self.extract_tensorop(node)
         elif isinstance(node.value.func.value, ast.Attribute):
             if node.value.func.value.value.id == "tf":
-                # Check if it's tf.nn.<activation>
                 if (node.value.func.value.attr == "nn" and
                     node.value.func.attr in tf_actv_func_mapping):
                     self.handle_tf_activation(node, node.value.func.attr)
                 else:
                     self.extract_tensorop(node)
+
 
 
     def handle_tf_activation(self, node: ast.Assign, func_name: str):
@@ -2510,12 +2479,84 @@ class ASTParserTF(ASTParser):
         add_squeeze_ops(self.buml_model.modules)
 
 
+    def _is_cnn_module(self, module, cnns):
+        """Check if module is a CNN-type layer or spatial tensorop."""
+        if isinstance(module, Layer):
+            return module.__class__.__name__ in cnns
+        elif isinstance(module, TensorOp):
+            return module.tns_type in ("interpolate", "pad")
+        return False
+
+    def _is_batchnorm_on_spatial_data(self, module, modules, cnns):
+        """Check if BatchNormLayer operates on spatial data (follows a CNN layer)."""
+        if not module.name_module_input:
+            return False
+
+        prev_module = next((obj for obj in modules if obj.name == module.name_module_input), None)
+        if not prev_module:
+            return False
+
+        if isinstance(prev_module, Layer):
+            return prev_module.__class__.__name__ in cnns
+        elif isinstance(prev_module, TensorOp):
+            return prev_module.tns_type in ("interpolate", "pad")
+        return False
+
+    def _should_treat_next_as_cnn(self, next_module, cnns):
+        """Determine if next module should be treated as CNN for permute logic."""
+        if isinstance(next_module, Layer):
+            return next_module.__class__.__name__ in cnns
+        elif isinstance(next_module, TensorOp):
+            if next_module.tns_type in ("interpolate", "pad"):
+                return True
+            if next_module.tns_type == "permute" and hasattr(next_module, 'permute_dim'):
+                canceling_permutes = [[0, 2, 1], [0, 2, 3, 1], [0, 2, 3, 4, 1]]
+                return next_module.permute_dim in canceling_permutes
+        return False
+
+    def _update_prev_module_reference(self, module, modules):
+        """Update prev_module reference based on module's input."""
+        if module.name_module_input:
+            return next((obj for obj in modules if obj.name == module.name_module_input), None)
+        return None
+
+    def _set_input_permute(self, module, prev_cnn, prev_module, lyr_out_permuted):
+        """Set input permute flags on module based on previous module state."""
+        needs_input_permute = False
+
+        if not prev_cnn and (prev_module is None or prev_module.name not in lyr_out_permuted):
+            needs_input_permute = True
+        elif prev_cnn and prev_module and prev_module.name in lyr_out_permuted:
+            needs_input_permute = True
+
+        if needs_input_permute:
+            if isinstance(module, (Layer, TensorOp)):
+                module.permute_in = True
+            if prev_module is not None and prev_module.name not in lyr_out_permuted:
+                lyr_out_permuted.append(prev_module.name)
+
+    def _set_output_permute(self, module, next_cnn, lyr_out_permuted):
+        """Set output permute flags on module based on next module state."""
+        if next_cnn:
+            return
+
+        is_global_pooling = (isinstance(module, Layer) and
+                           module.__class__.__name__ == "PoolingLayer" and
+                           hasattr(module, 'pooling_type') and
+                           module.pooling_type.startswith("global"))
+
+        if not is_global_pooling and isinstance(module, (Layer, TensorOp)):
+            module.permute_out = True
+
+        if module.name not in lyr_out_permuted:
+            lyr_out_permuted.append(module.name)
+
     def permute(self, module, modules: list,
                 prev_module, next_module,
                 lyr_out_permuted: list, cnns: list):
         """
         It permutes input and output of `name` layer if needed
-        
+
         Parameters:
             module: A buml module (either a layer, a subnn or a tensorop).
             modules (list): A list of modules.
@@ -2523,128 +2564,40 @@ class ASTParserTF(ASTParser):
             next_module: The module defined after 'module' in the nn model.
             lyr_out_permuted (list): A list containing the modules that their
                 output has been already permuted.
-            cnns (list): A list containing the names of layers to which 
+            cnns (list): A list containing the names of layers to which
                 permutation applies.
 
         Returns:
             The module defined before 'module' in the nn model.
-        
+
         """
-        current_cnn, prev_cnn, next_cnn = False, False, False
+        next_cnn = self._should_treat_next_as_cnn(next_module, cnns)
 
-        # Check if next module is CNN or spatial tensorop
-        if isinstance(next_module, Layer):
-            if next_module.__class__.__name__ in cnns:
-                next_cnn = True
-        elif isinstance(next_module, TensorOp):
-            if next_module.tns_type in ("interpolate", "pad"):
-                next_cnn = True
-            # Check if next is a permute that would cancel our auto permute_out
-            elif next_module.tns_type == "permute" and hasattr(next_module, 'permute_dim'):
-                # For Conv1D: auto permute_out is [0,2,1], canceling permute is also [0,2,1]
-                # For Conv2D: auto permute_out is [0,2,3,1], canceling permute is also [0,2,3,1]
-                # For Conv3D: auto permute_out is [0,2,3,4,1], canceling permute is also [0,2,3,4,1]
-                canceling_permutes = {
-                    3: [0, 2, 1],           # Conv1D
-                    4: [0, 2, 3, 1],        # Conv2D
-                    5: [0, 2, 3, 4, 1]      # Conv3D
-                }
-                perm_dim = next_module.permute_dim
-                if perm_dim in canceling_permutes.values():
-                    # This permute cancels our auto permute_out, treat as CNN
-                    next_cnn = True
-
-        # Check if current module is CNN or spatial tensorop
-        if isinstance(module, Layer):
-            if module.__class__.__name__ in cnns:
-                # Special case: BatchNormLayer is only CNN if prev layer was also CNN
-                # (i.e., it operates on spatial data, not vectors)
-                if module.__class__.__name__ == "BatchNormLayer":
-                    # First determine prev_cnn to check if BatchNorm should be treated as CNN
-                    temp_prev_cnn = False
-                    if module.name_module_input:
-                        prev_module_name = module.name_module_input
-                        temp_prev_module = next((obj for obj in modules if
-                                            obj.name == prev_module_name), None)
-                        if temp_prev_module and isinstance(temp_prev_module, Layer):
-                            if temp_prev_module.__class__.__name__ in cnns:
-                                temp_prev_cnn = True
-                        elif temp_prev_module and isinstance(temp_prev_module, TensorOp):
-                            if temp_prev_module.tns_type in ("interpolate", "pad"):
-                                temp_prev_cnn = True
-
-                    # Only treat BatchNorm as CNN if previous layer was CNN
-                    if temp_prev_cnn:
-                        current_cnn = True
-                else:
-                    current_cnn = True
-
-                if module.name_module_input:
-                    prev_module_name = module.name_module_input
-                    prev_module = next((obj for obj in modules if
-                                        obj.name == prev_module_name), None)
-
-                if isinstance(next_module, Layer):
-                    if next_module.name_module_input:
-                        next_in = next_module.name_module_input
-                        if next_in != module.name:
-                            next_cnn = False
-        elif isinstance(module, TensorOp):
-            if module.tns_type in ("interpolate", "pad"):
-                current_cnn = True
-                # TensorOps use name_module_input to track their input
-                if module.name_module_input:
-                    prev_module_name = module.name_module_input
-                    prev_module = next((obj for obj in modules if
-                                        obj.name == prev_module_name), None)
-
-        if isinstance(prev_module, Layer):
-            if prev_module.__class__.__name__ in cnns:
-                prev_cnn = True
-        elif isinstance(prev_module, TensorOp):
-            # Treat spatial tensorops (interpolate, pad) as CNN-like for permute logic
-            # They expect NCHW input and output NCHW, so next layer shouldn't add input permute
-            if prev_module.tns_type in ("interpolate", "pad"):
-                prev_cnn = True
+        current_cnn = False
+        if isinstance(module, Layer) and module.__class__.__name__ in cnns:
+            if module.__class__.__name__ == "BatchNormLayer":
+                current_cnn = self._is_batchnorm_on_spatial_data(module, modules, cnns)
             else:
-                prev_cnn = False
-        else:
-            prev_cnn = False
-        if current_cnn:
-            # Determine if we need input permute
-            if not prev_cnn and (prev_module is None or
-                                 prev_module.name not in lyr_out_permuted):
-                # For Layers, set permute_in attribute
-                if isinstance(module, Layer):
-                    module.permute_in = True
-                # For TensorOps (interpolate, pad), we'll add permute in handle_tensorop
-                elif isinstance(module, TensorOp):
-                    # Mark that this tensorop needs input permute
-                    module.permute_in = True
-                if prev_module is not None:
-                    lyr_out_permuted.append(prev_module.name)
-            elif prev_cnn and prev_module.name in lyr_out_permuted:
-                if isinstance(module, Layer):
-                    module.permute_in = True
-                elif isinstance(module, TensorOp):
-                    module.permute_in = True
+                current_cnn = True
 
-            # Determine if we need output permute
-            if not next_cnn:
-                # For global pooling, don't set permute_out (will add squeeze instead)
-                is_global_pooling = (isinstance(module, Layer) and
-                                   module.__class__.__name__ == "PoolingLayer" and
-                                   hasattr(module, 'pooling_type') and
-                                   module.pooling_type.startswith("global"))
-                if not is_global_pooling:
-                    if isinstance(module, Layer):
-                        module.permute_out = True
-                    elif isinstance(module, TensorOp):
-                        # Mark that this tensorop needs output permute
-                        module.permute_out = True
-                lyr_out_permuted.append(module.name)
-        prev_module = module
-        return prev_module
+            if module.name_module_input:
+                prev_module = self._update_prev_module_reference(module, modules)
+
+            if isinstance(next_module, Layer) and next_module.name_module_input:
+                if next_module.name_module_input != module.name:
+                    next_cnn = False
+        elif isinstance(module, TensorOp) and module.tns_type in ("interpolate", "pad"):
+            current_cnn = True
+            if module.name_module_input:
+                prev_module = self._update_prev_module_reference(module, modules)
+
+        prev_cnn = self._is_cnn_module(prev_module, cnns) if prev_module else False
+
+        if current_cnn:
+            self._set_input_permute(module, prev_cnn, prev_module, lyr_out_permuted)
+            self._set_output_permute(module, next_cnn, lyr_out_permuted)
+
+        return module
 
 
 
@@ -2683,6 +2636,55 @@ def transform_layer(lyr_type: str, lyr_params: dict,
 
 
 
+def _process_units_param(lyr_type, lyr_params, updated_params):
+    """Handle units parameter for Dense and RNN layers."""
+    lyrs_units = rnn_layers + ["Dense"]
+    if lyr_type in lyrs_units and "units" in lyr_params:
+        param = "out_features" if lyr_type == "Dense" else "hidden_size"
+        updated_params[param] = lyr_params["units"]
+
+def _extract_dropout_params(lyr_type, lyr_params):
+    """Extract dropout parameters from RNN layers."""
+    dropout_rate = None
+    has_recurrent_dropout = False
+
+    if lyr_type in rnn_layers:
+        if "dropout" in lyr_params and lyr_params["dropout"] > 0:
+            dropout_rate = lyr_params["dropout"]
+        if "recurrent_dropout" in lyr_params and lyr_params["recurrent_dropout"] > 0:
+            has_recurrent_dropout = True
+
+    return dropout_rate, has_recurrent_dropout
+
+def _map_param(param, value, updated_params):
+    """Map a single parameter from TF to BUML."""
+    if param == "activation":
+        updated_params["actv_func"] = value
+    elif param in ["return_sequences", "return_state", "dropout", "recurrent_dropout", "units", "positional_params", "name"]:
+        pass
+    elif param == "mask_zero":
+        if value is True:
+            updated_params["padding_idx"] = 0
+    elif param in params_mapping:
+        updated_params[params_mapping[param]] = value
+
+def _determine_rnn_return_type(lyr_type, lyr_params, updated_params):
+    """Determine RNN return_type from return_sequences and return_state."""
+    if lyr_type not in rnn_layers:
+        return
+
+    has_return_sequences = lyr_params.get("return_sequences", False)
+    has_return_state = lyr_params.get("return_state", False)
+
+    if has_return_sequences and has_return_state:
+        updated_params["return_type"] = "both"
+    elif has_return_sequences:
+        updated_params["return_type"] = "full"
+    elif has_return_state:
+        updated_params["return_type"] = "hidden"
+    else:
+        updated_params["return_type"] = "last"
+
 def process_params(lyr_type: str, lyr_params: dict):
     """
     It processes and transforms the layers' parameters.
@@ -2698,62 +2700,15 @@ def process_params(lyr_type: str, lyr_params: dict):
         - dropout_rate: Dropout rate if present on RNN layer, None otherwise
         - has_recurrent_dropout: True if recurrent_dropout param was present
     """
-
     updated_lyr_params = {}
-    dropout_rate = None
-    has_recurrent_dropout = False
 
-    # Handle units parameter for Dense and RNN layers
-    lyrs_units = rnn_layers + ["Dense"]
-    if lyr_type in lyrs_units and "units" in lyr_params:
-        param = "out_features" if lyr_type == "Dense" else "hidden_size"
-        updated_lyr_params[param] = lyr_params["units"]
+    _process_units_param(lyr_type, lyr_params, updated_lyr_params)
+    dropout_rate, has_recurrent_dropout = _extract_dropout_params(lyr_type, lyr_params)
 
-    # Extract dropout for RNN layers (will be converted to separate Dropout layer)
-    if lyr_type in rnn_layers:
-        if "dropout" in lyr_params and lyr_params["dropout"] > 0:
-            dropout_rate = lyr_params["dropout"]
-        if "recurrent_dropout" in lyr_params and lyr_params["recurrent_dropout"] > 0:
-            has_recurrent_dropout = True
+    for param, value in lyr_params.items():
+        _map_param(param, value, updated_lyr_params)
 
-    # Track return_sequences and return_state to determine return_type
-    has_return_sequences = lyr_params.get("return_sequences", False)
-    has_return_state = lyr_params.get("return_state", False)
-
-    for param in lyr_params:
-        if param == "activation":
-            updated_lyr_params["actv_func"] = lyr_params[param]
-        elif param in ["return_sequences", "return_state"]:
-            # Skip these, handled below to determine return_type
-            pass
-        elif param in ["dropout", "recurrent_dropout"]:
-            # Skip dropout params: handled separately above
-            pass
-        elif param == "mask_zero":
-            # TensorFlow Embedding mask_zero → PyTorch padding_idx
-            # mask_zero=True → padding_idx=0 (TF always masks at index 0)
-            # mask_zero=False → no padding_idx
-            if lyr_params[param] is True:
-                updated_lyr_params["padding_idx"] = 0
-            # If mask_zero=False, don't add padding_idx (leave as None)
-        elif param in params_mapping:
-            updated_lyr_params[params_mapping[param]] = lyr_params[param]
-        elif param in ["units", "positional_params", "name"]:
-            # Skip these, handled separately
-            pass
-        # Note: Unknown parameters are silently skipped (not critical for migration)
-
-    # Determine return_type based on return_sequences and return_state
-    if lyr_type in rnn_layers:
-        if has_return_sequences and has_return_state:
-            updated_lyr_params["return_type"] = "both"
-        elif has_return_sequences:
-            updated_lyr_params["return_type"] = "full"
-        elif has_return_state:
-            updated_lyr_params["return_type"] = "hidden"
-        else:
-            updated_lyr_params["return_type"] = "last"
-
+    _determine_rnn_return_type(lyr_type, lyr_params, updated_lyr_params)
     set_static_params(lyr_type, updated_lyr_params, static_params)
 
     return updated_lyr_params, dropout_rate, has_recurrent_dropout

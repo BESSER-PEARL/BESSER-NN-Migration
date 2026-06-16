@@ -264,6 +264,23 @@ class ASTParser(ast.NodeVisitor):
             self.handle_sequential_nn(node)
 
 
+    def _create_synthetic_assign(self, node, var_name='_return_output'):
+        """Create a synthetic assignment node for return expressions."""
+        synthetic_assign = ast.Assign(
+            targets=[ast.Name(id=var_name, ctx=ast.Store())],
+            value=node.value
+        )
+        synthetic_assign.lineno = node.lineno
+        synthetic_assign.col_offset = node.col_offset
+        return synthetic_assign
+
+    def _handle_tuple_return(self, node):
+        """Handle tuple return statements (e.g., return a, b)."""
+        pytorch_return_vars = [elt.id for elt in node.value.elts if isinstance(elt, ast.Name)]
+        if not hasattr(self, 'pytorch_return_vars'):
+            self.pytorch_return_vars = []
+        self.pytorch_return_vars = pytorch_return_vars
+
     def visit_Return(self, node: ast.Return):
         """
         It visits return statements. Converts complex return expressions into synthetic
@@ -279,53 +296,20 @@ class ASTParser(ast.NodeVisitor):
         Returns:
             None, but processes the return value and tracks multiple return values.
         """
-        # Only process if we're in a class (forward method) and input_nn_type is subclassing
         if not self.in_class or self.input_nn_type != "subclassing":
             return
 
-        # Handle expressions that need to be converted to assignments to ensure full processing
-        # Use '_return_output' as the synthetic variable name (doesn't matter since it's the last op)
         if isinstance(node.value, (ast.Call, ast.BinOp, ast.Subscript, ast.UnaryOp, ast.IfExp)):
-            # Create a synthetic assignment node for processing
-            # This allows reusing the existing assignment processing logic
-            synthetic_assign = ast.Assign(
-                targets=[ast.Name(id='_return_output', ctx=ast.Store())],
-                value=node.value
-            )
-            # Copy location info from original node
-            synthetic_assign.lineno = node.lineno
-            synthetic_assign.col_offset = node.col_offset
+            synthetic_assign = self._create_synthetic_assign(node)
             self.visit_Assign(synthetic_assign)
-
-        # Handle tuple returns (e.g., return a, b)
         elif isinstance(node.value, ast.Tuple):
-            # Track the tuple of return variables from PyTorch source
-            pytorch_return_vars = []
-            for elt in node.value.elts:
-                if isinstance(elt, ast.Name):
-                    pytorch_return_vars.append(elt.id)
-
-            # Store for set_remaining_lyr_params to create a return TensorOp
-            if not hasattr(self, 'pytorch_return_vars'):
-                self.pytorch_return_vars = []
-            self.pytorch_return_vars = pytorch_return_vars
-
-        # Handle simple name returns (e.g., return x): no processing needed
+            self._handle_tuple_return(node)
         elif isinstance(node.value, ast.Name):
-            pass  # No processing needed
-
-        # Handle constants (e.g., return None, return 5): no processing needed
+            pass
         elif isinstance(node.value, (ast.Constant, ast.Num)) or node.value is None:
-            pass  # No processing needed
-
-        # Handle other types (List, Dict, etc.): create synthetic assignment to be safe
+            pass
         else:
-            synthetic_assign = ast.Assign(
-                targets=[ast.Name(id='_return_output', ctx=ast.Store())],
-                value=node.value
-            )
-            synthetic_assign.lineno = node.lineno
-            synthetic_assign.col_offset = node.col_offset
+            synthetic_assign = self._create_synthetic_assign(node)
             self.visit_Assign(synthetic_assign)
 
 

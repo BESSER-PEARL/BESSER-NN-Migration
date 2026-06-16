@@ -95,98 +95,100 @@ def parse_tuple(value: str):
     """
     return (1,) + tuple(map(int, value.strip("()").split(",")))
 
-def transform(args: argparse.Namespace, framework: str,
-              ast_parser_class: 'ASTParser'):
+def _display_migration_warnings(extractor):
+    """Display migration warnings if any exist."""
+    if not (hasattr(extractor, 'migration_warnings') and extractor.migration_warnings):
+        return
+
+    print("\n" + "="*60)
+    print("MIGRATION WARNINGS")
+    print("="*60)
+    print(f"\nFound {len(extractor.migration_warnings)} issue(s) during migration:\n")
+    for i, warning in enumerate(extractor.migration_warnings, 1):
+        print(f"{i}. {warning}")
+    print("\n" + "="*60)
+    print("The migration will continue, but please review these warnings.")
+    print("Some PyTorch features may not be fully supported in the TensorFlow output.")
+    print("="*60 + "\n")
+
+def _restructure_sequential_model(buml_model):
+    """Restructure sequential model from sub_nn to main model."""
+    nn_obj = next((obj for obj in buml_model.sub_nns if obj.name == buml_model.name), None)
+    if not nn_obj:
+        return
+
+    buml_model.modules.clear()
+    buml_model.layers.clear()
+    for module in nn_obj.modules:
+        if isinstance(module, Layer):
+            buml_model.add_layer(module)
+        elif isinstance(module, NN):
+            buml_model.add_sub_nn(module)
+        else:
+            buml_model.modules.append(module)
+    buml_model.sub_nns.remove(nn_obj)
+
+def _add_configuration(buml_model, config):
+    """Add configuration to BUML model if exists."""
+    if not config:
+        return
+    if "classification" in config:
+        del config["classification"]
+    cnf = Configuration(**config)
+    buml_model.add_configuration(cnf)
+
+def _add_datasets(buml_model, dt_tr, dt_ts):
+    """Add training and test datasets to BUML model if they exist."""
+    if not dt_tr:
+        return
+
+    train_data = Dataset(name="train_data", path_data=dt_tr["path_data"],
+                         task_type=dt_tr["task_type"],
+                         input_format=dt_tr["input_format"])
+    test_data = Dataset(name="test_data", path_data=dt_ts["path_data"])
+
+    if dt_tr["input_format"] == "images":
+        if "normalize_images" not in dt_tr:
+            dt_tr["normalize_images"] = False
+        img = Image(shape=dt_tr["images_size"], normalize=dt_tr["normalize_images"])
+        train_data.add_image(img)
+
+    buml_model.add_train_data(train_data)
+    buml_model.add_test_data(test_data)
+
+def transform(args: argparse.Namespace, framework: str, ast_parser_class: 'ASTParser'):
     """
     It gets the AST and transforms it to a buml model.
 
     Parameters:
         args(argparse.Namespace): An object with arg attributes.
             framework (str): "TF" or "PyTorch".
-        ast_parser_class ('ASTParser'): The class to use to 
-            parse the AST
+        ast_parser_class ('ASTParser'): The class to use to parse the AST
 
     Returns:
         The buml model and its output architecture type (i.e., sequential
             or subclassing). It is specified in the config file.
     """
-
-    # Read the nn code to migrate
     with open(args.filename, "r", encoding="utf-8") as file:
         code = file.read()
 
-    # shape of the data input by the user
-    shape = args.datashape
-    input_nn_type = args.typeinput
-    output_nn_type = args.typeoutput
-    only_nn = args.onlynn
-
-    # Parse the code and get the buml model
     tree = ast.parse(code)
-    extractor = ast_parser_class(input_nn_type, only_nn)
+    extractor = ast_parser_class(args.typeinput, args.onlynn)
     extractor.visit(tree)
     buml_model = extractor.buml_model
 
-    # Display any warnings about unsupported features
-    if hasattr(extractor, 'migration_warnings') and extractor.migration_warnings:
-        print("\n" + "="*60)
-        print("MIGRATION WARNINGS")
-        print("="*60)
-        print(f"\nFound {len(extractor.migration_warnings)} issue(s) during migration:\n")
-        for i, warning in enumerate(extractor.migration_warnings, 1):
-            print(f"{i}. {warning}")
-        print("\n" + "="*60)
-        print("The migration will continue, but please review these warnings.")
-        print("Some PyTorch features may not be fully supported in the TensorFlow output.")
-        print("="*60 + "\n")
+    _display_migration_warnings(extractor)
 
-    # If the input_nn_type is sequential, it is processed as a sub_nn.
-    # It needs to be removed from sub_nns and the order of modules needs
-    # to be corrected.
-    if input_nn_type == "sequential":
-        nn_obj = next((obj for obj in buml_model.sub_nns if
-                        obj.name == buml_model.name), None)
-        buml_model.modules.clear()
-        buml_model.layers.clear()
-        for module in nn_obj.modules:
-            if isinstance(module, Layer):
-                buml_model.add_layer(module)
-            # automatically appends to modules
-            elif isinstance(module, NN):
-                buml_model.add_sub_nn(module)
-            else:
-                buml_model.modules.append(module)
-        buml_model.sub_nns.remove(nn_obj)
+    if args.typeinput == "sequential":
+        _restructure_sequential_model(buml_model)
 
     if framework == "TF":
-        update_model(input_nn_type, buml_model, args.filename, shape)
+        update_model(args.typeinput, buml_model, args.filename, args.datashape)
 
-    config = extractor.data_config["config"]
-    if config:
-        if "classification" in config:
-            del config["classification"]
-        cnf = Configuration(**config)
-        buml_model.add_configuration(cnf)
+    _add_configuration(buml_model, extractor.data_config["config"])
+    _add_datasets(buml_model, extractor.data_config["train_data"], extractor.data_config["test_data"])
 
-    dt_tr = extractor.data_config["train_data"]
-    dt_ts = extractor.data_config["test_data"]
-    if dt_tr:
-        train_data = Dataset(name="train_data", path_data=dt_tr["path_data"],
-                             task_type=dt_tr["task_type"],
-                             input_format=dt_tr["input_format"])
-        test_data = Dataset(name="test_data", path_data=dt_ts["path_data"])
-
-        if dt_tr["input_format"] == "images":
-            if "normalize_images" not in dt_tr:
-                dt_tr["normalize_images"] = False
-            img = Image(shape=dt_tr["images_size"],
-                        normalize=dt_tr["normalize_images"])
-            train_data.add_image(img)
-
-        buml_model.add_train_data(train_data)
-        buml_model.add_test_data(test_data)
-
-    return buml_model, output_nn_type
+    return buml_model, args.typeoutput
 
 
 def param_to_list(lyr_type: str, lyr_params: dict, params_to_convert: list,
