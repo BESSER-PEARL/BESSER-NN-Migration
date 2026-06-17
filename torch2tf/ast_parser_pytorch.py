@@ -538,6 +538,7 @@ class ASTParserTorch(ASTParser):
     def _process_chained_calls(self, node):
         """Process chained method calls by decomposing and handling each element."""
         chain = self.decompose_chained_call(node)
+        all_temp_names = []  # Track all temp variables created in this chain
 
         for i, call in enumerate(chain):
             is_last = (i == len(chain) - 1)
@@ -550,6 +551,7 @@ class ASTParserTorch(ASTParser):
                 temp_target = ast.Name(id=temp_name, ctx=ast.Store())
                 synthetic_node = ast.Assign(targets=[temp_target], value=call)
                 self._link_chain_calls(chain, i, temp_name)
+                all_temp_names.append(temp_name)
 
             # Handle nested calls within this chain element
             self._process_nested_call_in_chain(call, node)
@@ -567,6 +569,29 @@ class ASTParserTorch(ASTParser):
 
             if is_nested_activ:
                 self.is_processing_nested_outer = False
+
+        # Clean up chain temp variables to preserve original variable names
+        if len(chain) > 1 and all_temp_names:
+            target_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
+            if not target_var:
+                return
+
+            # Replace all temp variables in the chain with target_var
+            # This handles chains of any length (2+)
+            for temp_name in all_temp_names:
+                # Update inputs_outputs: replace temp_name with target_var in both inputs and outputs
+                for key in list(self.inputs_outputs.keys()):
+                    in_var, out_var = self.inputs_outputs[key]
+                    if out_var == temp_name:
+                        self.inputs_outputs[key][1] = target_var
+                    if in_var == temp_name:
+                        self.inputs_outputs[key][0] = target_var
+
+                # Update module_of_output: transfer temp's module to target_var
+                if temp_name in self.module_of_output:
+                    if target_var not in self.module_of_output:
+                        self.module_of_output[target_var] = self.module_of_output[temp_name]
+                    del self.module_of_output[temp_name]
 
     def handle_forward_simple_call(self, node: ast.Assign):
         """
