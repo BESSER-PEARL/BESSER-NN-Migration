@@ -13,7 +13,7 @@ import besser.BUML.metamodel.nn as mm_classes
 from torch2tf.definitions import (
     layers_mapping, params_mapping, static_params,
     pos_params, int2list_params, lyrs_of_int2list_params,
-    actv_fun_mapping, cnn_layers, loss_func_mapping,
+    actv_fun_mapping, channels_first_layers, loss_func_mapping,
     functional_to_module_mapping
 )
 from ast_parser_nn import ASTParser
@@ -427,7 +427,7 @@ class ASTParserTorch(ASTParser):
 
         if last_lyr is not None:
             last_lyr_type = subnn.layers[-1].__class__.__name__
-            if last_lyr_type in cnn_layers:
+            if last_lyr_type in channels_first_layers:
                 subnn.layers[-1].permute_out = True
                 return False
         return True
@@ -1511,7 +1511,7 @@ class ASTParserTorch(ASTParser):
         if not lyr_obj:
             return
         lyr_type = lyr_obj.__class__.__name__
-        if (lyr_type in cnn_layers and len(self.buml_model.tensor_ops)!=0):
+        if (lyr_type in channels_first_layers and len(self.buml_model.tensor_ops)!=0):
 
             if (isinstance(self.previous_assign.targets[0], ast.Name) and
                 isinstance(self.previous_assign.value, ast.Call)):
@@ -1746,14 +1746,30 @@ class ASTParserTorch(ASTParser):
         self.inputs_outputs[actv_lyr_name] = [input_var, output_var]
         self.module_of_output[output_var] = actv_lyr_name
 
+    def _can_merge_activation(self, layer_obj):
+        """Check if a layer supports activation function merging."""
+        if not layer_obj:
+            return False
+
+        layer_class = layer_obj.__class__.__name__
+        # Pooling layers don't support activation parameters in TensorFlow
+        # Exclude them and keep activations standalone
+        non_mergeable_types = ['PoolingLayer']
+        return layer_class not in non_mergeable_types
+
     def _handle_functional_activation(self, node, module_name):
         """Handle functional API activation functions."""
         input_var = self._extract_activation_input_var(node)
         is_tensorop, prev_lyr_obj, prev_lyr_name = self._check_prev_is_tensorop(input_var)
 
-        if is_tensorop:
+        # Check if previous layer can merge activation
+        can_merge = self._can_merge_activation(prev_lyr_obj) and not is_tensorop
+
+        if is_tensorop or not can_merge:
+            # Treat as standalone activation
             self._create_standalone_functional_activation(node, module_name, input_var)
         else:
+            # Merge into previous layer
             if prev_lyr_obj:
                 prev_lyr_obj.actv_func = actv_fun_mapping[module_name]
                 if hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer:
@@ -1774,11 +1790,11 @@ class ASTParserTorch(ASTParser):
         try:
             lyr_type, lyr_params = transform_layer(module_name, lyr_params, synthetic_name)
             lyr_obj = getattr(mm_classes, lyr_type)(**lyr_params)
-            self.buml_model.add_layer(lyr_obj)
+            self.buml_model.add_layer(lyr_obj)  # This also appends to modules
 
             self.inputs_outputs[synthetic_name] = [node.value.args[0].id, node.targets[0].id]
             self.module_of_output[node.targets[0].id] = synthetic_name
-            self.buml_model.modules.append(lyr_obj)
+            # Note: No need to append to modules here, add_layer already did it
         except ValueError as e:
             self.migration_warnings.append(f"Functional layer '{synthetic_name}': {str(e)}")
 
@@ -2727,7 +2743,7 @@ class ASTParserTorch(ASTParser):
 
         if isinstance(prev_module, Layer):
             lyr_type = prev_module.__class__.__name__
-            if lyr_type in cnn_layers:
+            if lyr_type in channels_first_layers:
                 prev_module.permute_out = True
                 return None
 

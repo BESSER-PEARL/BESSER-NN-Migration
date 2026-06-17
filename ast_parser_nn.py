@@ -121,8 +121,50 @@ class ASTParser(ast.NodeVisitor):
         # Add squeeze after global pooling layers (TF to PyTorch specific)
         if hasattr(self, 'add_squeeze_for_global_pooling'):
             self.add_squeeze_for_global_pooling()
+        # Renumber functional layers (f_*) to start from 1
+        self._renumber_functional_layers()
         # Set in_class var to False at the end of NN architecture processing
         self.in_class = False
+
+    def _renumber_functional_layers(self):
+        """Renumber functional layers: if only one, remove suffix; if multiple, renumber from 1."""
+        # Group functional layers by base name (e.g., f_adaptive_max_pool1d)
+        func_layer_groups = {}
+        for module in self.buml_model.modules:
+            if hasattr(module, 'name') and module.name.startswith('f_'):
+                # Extract base name: f_adaptive_max_pool1d_5 -> f_adaptive_max_pool1d
+                parts = module.name.rsplit('_', 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    base_name = parts[0]
+                    if base_name not in func_layer_groups:
+                        func_layer_groups[base_name] = []
+                    func_layer_groups[base_name].append(module)
+
+        # Renumber: if only one, remove suffix; if multiple, number from 1
+        for base_name, modules_list in func_layer_groups.items():
+            if len(modules_list) == 1:
+                # Only one layer of this type - remove suffix
+                module = modules_list[0]
+                old_name = module.name
+                new_name = base_name  # No suffix
+                module.name = new_name
+                # Update references
+                if old_name in self.inputs_outputs:
+                    self.inputs_outputs[new_name] = self.inputs_outputs.pop(old_name)
+                for var, mod_name in list(self.module_of_output.items()):
+                    if mod_name == old_name:
+                        self.module_of_output[var] = new_name
+            else:
+                # Multiple layers - renumber from 1
+                for idx, module in enumerate(modules_list, start=1):
+                    old_name = module.name
+                    new_name = f"{base_name}_{idx}"
+                    module.name = new_name
+                    if old_name in self.inputs_outputs:
+                        self.inputs_outputs[new_name] = self.inputs_outputs.pop(old_name)
+                    for var, mod_name in list(self.module_of_output.items()):
+                        if mod_name == old_name:
+                            self.module_of_output[var] = new_name
 
 
     def set_remaining_lyr_params(self):

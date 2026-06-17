@@ -80,7 +80,7 @@ static_params = {
 }
 
 
-cnn_layers = ["Conv1D", "Conv2D", "Conv3D", "PoolingLayer"]
+channels_first_layers = ["Conv1D", "Conv2D", "Conv3D", "PoolingLayer", "BatchNormLayer"]
 
 
 loss_func_mapping = {"CrossEntropyLoss": "crossentropy",
