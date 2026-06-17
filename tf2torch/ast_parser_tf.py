@@ -1235,6 +1235,10 @@ class ASTParserTF(ASTParser):
             else:
                 lyr_type, lyr_params = self.extract_layer(node.value)
 
+                # Skip unsupported Model constructor (Functional API)
+                if lyr_type == "Model":
+                    return
+
                 if lyr_type in actv_fun_mapping:
                     self._handle_init_activation_layer(module_name, lyr_type, node)
                 else:
@@ -1688,6 +1692,11 @@ class ASTParserTF(ASTParser):
         Process a single (non-chained) call operation.
         This contains the original logic from handle_forward_simple_call.
         """
+        # Check if node.value.func has a 'value' attribute (guard against functional API nested calls)
+        if not hasattr(node.value.func, 'value'):
+            # Functional API pattern in forward - skip it
+            return
+
         if isinstance(node.value.func.value, ast.Name):
             if node.value.func.value.id == "self":
                 module_name = node.value.func.attr

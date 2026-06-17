@@ -158,18 +158,16 @@ class ASTParser(ast.NodeVisitor):
 
         # Handle tuple returns
         if hasattr(self, 'pytorch_return_vars') and self.pytorch_return_vars:
-            # Map PyTorch variables to module names
-            return_modules = []
+            # Store actual return variable names
+            return_vars = []
             for pytorch_var in self.pytorch_return_vars:
                 if pytorch_var == '_':
                     continue
-                if pytorch_var in self.module_of_output:
-                    module_name = self.module_of_output[pytorch_var]
-                    return_modules.append(module_name)
+                return_vars.append(pytorch_var)
 
             # Store in model's inputs_outputs for generator to access
-            if return_modules:
-                self.inputs_outputs['__return__'] = [None, ','.join(return_modules)]
+            if return_vars:
+                self.inputs_outputs['__return__'] = [None, ', '.join(return_vars)]
 
         # Store inputs_outputs in model for generator access
         self.buml_model.inputs_outputs = self.inputs_outputs

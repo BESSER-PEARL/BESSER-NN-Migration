@@ -2547,7 +2547,18 @@ class ASTParserTorch(ASTParser):
             if indices:
                 # Accept negative indices (-2, -1) or positive indices for last layer
                 # For num_layers=N bidirectional: last layer is [2*N-2, 2*N-1]
-                num_layers = source_layer.num_layers if hasattr(source_layer, 'num_layers') else 1
+                # Find base module name to get num_layers
+                base_module_name = None
+                for module_name in self.rnn_num_layers:
+                    if source_layer_name in self.multi_layer_rnns.get(module_name, []):
+                        base_module_name = module_name
+                        break
+
+                if base_module_name:
+                    num_layers = self.rnn_num_layers[base_module_name]
+                else:
+                    num_layers = source_layer.num_layers if hasattr(source_layer, 'num_layers') else 1
+
                 expected_positive_indices = {2 * num_layers - 2, 2 * num_layers - 1}
 
                 if set(indices) == {-2, -1} or set(indices) == expected_positive_indices:
