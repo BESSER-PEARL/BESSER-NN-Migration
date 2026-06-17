@@ -1997,8 +1997,22 @@ class ASTParserTF(ASTParser):
             "matmul": "matmultiply"
         }
         tns_type = op_map[op_type]
-        layers_of_tensors = [self.module_of_output[op_args[0].id],
-                             self.module_of_output[op_args[1].id]]
+
+        # Extract operands (handles both variables and scalar constants)
+        left_var = self._extract_binop_operand(op_args[0], node, "left")
+        right_var = self._extract_binop_operand(op_args[1], node, "right")
+
+        if left_var is None or right_var is None:
+            return None
+
+        # Get layer names or keep scalar values
+        left_layer = left_var if isinstance(left_var, (int, float)) else self.module_of_output.get(left_var)
+        right_layer = right_var if isinstance(right_var, (int, float)) else self.module_of_output.get(right_var)
+
+        if left_layer is None or right_layer is None:
+            return None
+
+        layers_of_tensors = [left_layer, right_layer]
         return {"tns_type": tns_type, "layers_of_tensors": layers_of_tensors}
 
     def _extract_transpose(self, node, op_args):
