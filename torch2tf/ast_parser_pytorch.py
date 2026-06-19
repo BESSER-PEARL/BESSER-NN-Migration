@@ -176,6 +176,7 @@ class ASTParserTorch(ASTParser):
             "dropout": lambda cn, n, args: self._extract_op_dropout(cn, n, args),
             "zeros_like": lambda cn, n, args: self._extract_op_zeros_like(cn, args),
             "split": lambda cn, n, args: self._extract_op_split(cn, n, args),
+            "chunk": lambda cn, n, args: self._extract_op_chunk(cn, n, args),
         }
 
     def _add_layer_with_tracking(self, layer_obj):
@@ -2516,7 +2517,7 @@ class ASTParserTorch(ASTParser):
             self._create_dropout_layer(tensorop_param, node)
             return
 
-        # Handle split with tuple outputs specially
+        # Handle split/chunk with tuple outputs specially
         if (tensorop_param and tensorop_param.get('tns_type') == 'split' and
             isinstance(node.targets[0], ast.Tuple)):
             self._create_and_track_split_tensorop(tensorop_param, call_node, node)
@@ -3088,6 +3089,54 @@ class ASTParserTorch(ASTParser):
             "split_dim": split_dim,
             "split_sizes": split_size,
             "input_reused": True  # Force new variable names for split outputs
+        }
+
+    def _extract_op_chunk(self, call_node, node, op_args):
+        """Extract chunk operation parameters.
+
+        Handles: x1, x2, x3 = torch.chunk(x, 3, dim=1)
+
+        Note: torch.chunk(x, chunks, dim) where:
+        - chunks: number of chunks to split into
+        - dim: dimension along which to split
+        """
+        source_var = None
+        num_chunks = None
+        split_dim = 0  # Default dimension
+
+        # Extract source variable from first argument
+        if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
+            source_var = op_args[0].id
+
+        # Extract number of chunks from second argument
+        if len(op_args) > 1 and isinstance(op_args[1], ast.Constant):
+            num_chunks = op_args[1].value
+
+        # Extract dim from keyword arguments or third positional argument
+        if hasattr(call_node, 'keywords'):
+            for kw in call_node.keywords:
+                if kw.arg == 'dim' and isinstance(kw.value, ast.Constant):
+                    split_dim = kw.value.value
+
+        if len(op_args) > 2 and isinstance(op_args[2], ast.Constant):
+            split_dim = op_args[2].value
+
+        # Determine source layers
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+
+        # torch.chunk(x, N, dim) splits tensor into N chunks
+        # This maps to split with num_splits = N
+        return {
+            "tns_type": "split",
+            "layers_of_tensors": source_layers,
+            "split_dim": split_dim,
+            "split_sizes": num_chunks,
+            "input_reused": True  # Force new variable names for chunk outputs
         }
 
     def handle_outer_attribute_assignment(self, node: ast.Assign):
