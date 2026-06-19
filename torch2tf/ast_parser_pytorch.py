@@ -2020,13 +2020,28 @@ class ASTParserTorch(ASTParser):
             )
             return
 
-        actv_lyr = mm_classes.GeneralLayer(name=module_name, actv_func=actv_func)
-        self.buml_model.modules.append(actv_lyr)
-
         input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
         output_var = node.targets[0].id
-        self.inputs_outputs[module_name] = [input_var, output_var]
-        self.module_of_output[output_var] = module_name
+
+        # Check if activation layer already exists (layer reuse)
+        existing_actv = self._get_layer_by_name(module_name)
+        if existing_actv and existing_actv in self.buml_model.modules:
+            # This is a reused activation - clone and add with suffix
+            import copy
+            reused_actv = copy.deepcopy(existing_actv)
+            reused_actv.name = module_name  # Reset to base name before adding suffix
+            reused_actv.is_layer_call = True
+            self._add_layer_with_tracking(reused_actv)
+            # Store inputs_outputs with suffixed name
+            self.inputs_outputs[reused_actv.name] = [input_var, output_var]
+            self.module_of_output[output_var] = reused_actv.name
+        else:
+            # First occurrence - create and add with tracking
+            actv_lyr = mm_classes.GeneralLayer(name=module_name, actv_func=actv_func)
+            self._add_layer_with_tracking(actv_lyr)
+            # Store inputs_outputs with suffixed name
+            self.inputs_outputs[actv_lyr.name] = [input_var, output_var]
+            self.module_of_output[output_var] = actv_lyr.name
 
     def _handle_module_activation(self, node, module_name):
         """Handle module API activation functions with merge logic."""
