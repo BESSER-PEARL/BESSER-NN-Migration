@@ -2144,13 +2144,16 @@ class ASTParserTorch(ASTParser):
 
         if module_name not in self.activation_functions:
             module_obj = self._get_layer_by_name(module_name)
+            is_subnn = False
             if not module_obj:
                 module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
+                is_subnn = module_obj is not None
 
             # For layer reuse: clone the layer and add with new suffix
             # The counter suffix ensures unique keys in modules_details
             # Generator strips suffix to reference same layer instance
-            if module_obj and module_obj in self.buml_model.modules:
+            # NOTE: SubNNs (Sequential/ModuleList) don't get suffix tracking
+            if module_obj and module_obj in self.buml_model.modules and not is_subnn:
                 import copy
                 # Clone the layer with is_layer_call=True to skip __init__ definition
                 reused_layer = copy.deepcopy(module_obj)
@@ -2169,13 +2172,17 @@ class ASTParserTorch(ASTParser):
                         self.inputs_outputs[first_layer.name] = original_inputs_outputs
                 # Update module_of_output to point to new suffixed name
                 self.module_of_output[node.targets[0].id] = reused_layer.name
-            elif module_obj:
-                # Add first occurrence with suffix tracking
+            elif module_obj and not is_subnn:
+                # Add first occurrence with suffix tracking (only for Layers, not SubNNs)
                 self._add_layer_with_tracking(module_obj)
                 # Update inputs_outputs to use suffixed name
                 self.inputs_outputs[module_obj.name] = self.inputs_outputs[module_name]
                 # Update module_of_output to point to suffixed name
                 self.module_of_output[node.targets[0].id] = module_obj.name
+            elif is_subnn and module_obj not in self.buml_model.modules:
+                # SubNN (Sequential/ModuleList) called in forward - add to modules for generator
+                # No suffix tracking needed for SubNNs
+                self._add_module_with_tracking(module_obj)
 
     def _process_functional_api(self, node):
         """Process functional API calls (F.layer, torch.layer)."""
