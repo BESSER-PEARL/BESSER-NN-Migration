@@ -49,6 +49,16 @@ class ASTParserTorch(ASTParser):
         # Strategy: if a temp is only used as input to one operation that outputs to a real var,
         # replace the temp with that real var
         for temp_var in temp_vars:
+            # CRITICAL FIX: Don't collapse _nested_temp_* if produced by a reused layer
+            # In nested calls like r = proj(dropout(m)) where dropout is reused,
+            # we need _nested_temp_2 = dropout_use_1(m) as an intermediate assignment
+            if temp_var.startswith(self.TEMP_NESTED.split('{')[0]):
+                # Check if this temp is produced by a reused layer (contains "_use_")
+                producer = self.module_of_output.get(temp_var)
+                if producer and '_use_' in producer:
+                    # Skip this temp variable - must be preserved for layer reuse
+                    continue
+
             # Find operations that use this temp as input
             consumers = [k for k, (i, o) in self.inputs_outputs.items() if i == temp_var]
 
@@ -148,6 +158,8 @@ class ASTParserTorch(ASTParser):
         self.layer_reuse_count = {}  # {layer_name: reuse_count}
         # Track the output variable of the immediately previous layer
         self.prev_layer_output = None  # str: variable name
+        # Counter for adding unique suffix to ALL layer names
+        self.layer_counter = 0
         # Note: migration_warnings inherited from base ASTParser class
         # Performance optimization: O(1) lookup dicts instead of O(n) searches
         self.layer_by_name = {}  # {layer_name: layer_obj}
@@ -180,11 +192,28 @@ class ASTParserTorch(ASTParser):
         }
 
     def _add_layer_with_tracking(self, layer_obj):
-        """Add layer to model and update lookup dict for O(1) access."""
-        self.buml_model.add_layer(layer_obj)
+        """
+        Add layer to model with counter suffix and update lookup dict for O(1) access.
+        All layers get a suffix like _1, _2, etc. to ensure unique keys in modules_details.
+        The generator strips this suffix when creating layer syntax and uses is_layer_call
+        to skip duplicate definitions in __init__.
+        """
         if hasattr(layer_obj, 'name'):
+            base_name = layer_obj.name
+            # Store base name for lookups (before adding suffix)
+            if base_name not in self.layer_by_name:
+                self.layer_by_name[base_name] = layer_obj
+                self.module_by_name[base_name] = layer_obj
+
+            # Add suffix to ALL layers using _c prefix to distinguish from other _N suffixes
+            self.layer_counter += 1
+            layer_obj.name = f"{base_name}_c{self.layer_counter}"
+
+            # Store in lookup dicts using the SUFFIXED name
             self.layer_by_name[layer_obj.name] = layer_obj
             self.module_by_name[layer_obj.name] = layer_obj
+
+        self.buml_model.add_layer(layer_obj)
 
     def _add_module_with_tracking(self, module_obj):
         """Add module to model and update lookup dict for O(1) access."""
@@ -2006,40 +2035,35 @@ class ASTParserTorch(ASTParser):
             self._create_standalone_activation(node, module_name)
 
     def _handle_module_layer_reuse(self, node, module_name, module_obj, original_inputs_outputs=None):
-        """Handle layer reuse by creating synthetic copy with current call's input tracking."""
-        # Use per-layer reuse counter for clearer naming (dropout_use_1, dropout_use_2, ...)
-        self.layer_reuse_count[module_name] = self.layer_reuse_count.get(module_name, 0) + 1
-        use_count = self.layer_reuse_count[module_name]
-        synthetic_name = f"{module_name}_use_{use_count}"
+        """
+        Handle layer reuse - same layer instance called multiple times.
+        Create a new layer in BUML with is_layer_call=True.
+        The layer gets a unique suffix from _add_layer_with_tracking.
+        """
+        # Extract current call's input/output (set by _process_module_api before this)
+        current_input, current_output = self.inputs_outputs.get(module_name, [None, None])
 
-        synthetic_module = copy.copy(module_obj)
-        synthetic_module.name = synthetic_name
-
-        # Extract input for current call (already done in _process_module_api before this)
-        # inputs_outputs[module_name] contains current call's input/output
-        input_var, output_var = self.inputs_outputs[module_name]
-
-        # Set inputs_outputs for synthetic layer with current call's input/output
-        self.inputs_outputs[synthetic_name] = [input_var, output_var]
-
-        # Restore original inputs_outputs for the base layer (from first use)
+        # Restore original inputs_outputs for the original layer definition
         if original_inputs_outputs:
             self.inputs_outputs[module_name] = original_inputs_outputs
 
-        # Copy name_module_input from original module (set before module_of_output overwrite)
-        # This has the correct input source
-        if hasattr(module_obj, 'name_module_input') and module_obj.name_module_input:
-            synthetic_module.name_module_input = module_obj.name_module_input
+        if not current_input:
+            return
 
-        # Mark as input_reused since it's using output from another module
-        if input_var in self.module_of_output:
-            synthetic_module.input_reused = True
+        # Clone the original layer and mark it as a layer call (reuse)
+        import copy
+        call_layer = copy.deepcopy(module_obj)
+        # Keep the BASE layer name (without suffix) - _add_layer_with_tracking will add suffix
+        call_layer.name = module_name
+        # Mark as layer call so generator skips it in __init__
+        call_layer.is_layer_call = True
 
-        # Map output variable to synthetic module
-        self.module_of_output[output_var] = synthetic_name
+        # Add layer with tracking (this adds suffix to name AND adds to both layers and modules)
+        self._add_layer_with_tracking(call_layer)
 
-        self.buml_model.layers.append(synthetic_module)
-        self.buml_model.modules.append(synthetic_module)
+        # Now call_layer.name has suffix, use it for tracking
+        self.inputs_outputs[call_layer.name] = [current_input, current_output]
+        self.module_of_output[current_output] = call_layer.name
 
     def _detect_parallel_operations(self, module_obj, input_var):
         """Detect and mark parallel operations and TensorOp usage."""
@@ -2108,10 +2132,35 @@ class ASTParserTorch(ASTParser):
             if not module_obj:
                 module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
+            # For layer reuse: clone the layer and add with new suffix
+            # The counter suffix ensures unique keys in modules_details
+            # Generator strips suffix to reference same layer instance
             if module_obj and module_obj in self.buml_model.modules:
-                self._handle_module_layer_reuse(node, module_name, module_obj, original_inputs_outputs)
+                import copy
+                # Clone the layer with is_layer_call=True to skip __init__ definition
+                reused_layer = copy.deepcopy(module_obj)
+                reused_layer.name = module_name  # Reset to base name before adding
+                reused_layer.is_layer_call = True
+                # Add with tracking - this adds counter suffix and appends to modules
+                self._add_layer_with_tracking(reused_layer)
+                # inputs_outputs[module_name] already has current call's values from line 2112
+                # Copy them to the new suffixed name
+                self.inputs_outputs[reused_layer.name] = self.inputs_outputs[module_name]
+                # Restore original for first layer if we saved it
+                if original_inputs_outputs and module_name in self.layer_by_name:
+                    # Get the first layer instance (has suffix _1)
+                    first_layer = self.layer_by_name[module_name]
+                    if hasattr(first_layer, 'name') and first_layer.name.endswith('_1'):
+                        self.inputs_outputs[first_layer.name] = original_inputs_outputs
+                # Update module_of_output to point to new suffixed name
+                self.module_of_output[node.targets[0].id] = reused_layer.name
             elif module_obj:
-                self.buml_model.modules.append(module_obj)
+                # Add first occurrence with suffix tracking
+                self._add_layer_with_tracking(module_obj)
+                # Update inputs_outputs to use suffixed name
+                self.inputs_outputs[module_obj.name] = self.inputs_outputs[module_name]
+                # Update module_of_output to point to suffixed name
+                self.module_of_output[node.targets[0].id] = module_obj.name
 
     def _process_functional_api(self, node):
         """Process functional API calls (F.layer, torch.layer)."""

@@ -135,6 +135,8 @@ class ASTParserTF(ASTParser):
         self.layer_reuse_count = {}  # {layer_name: reuse_count} for layer reuse tracking
         # Track standalone activation layers (layers.ReLU, layers.Activation, etc.)
         self.activation_functions = {}  # {module_name: actv_func_name}
+        # Counter for adding unique suffix to ALL layer names
+        self.layer_counter = 0
 
     def _get_layer_by_name(self, layer_name):
         """Get layer by name using O(1) lookup, fallback to linear search if not in dict."""
@@ -145,6 +147,28 @@ class ASTParserTF(ASTParser):
         if layer_obj:
             self.layer_by_name[layer_name] = layer_obj
         return layer_obj
+
+    def _add_layer_with_tracking(self, layer_obj):
+        """
+        Add layer to model with counter suffix and update lookup dict for O(1) access.
+        All layers get a suffix like _c1, _c2, etc. to ensure unique keys in modules_details.
+        The generator strips this suffix when creating layer syntax and uses is_layer_call
+        to skip duplicate definitions in __init__.
+        """
+        if hasattr(layer_obj, 'name'):
+            base_name = layer_obj.name
+            # Store base name for lookups (before adding suffix)
+            if base_name not in self.layer_by_name:
+                self.layer_by_name[base_name] = layer_obj
+
+            # Add suffix to ALL layers using _c prefix to distinguish from other _N suffixes
+            self.layer_counter += 1
+            layer_obj.name = f"{base_name}_c{self.layer_counter}"
+
+            # Store in lookup dicts using the SUFFIXED name
+            self.layer_by_name[layer_obj.name] = layer_obj
+
+        self.buml_model.add_layer(layer_obj)
 
     def visit_AugAssign(self, node: ast.AugAssign):
         """
@@ -345,35 +369,29 @@ class ASTParserTF(ASTParser):
         return False
 
     def _handle_module_layer_reuse(self, node, module_name, module_obj):
-        """Handle layer reuse - reuse stateless layers, copy stateful ones."""
-        # Stateless layers can be reused without creating copies
-        # These layers have no trainable parameters or internal state that changes during training
-        stateless_layer_types = ("DropoutLayer", "GeneralLayer")  # GeneralLayer is for activations
+        """
+        Handle layer reuse by cloning the layer with is_layer_call=True.
+        This marks it to skip __init__ definition but be called in forward.
+        """
+        import copy
+        # Save original inputs_outputs for first layer if needed
+        original_inputs_outputs = self.inputs_outputs.get(module_name)
 
-        layer_class_name = module_obj.__class__.__name__
-
-        if layer_class_name in stateless_layer_types:
-            # Reuse the same layer: append the same module object again
-            # This will generate multiple calls to the same layer instance in forward()
-            output_var = node.targets[0].id
-            self.module_of_output[output_var] = module_name
-            # Append the same module again so it appears in the forward pass
-            self.buml_model.modules.append(module_obj)
-        else:
-            # Stateful layers (Dense, Conv, RNN, etc.) need copies for reuse
-            synthetic_name = f"{module_name}_use_{self.tensor_op_counter}"
-            self.tensor_op_counter += 1
-
-            synthetic_module = copy.copy(module_obj)
-            synthetic_module.name = synthetic_name
-
-            if module_name in self.inputs_outputs:
-                self.inputs_outputs[synthetic_name] = self.inputs_outputs[module_name]
-
-            output_var = node.targets[0].id
-            self.module_of_output[output_var] = synthetic_name
-
-            self.buml_model.modules.append(synthetic_module)
+        # Clone the layer with is_layer_call=True to skip __init__ definition
+        reused_layer = copy.deepcopy(module_obj)
+        reused_layer.name = module_name  # Reset to base name before adding suffix
+        reused_layer.is_layer_call = True
+        # Add with tracking - this adds counter suffix and appends to modules
+        self._add_layer_with_tracking(reused_layer)
+        # Copy current inputs_outputs to suffixed name
+        self.inputs_outputs[reused_layer.name] = self.inputs_outputs[module_name]
+        # Restore original for first layer if saved
+        if original_inputs_outputs and module_name in self.layer_by_name:
+            first_layer = self.layer_by_name[module_name]
+            if hasattr(first_layer, 'name') and first_layer.name.endswith('_c1'):
+                self.inputs_outputs[first_layer.name] = original_inputs_outputs
+        # Update module_of_output to point to new suffixed name
+        self.module_of_output[node.targets[0].id] = reused_layer.name
 
     def _handle_layer_reuse_in_concat(self, layer_obj, arg, layer_name):
         """Handle layer reuse in concatenation."""
@@ -1627,7 +1645,8 @@ class ASTParserTF(ASTParser):
 
     def _find_module_by_name(self, module_name):
         """Find module object by name in layers or sub_nns."""
-        module_obj = next((obj for obj in self.buml_model.layers if obj.name == module_name), None)
+        # First check the tracking dict for O(1) lookup
+        module_obj = self._get_layer_by_name(module_name)
         if not module_obj:
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
         return module_obj
@@ -1685,7 +1704,12 @@ class ASTParserTF(ASTParser):
         elif module_obj and module_obj in self.buml_model.modules:
             self._handle_module_layer_reuse(node, module_name, module_obj)
         elif module_obj:
-            self.buml_model.modules.append(module_obj)
+            # Add first occurrence with suffix tracking
+            self._add_layer_with_tracking(module_obj)
+            # Update inputs_outputs to use suffixed name
+            self.inputs_outputs[module_obj.name] = self.inputs_outputs[module_name]
+            # Update module_of_output to point to suffixed name
+            self.module_of_output[node.targets[0].id] = module_obj.name
 
     def process_single_call(self, node: ast.Assign):
         """

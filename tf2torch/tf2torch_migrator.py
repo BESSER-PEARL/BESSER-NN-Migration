@@ -33,7 +33,8 @@ def main():
         model=buml_model,
         output_dir=args.output_dir,
         generation_type=output_nn_type,
-        channel_last=True
+        channel_last=True,
+        strip_layer_counter_suffix=True  # Migration adds counter suffixes to layer names
     )
     pytorch_model.generate()
 
