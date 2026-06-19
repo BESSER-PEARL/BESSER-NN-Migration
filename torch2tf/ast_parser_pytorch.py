@@ -1980,20 +1980,47 @@ class ASTParserTorch(ASTParser):
         except ValueError as e:
             self.migration_warnings.append(f"Functional layer '{synthetic_name}': {str(e)}")
 
-    def _try_merge_activation(self, node, module_name):
-        """Try to merge activation into previous layer. Returns (merged, prev_lyr_name)."""
+    def _try_merge_activation(self, node, module_name, input_source_module=None):
+        """Try to merge activation into previous layer. Returns (merged, prev_lyr_name).
+
+        Args:
+            node: The AST node for the activation call
+            module_name: Name of the activation module
+            input_source_module: The module name (with suffix) that produced the input variable.
+                                This is captured before module_of_output gets overwritten.
+        """
         if hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer:
             return False, None
 
-        if not (self.previous_assign and isinstance(self.previous_assign.value, ast.Call)):
-            return False, None
+        # Use input_source_module if provided (captures the layer before overwrite)
+        if input_source_module:
+            prev_lyr_name_with_suffix = input_source_module
+        else:
+            # Fallback to old logic for backward compatibility
+            if not (self.previous_assign and isinstance(self.previous_assign.value, ast.Call)):
+                return False, None
 
-        if not hasattr(self.previous_assign.value.func, 'attr'):
-            return False, None
+            if not hasattr(self.previous_assign.value.func, 'attr'):
+                return False, None
 
-        prev_lyr_name = self.previous_assign.value.func.attr
-        prev_lyr_obj = self._get_module_by_name(prev_lyr_name)
+            # Get the output variable from previous assignment
+            prev_output_var = self.previous_assign.targets[0].id
+            # Look up the actual module name (with suffix) that produced this variable
+            prev_lyr_name_with_suffix = self.module_of_output.get(prev_output_var)
+            if not prev_lyr_name_with_suffix:
+                return False, None
+
+        # Get the module object using the suffixed name
+        prev_lyr_obj = self._get_module_by_name(prev_lyr_name_with_suffix)
         if not prev_lyr_obj:
+            return False, None
+
+        # Check if it's a layer that can merge activation
+        if not self._can_merge_activation(prev_lyr_obj):
+            return False, None
+
+        # If layer already has activation, don't merge
+        if hasattr(prev_lyr_obj, 'actv_func') and prev_lyr_obj.actv_func is not None:
             return False, None
 
         actv = self.activation_functions[module_name]
@@ -2004,10 +2031,12 @@ class ASTParserTorch(ASTParser):
             )
             return False, None
 
+        # Merge activation into previous layer
         prev_lyr_obj.actv_func = actv_func
         output_var = node.targets[0].id
-        self.module_of_output[output_var] = prev_lyr_name
-        return True, prev_lyr_name
+        # Point output to the previous layer (skip standalone activation)
+        self.module_of_output[output_var] = prev_lyr_name_with_suffix
+        return True, prev_lyr_name_with_suffix
 
     def _create_standalone_activation(self, node, module_name):
         """Create standalone activation layer."""
@@ -2043,9 +2072,9 @@ class ASTParserTorch(ASTParser):
             self.inputs_outputs[actv_lyr.name] = [input_var, output_var]
             self.module_of_output[output_var] = actv_lyr.name
 
-    def _handle_module_activation(self, node, module_name):
+    def _handle_module_activation(self, node, module_name, input_source_module=None):
         """Handle module API activation functions with merge logic."""
-        merged, _ = self._try_merge_activation(node, module_name)
+        merged, _ = self._try_merge_activation(node, module_name, input_source_module)
         if not merged:
             self._create_standalone_activation(node, module_name)
 
@@ -2138,7 +2167,7 @@ class ASTParserTorch(ASTParser):
         is_subnn_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
         if module_name in self.activation_functions:
-            self._handle_module_activation(node, module_name)
+            self._handle_module_activation(node, module_name, input_source_module)
         elif not is_subnn_obj:
             self.is_permute_before_cnn(module_name)
 
