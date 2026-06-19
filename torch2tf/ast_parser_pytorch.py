@@ -300,9 +300,9 @@ class ASTParserTorch(ASTParser):
 
 
         # Strip __hidden or __cell suffix from source_module for tensorop
-        if source_module.endswith("__hidden"):
+        if source_module and source_module.endswith("__hidden"):
             source_module = source_module[:-8]
-        elif source_module.endswith("__cell"):
+        elif source_module and source_module.endswith("__cell"):
             source_module = source_module[:-6]
 
         subscript_op = self._create_subscript_op(op_name, source_module, subscript_pattern)
@@ -347,7 +347,22 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but creates TensorOp or sets RNN return_type
         """
-        subscripted_var = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else None
+        # If subscript value is a call (e.g., self.conv(x)[:, :, 0]), process it first
+        if isinstance(subscript_node.value, ast.Call):
+            inner_temp = self.TEMP_NESTED.format(self.tensor_op_counter)
+            self.tensor_op_counter += 1
+            inner_target = ast.Name(id=inner_temp, ctx=ast.Store())
+            inner_node = ast.Assign(targets=[inner_target], value=subscript_node.value)
+            inner_node.lineno = node.lineno
+            inner_node.col_offset = node.col_offset
+            self.process_single_call(inner_node)
+            self.previous_assign = inner_node
+            subscripted_var = inner_temp
+            # Update the subscript node to reference the temp variable
+            subscript_node.value = ast.Name(id=inner_temp, ctx=ast.Load())
+        else:
+            subscripted_var = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else None
+
         subscript_assign = self._create_temp_assignment(temp_name, subscript_node, node)
 
 
