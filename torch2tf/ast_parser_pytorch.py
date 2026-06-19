@@ -701,7 +701,13 @@ class ASTParserTorch(ASTParser):
         self.tensor_op_counter += 1
 
         self.handle_subscript_operation(subscript_node, temp_name, node)
-        node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+
+        # Check if this created an alias (no-op subscript) and use the base variable instead
+        if temp_name in self.variable_aliases:
+            base_var = self.variable_aliases[temp_name]
+            node.value.args[0] = ast.Name(id=base_var, ctx=ast.Load())
+        else:
+            node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
 
     def _is_noop_squeeze(self, call_node):
         """Check if a call is a no-op squeeze(0) on single-layer RNN hidden state."""
@@ -773,6 +779,9 @@ class ASTParserTorch(ASTParser):
         inner_node = ast.Assign(targets=[temp_target], value=inner_call)
         inner_node.lineno = node.lineno
         inner_node.col_offset = node.col_offset
+
+        # Handle subscript arguments in the inner call before processing
+        self._handle_subscript_argument(inner_node)
 
         self.visit_Assign(inner_node)
         self.previous_assign = inner_node
@@ -1541,6 +1550,9 @@ class ASTParserTorch(ASTParser):
 
         self.module_of_output[result_var] = prev_module_name
         self.variable_aliases[result_var] = subscripted_var
+        # Track in inputs_outputs so generator can use this variable
+        if result_var.startswith('_subscript_temp_'):
+            self.inputs_outputs[prev_module_name] = [subscripted_var, result_var]
         self.previous_assign = node
 
 
