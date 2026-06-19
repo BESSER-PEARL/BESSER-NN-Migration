@@ -23,6 +23,59 @@ from transform_code import (
 
 
 class ASTParserTorch(ASTParser):
+    def _cleanup_temp_variables(self):
+        """
+        Replace temporary variables (_chain_temp, _nested_temp, etc.) with cleaner names.
+        This runs after all forward method processing to preserve original variable names.
+        """
+        # Collect all temp variable patterns
+        temp_patterns = [
+            self.TEMP_CHAIN.split('{')[0],      # _chain_temp_
+            self.TEMP_NESTED.split('{')[0],     # _nested_temp_
+            self.TEMP_NESTED_IN_CHAIN.split('{')[0],  # _nested_in_chain_
+        ]
+
+        # Find all temp variables in inputs_outputs
+        temp_vars = set()
+        for key in self.inputs_outputs:
+            in_var, out_var = self.inputs_outputs[key]
+            for pattern in temp_patterns:
+                if in_var and in_var.startswith(pattern):
+                    temp_vars.add(in_var)
+                if out_var and out_var.startswith(pattern):
+                    temp_vars.add(out_var)
+
+        # For each temp variable, find what it should be renamed to
+        # Strategy: if a temp is only used as input to one operation that outputs to a real var,
+        # replace the temp with that real var
+        for temp_var in temp_vars:
+            # Find operations that use this temp as input
+            consumers = [k for k, (i, o) in self.inputs_outputs.items() if i == temp_var]
+
+            # If temp has exactly 1 consumer and that consumer outputs to a non-temp var,
+            # replace the temp with the consumer's output var
+            if len(consumers) == 1:
+                consumer_key = consumers[0]
+                consumer_out = self.inputs_outputs[consumer_key][1]
+                # Check if consumer output is not a temp
+                is_consumer_out_temp = any(consumer_out.startswith(p) for p in temp_patterns) if consumer_out else False
+
+                if not is_consumer_out_temp and consumer_out:
+                    # Replace temp in all inputs_outputs
+                    for key in list(self.inputs_outputs.keys()):
+                        in_var, out_var = self.inputs_outputs[key]
+                        if in_var == temp_var:
+                            self.inputs_outputs[key][0] = consumer_out
+                        if out_var == temp_var:
+                            self.inputs_outputs[key][1] = consumer_out
+
+                    # Update module_of_output
+                    if temp_var in self.module_of_output:
+                        if consumer_out not in self.module_of_output:
+                            self.module_of_output[consumer_out] = self.module_of_output[temp_var]
+                        del self.module_of_output[temp_var]
+
+
     """
     Class visiting and parsing PyTorch code AST.
 
@@ -169,6 +222,9 @@ class ASTParserTorch(ASTParser):
 
         # Call parent's visit_ClassDef to do the actual parsing
         super().visit_ClassDef(node)
+
+        # Clean up temporary variables to preserve original names
+        self._cleanup_temp_variables()
 
         # After parsing, check for unused LSTM cell states
         if self.forward_node and self.lstm_cell_vars:
@@ -1790,7 +1846,10 @@ class ASTParserTorch(ASTParser):
         # Check if previous layer can merge activation
         can_merge = self._can_merge_activation(prev_lyr_obj) and not is_tensorop
 
-        if is_tensorop or not can_merge:
+        # If layer already has an activation, don't merge - create standalone instead
+        layer_already_has_activation = prev_lyr_obj and hasattr(prev_lyr_obj, 'actv_func') and prev_lyr_obj.actv_func is not None
+
+        if is_tensorop or not can_merge or layer_already_has_activation:
             # Treat as standalone activation
             self._create_standalone_functional_activation(node, module_name, input_var)
         else:
