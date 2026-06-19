@@ -175,6 +175,7 @@ class ASTParserTorch(ASTParser):
             "pad": lambda cn, n, args: self._extract_op_pad(cn, n, args),
             "dropout": lambda cn, n, args: self._extract_op_dropout(cn, n, args),
             "zeros_like": lambda cn, n, args: self._extract_op_zeros_like(cn, args),
+            "split": lambda cn, n, args: self._extract_op_split(cn, n, args),
         }
 
     def _add_layer_with_tracking(self, layer_obj):
@@ -1749,6 +1750,46 @@ class ASTParserTorch(ASTParser):
             return first_elem.id if isinstance(first_elem, ast.Name) else None
         return None
 
+    def _create_and_track_split_tensorop(self, tensorop_param, call_node, node):
+        """
+        Create and track split TensorOp with tuple outputs.
+
+        For: x1, x2 = torch.split(x, 32, dim=1)
+        Tracks each output variable with __split_N suffix.
+        """
+        op_name = f"op_{self.tensor_op_counter}"
+        tensorop_param["name"] = op_name
+        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+
+        self.buml_model.add_tensor_op(tns_obj)
+        self.tensor_op_counter += 1
+
+        # Extract output variable names from tuple target
+        output_vars = []
+        for elt in node.targets[0].elts:
+            if isinstance(elt, ast.Name):
+                output_vars.append(elt.id)
+
+        # Track each output variable with __split_N suffix
+        for i, out_var in enumerate(output_vars):
+            split_suffix = f"__split_{i}"
+            self.module_of_output[out_var] = op_name + split_suffix
+            # Store in inputs_outputs for generator to use original variable name
+            self.inputs_outputs[op_name + split_suffix] = [out_var, out_var]
+
+        # Extract input variable for the split operation
+        input_var = self._extract_tensorop_input_var(call_node, node)
+
+        # Store main operation input/output (for the operation itself)
+        # The output is a tuple, so we use the first variable as representative
+        main_output = output_vars[0] if output_vars else None
+        if input_var and main_output:
+            self.inputs_outputs[op_name] = [input_var, main_output]
+
+        # Update prev_layer_output (use last output variable)
+        if output_vars:
+            self.prev_layer_output = output_vars[-1]
+
     def _create_and_track_tensorop(self, tensorop_param, call_node, node):
         """
         Create TensorOp object and track its output.
@@ -2475,6 +2516,12 @@ class ASTParserTorch(ASTParser):
             self._create_dropout_layer(tensorop_param, node)
             return
 
+        # Handle split with tuple outputs specially
+        if (tensorop_param and tensorop_param.get('tns_type') == 'split' and
+            isinstance(node.targets[0], ast.Tuple)):
+            self._create_and_track_split_tensorop(tensorop_param, call_node, node)
+            return
+
         if tensorop_param:
             self._create_and_track_tensorop(tensorop_param, call_node, node)
 
@@ -2983,6 +3030,64 @@ class ASTParserTorch(ASTParser):
             "tns_type": "zeros_like",
             "layers_of_tensors": source_layers,
             "input_reused": True  # Force new variable name to avoid overwriting previous outputs
+        }
+
+    def _extract_op_split(self, call_node, node, op_args):
+        """Extract split operation parameters.
+
+        Handles: x1, x2 = torch.split(x, split_size, dim=1)
+        or: x1, x2 = torch.split(x, [size1, size2], dim=1)
+
+        Note: torch.split(x, split_size_or_sections, dim) where:
+        - If split_size_or_sections is int: splits into chunks of that size
+        - If split_size_or_sections is list: splits into chunks with those sizes
+        """
+        source_var = None
+        split_size = None
+        split_dim = 0  # Default dimension
+        num_outputs = 1
+
+        # Extract source variable from first argument
+        if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
+            source_var = op_args[0].id
+
+        # Count number of output variables from assignment target (x1, x2 = ...)
+        if isinstance(node.targets[0], ast.Tuple):
+            num_outputs = len(node.targets[0].elts)
+
+        # Extract split size from second argument
+        if len(op_args) > 1:
+            if isinstance(op_args[1], ast.Constant):
+                # PyTorch: split_size (chunk size), but we need num_splits for TF
+                # Use num_outputs from assignment to determine this
+                split_size = num_outputs
+            elif isinstance(op_args[1], ast.List):
+                # Handle list of split sizes [size1, size2, ...]
+                split_size = [elt.value for elt in op_args[1].elts if isinstance(elt, ast.Constant)]
+
+        # Extract dim from keyword arguments or third positional argument
+        if hasattr(call_node, 'keywords'):
+            for kw in call_node.keywords:
+                if kw.arg == 'dim' and isinstance(kw.value, ast.Constant):
+                    split_dim = kw.value.value
+
+        if len(op_args) > 2 and isinstance(op_args[2], ast.Constant):
+            split_dim = op_args[2].value
+
+        # Determine source layers
+        if source_var and source_var in self.module_of_output:
+            source_layers = [self.module_of_output[source_var]]
+        elif source_var:
+            source_layers = ['INPUT']
+        else:
+            source_layers = None
+
+        return {
+            "tns_type": "split",
+            "layers_of_tensors": source_layers,
+            "split_dim": split_dim,
+            "split_sizes": split_size,
+            "input_reused": True  # Force new variable names for split outputs
         }
 
     def handle_outer_attribute_assignment(self, node: ast.Assign):
