@@ -1982,9 +1982,7 @@ class ASTParserTorch(ASTParser):
 
     def _create_standalone_activation(self, node, module_name):
         """Create standalone activation layer."""
-        unique_name = f"{module_name}_{self.tensor_op_counter}"
-        self.tensor_op_counter += 1
-
+        # Use the actual module name from PyTorch to preserve layer names
         actv = self.activation_functions[module_name]
         actv_func = actv_fun_mapping.get(actv)
         if actv_func is None:
@@ -1993,13 +1991,13 @@ class ASTParserTorch(ASTParser):
             )
             return
 
-        actv_lyr = mm_classes.GeneralLayer(name=unique_name, actv_func=actv_func)
+        actv_lyr = mm_classes.GeneralLayer(name=module_name, actv_func=actv_func)
         self.buml_model.modules.append(actv_lyr)
 
         input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
         output_var = node.targets[0].id
-        self.inputs_outputs[unique_name] = [input_var, output_var]
-        self.module_of_output[output_var] = unique_name
+        self.inputs_outputs[module_name] = [input_var, output_var]
+        self.module_of_output[output_var] = module_name
 
     def _handle_module_activation(self, node, module_name):
         """Handle module API activation functions with merge logic."""
