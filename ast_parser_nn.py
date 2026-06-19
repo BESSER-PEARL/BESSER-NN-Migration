@@ -342,7 +342,7 @@ class ASTParser(ast.NodeVisitor):
         if isinstance(node.value, (ast.Call, ast.BinOp, ast.Subscript, ast.UnaryOp, ast.IfExp)):
             synthetic_assign = self._create_synthetic_assign(node)
             self.visit_Assign(synthetic_assign)
-        elif isinstance(node.value, ast.Tuple):
+        elif isinstance(node.value, (ast.Tuple, ast.List)):
             self._handle_tuple_return(node)
         elif isinstance(node.value, ast.Name):
             pass
