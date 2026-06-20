@@ -1914,16 +1914,35 @@ class ASTParserTorch(ASTParser):
         return is_tensorop, prev_lyr_obj, prev_lyr_name
 
     def _create_standalone_functional_activation(self, node, module_name, input_var):
-        """Create standalone activation layer for functional API."""
-        actv_lyr_name = f"activ_{module_name}_{self.tensor_op_counter}"
-        self.tensor_op_counter += 1
-        actv_lyr = mm_classes.GeneralLayer(name=actv_lyr_name, actv_func=actv_fun_mapping[module_name])
-        self.buml_model.add_layer(actv_lyr)
-        self.buml_model.modules.append(actv_lyr)
+        """Create standalone activation layer for functional API.
 
+        Reuses existing activation layer of same type if found, otherwise creates new one.
+        """
+        actv_func = actv_fun_mapping[module_name]
         output_var = node.targets[0].id
-        self.inputs_outputs[actv_lyr_name] = [input_var, output_var]
-        self.module_of_output[output_var] = actv_lyr_name
+
+        # Look for existing activation layer with same activation function
+        # Use lowercase activation function name as base layer name (e.g., 'relu', 'gelu')
+        base_actv_name = actv_func.lower()
+        existing_actv = self._get_layer_by_name(base_actv_name)
+
+        if existing_actv and existing_actv in self.buml_model.modules:
+            # Reuse existing activation layer
+            import copy
+            reused_actv = copy.deepcopy(existing_actv)
+            reused_actv.name = base_actv_name  # Reset to base name before adding suffix
+            reused_actv.is_layer_call = True
+            self._add_layer_with_tracking(reused_actv)
+            # Store inputs_outputs with suffixed name
+            self.inputs_outputs[reused_actv.name] = [input_var, output_var]
+            self.module_of_output[output_var] = reused_actv.name
+        else:
+            # First occurrence - create new activation layer with clean name
+            actv_lyr = mm_classes.GeneralLayer(name=base_actv_name, actv_func=actv_func)
+            self._add_layer_with_tracking(actv_lyr)
+            # Store inputs_outputs with suffixed name (if any)
+            self.inputs_outputs[actv_lyr.name] = [input_var, output_var]
+            self.module_of_output[output_var] = actv_lyr.name
 
     def _can_merge_activation(self, layer_obj):
         """Check if a layer supports activation function merging."""
@@ -1960,13 +1979,14 @@ class ASTParserTorch(ASTParser):
             self._create_standalone_functional_activation(node, module_name, input_var)
         else:
             # Merge into previous layer
+            output_var = node.targets[0].id
             if prev_lyr_obj:
                 prev_lyr_obj.actv_func = actv_fun_mapping[module_name]
-                if hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer:
-                    if prev_lyr_name in self.inputs_outputs:
-                        self.inputs_outputs[prev_lyr_name][1] = node.targets[0].id
+                # Update the layer's output variable to preserve the activation's output variable
+                if prev_lyr_name in self.inputs_outputs:
+                    self.inputs_outputs[prev_lyr_name][1] = output_var
             if input_var in self.module_of_output:
-                self.module_of_output[node.targets[0].id] = self.module_of_output[input_var]
+                self.module_of_output[output_var] = self.module_of_output[input_var]
 
     def _handle_functional_regular_layer(self, node, module_name, synthetic_name):
         """Handle functional API regular (non-activation) layers."""
