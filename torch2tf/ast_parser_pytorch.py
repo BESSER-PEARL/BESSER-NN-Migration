@@ -1931,10 +1931,18 @@ class ASTParserTorch(ASTParser):
             return False
 
         layer_class = layer_obj.__class__.__name__
-        # Pooling layers don't support activation parameters in TensorFlow
-        # Exclude them and keep activations standalone
-        non_mergeable_types = ['PoolingLayer']
-        return layer_class not in non_mergeable_types
+        parent_class = layer_obj.__class__.mro()[1].__name__ if len(layer_obj.__class__.mro()) > 1 else None
+
+        # TensorFlow doesn't support activation parameter for these layer types:
+        # - NormalizationLayer (BatchNorm, LayerNorm)
+        # - PoolingLayer
+        # - LayerModifier (Dropout)
+        # - EmbeddingLayer
+        # - FlattenLayer
+        non_mergeable_types = ['PoolingLayer', 'EmbeddingLayer', 'FlattenLayer']
+        non_mergeable_parents = ['NormalizationLayer', 'LayerModifier']
+
+        return layer_class not in non_mergeable_types and parent_class not in non_mergeable_parents
 
     def _handle_functional_activation(self, node, module_name):
         """Handle functional API activation functions."""
