@@ -2332,6 +2332,7 @@ class ASTParserTF(ASTParser):
             tensorop_param["name"] = op_name
 
             # Special handling for split: remove output_vars before creating TensorOp
+            # (output vars are tracked via inputs_outputs dict instead)
             output_vars = tensorop_param.pop("output_vars", None)
 
             tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
@@ -2344,6 +2345,21 @@ class ASTParserTF(ASTParser):
                     # Multiple outputs (e.g., split): track each with suffix like RNN does
                     for idx, var in enumerate(output_vars):
                         self.module_of_output[var] = f"{op_name}__split_{idx}"
+
+                    # Track inputs_outputs for split: output is comma-joined tuple of actual vars
+                    # Find input variable
+                    first_layer = tensorop_param.get('layers_of_tensors', [None])[0]
+                    input_var = None
+                    if first_layer:
+                        for var, mod_name in self.module_of_output.items():
+                            if mod_name == first_layer:
+                                input_var = var
+                                break
+                    if input_var is None:
+                        input_var = 'x'
+
+                    # Store tuple of output variables joined by ", "
+                    self.inputs_outputs[op_name] = [input_var, ", ".join(output_vars)]
                 else:
                     # Single output: normal tracking
                     target_var = node.targets[0].id
