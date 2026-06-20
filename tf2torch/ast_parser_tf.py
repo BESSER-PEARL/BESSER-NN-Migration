@@ -1435,11 +1435,12 @@ class ASTParserTF(ASTParser):
     def _extract_nested_call(self, node):
         """Extract nested call from arguments and process it."""
         inner_call = node.value.args[0]
-        temp_name = f"_nested_temp_{self.tensor_op_counter}"
-        self.tensor_op_counter += 1
+        # Use the outer output variable instead of creating a temp variable
+        # For x_1 = fc3(fc2(fc1(h))), use 'x_1' throughout
+        outer_var = node.targets[0].id
 
         inner_node = ast.Assign(
-            targets=[ast.Name(id=temp_name, ctx=ast.Store())],
+            targets=[ast.Name(id=outer_var, ctx=ast.Store())],
             value=inner_call
         )
         inner_node.lineno = node.lineno
@@ -1447,7 +1448,7 @@ class ASTParserTF(ASTParser):
         self.handle_forward_simple_call(inner_node)
         self.previous_assign = inner_node
 
-        node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+        node.value.args[0] = ast.Name(id=outer_var, ctx=ast.Load())
 
     def _extract_subscript_arg(self, node):
         """Extract subscript from arguments and process it."""
@@ -1639,7 +1640,8 @@ class ASTParserTF(ASTParser):
         if isinstance(arg, ast.Name):
             return arg.id
         elif isinstance(arg, ast.Call):
-            return f"_nested_temp_{self.tensor_op_counter - 1}"
+            # After nested call extraction, the arg becomes the outer var name
+            return node.targets[0].id
         else:
             return "x"
 
