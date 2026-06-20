@@ -132,6 +132,7 @@ class ASTParserTF(ASTParser):
         # Track variable aliases and layer lookups
         self.variable_aliases = {}  # {alias_var: source_var}
         self.layer_by_name = {}  # {layer_name: layer_obj} for O(1) lookup
+        self.module_by_name = {}  # {module_name: module_obj} for O(1) lookup of layers and sub_nns
         self.layer_reuse_count = {}  # {layer_name: reuse_count} for layer reuse tracking
         # Track standalone activation layers (layers.ReLU, layers.Activation, etc.)
         self.activation_functions = {}  # {module_name: actv_func_name}
@@ -169,6 +170,12 @@ class ASTParserTF(ASTParser):
             self.layer_by_name[layer_obj.name] = layer_obj
 
         self.buml_model.add_layer(layer_obj)
+
+    def _add_module_with_tracking(self, module_obj):
+        """Add module (layer or sub_nn) to model and update lookup dict for O(1) access."""
+        self.buml_model.modules.append(module_obj)
+        if hasattr(module_obj, 'name'):
+            self.module_by_name[module_obj.name] = module_obj
 
     def visit_AugAssign(self, node: ast.AugAssign):
         """
@@ -1684,6 +1691,11 @@ class ASTParserTF(ASTParser):
         self.inputs_outputs[module_name] = [input_var, output_var]
         module_obj = self._find_module_by_name(module_name)
 
+        # Check if this is a sub_nn (Sequential) - same pattern as torch2tf
+        is_subnn = False
+        if module_obj and module_obj in self.buml_model.sub_nns:
+            is_subnn = True
+
         if module_obj:
             self._set_module_input(module_obj, input_var)
             self._mark_split_input_reuse(module_obj, input_var)
@@ -1703,15 +1715,20 @@ class ASTParserTF(ASTParser):
 
         if module_name in self.activation_functions:
             self._handle_module_activation(node, module_name)
-        elif module_obj and module_obj in self.buml_model.modules:
+        elif module_obj and module_obj in self.buml_model.modules and not is_subnn:
+            # Skip layer reuse for sub_nns
             self._handle_module_layer_reuse(node, module_name, module_obj)
-        elif module_obj:
-            # Add first occurrence with suffix tracking
+        elif module_obj and not is_subnn:
+            # Add first occurrence with suffix tracking (only for layers, not sub_nns)
             self._add_layer_with_tracking(module_obj)
             # Update inputs_outputs to use suffixed name
             self.inputs_outputs[module_obj.name] = self.inputs_outputs[module_name]
             # Update module_of_output to point to suffixed name
             self.module_of_output[node.targets[0].id] = module_obj.name
+        elif is_subnn and module_obj not in self.buml_model.modules:
+            # SubNN (Sequential) called in forward - add to modules for generator
+            # No suffix tracking needed for SubNNs
+            self._add_module_with_tracking(module_obj)
 
     def process_single_call(self, node: ast.Assign):
         """
