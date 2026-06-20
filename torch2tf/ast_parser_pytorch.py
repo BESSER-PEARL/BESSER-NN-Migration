@@ -801,9 +801,10 @@ class ASTParserTorch(ASTParser):
             node.value.args[0] = ast.Name(id=base_var, ctx=ast.Load())
             return False  # Not treated as nested since we're bypassing it
 
-        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
-        self.tensor_op_counter += 1
-        temp_target = ast.Name(id=temp_name, ctx=ast.Store())
+        # Use the outer output variable instead of creating a temp variable
+        # For x = F.relu(self.bn(self.conv(x))), use 'x' throughout
+        outer_var = node.targets[0].id
+        temp_target = ast.Name(id=outer_var, ctx=ast.Store())
 
         inner_node = ast.Assign(targets=[temp_target], value=inner_call)
         inner_node.lineno = node.lineno
@@ -815,7 +816,7 @@ class ASTParserTorch(ASTParser):
         self.visit_Assign(inner_node)
         self.previous_assign = inner_node
 
-        node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+        node.value.args[0] = ast.Name(id=outer_var, ctx=ast.Load())
         return True
 
     def process_single_call(self, node: ast.Assign):
