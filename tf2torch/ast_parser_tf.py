@@ -2813,14 +2813,21 @@ def set_conv_padding(layer_type, lyr_params, padding_amount):
 
     if layer_type.startswith("ZeroPadding"):
         padding_amount = lyr_params["padding"]
-    elif layer_type.startswith("Conv") or layer_type.startswith("MaxPooling") or layer_type.startswith("AveragePooling"):
+    elif layer_type.startswith("Conv") or layer_type.startswith("MaxPooling") or layer_type.startswith("MaxPool") or layer_type.startswith("AveragePooling") or layer_type.startswith("AveragePool"):
+        # Check if there's accumulated padding from ZeroPadding layer first
+        if padding_amount is not None:
+            lyr_params["padding_amount"] = padding_amount
+            padding_amount = None
+            # Remove any padding parameter since we're using accumulated padding
+            if "padding" in lyr_params:
+                del lyr_params["padding"]
         # Handle TF padding='same' -> calculate PyTorch padding amount
         # Note: At this point params haven't been mapped yet, so use TF names
-        if "padding" in lyr_params and lyr_params["padding"] == "same":
+        elif "padding" in lyr_params and lyr_params["padding"] == "same":
             # For 'same' padding with stride=1: padding = (kernel_size minus 1) // 2
             # This formula works for most common cases
             # Use pool_size for pooling layers, kernel_size for conv layers
-            size_param = "pool_size" if layer_type.startswith(("MaxPooling", "AveragePooling")) else "kernel_size"
+            size_param = "pool_size" if layer_type.startswith(("MaxPooling", "MaxPool", "AveragePooling", "AveragePool")) else "kernel_size"
             if size_param in lyr_params:
                 size_value = lyr_params[size_param]
                 # Calculate padding for each dimension
@@ -2838,9 +2845,5 @@ def set_conv_padding(layer_type, lyr_params, padding_amount):
         elif "padding" in lyr_params and lyr_params["padding"] == "valid":
             lyr_params["padding_amount"] = 0
             del lyr_params["padding"]
-        # Handle ZeroPadding before conv
-        elif padding_amount is not None:
-            lyr_params["padding_amount"] = padding_amount
-            padding_amount = None
 
     return lyr_params, padding_amount
