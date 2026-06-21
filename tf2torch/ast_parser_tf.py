@@ -809,20 +809,14 @@ class ASTParserTF(ASTParser):
         # This ensures "residual = x" becomes "residual = x" in PyTorch
         from besser.BUML.metamodel.nn import TensorOp
 
-        # Create identity tensorop with name_module_input to track source
+        # Create identity tensorop with layers_of_tensors to track source
+        source_module = self.module_of_output.get(source_var, 'INPUT')
         identity_op = TensorOp(
             name=target_var,
             tns_type='identity',
-            layers_of_tensors=[],  # Will use name_module_input instead
+            layers_of_tensors=[source_module],
             input_reused=True  # Mark as reusing input so BESSER uses tensorop name as output var
         )
-
-        # Set name_module_input to indicate where the input comes from
-        if source_var in self.module_of_output:
-            identity_op.name_module_input = self.module_of_output[source_var]
-        else:
-            # Source is the network input
-            identity_op.name_module_input = 'INPUT'
 
         self.buml_model.modules.append(identity_op)
         self.module_of_output[target_var] = target_var  # Identity op outputs to target_var

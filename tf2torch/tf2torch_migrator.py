@@ -34,7 +34,7 @@ def main():
         output_dir=args.output_dir,
         generation_type=output_nn_type,
         channel_last=True,
-        strip_layer_counter_suffix=True  # Migration adds counter suffixes to layer names
+        strip_layer_counter_suffix=True
     )
     pytorch_model.generate()
 
