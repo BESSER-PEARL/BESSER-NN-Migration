@@ -180,6 +180,9 @@ def transform(args: argparse.Namespace, framework: str, ast_parser_class: 'ASTPa
     _display_migration_warnings(extractor)
 
     if args.typeinput == "sequential":
+        # For sequential models, set_remaining_lyr_params was not called during visit
+        # (it's only called in visit_ClassDef for subclassing), so call it here
+        extractor.set_remaining_lyr_params()
         _restructure_sequential_model(buml_model)
 
     if framework == "TF":

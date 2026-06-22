@@ -436,12 +436,23 @@ class ASTParserTorch(ASTParser):
         process_positional_params(lyr_type, lyr_params, pos_params)
         num_layers = lyr_params.get('num_layers', 1)
         original_return_type = lyr_params.get('return_type', 'full')
+        dropout_rate = lyr_params.get('dropout', 0.0)
         layer_names = []
 
         for i in range(num_layers):
             layer_params = self._create_rnn_layer_params(lyr_params, i, num_layers, module_name, original_return_type)
+            # Remove dropout from individual layers - will be added between layers instead
+            layer_params['dropout'] = 0.0
             layer_names.append(layer_params['name'])
             self._add_rnn_layer(lyr_type, layer_params)
+
+            # Add dropout layer between RNN layers (not after last layer)
+            if i < num_layers - 1 and dropout_rate > 0:
+                dropout_layer = getattr(mm_classes, "DropoutLayer")(
+                    name=f"{module_name}_dropout_{i}",
+                    rate=dropout_rate
+                )
+                self.buml_model.add_layer(dropout_layer)
 
         self.multi_layer_rnns[module_name] = layer_names
         self.rnn_num_layers[module_name] = num_layers

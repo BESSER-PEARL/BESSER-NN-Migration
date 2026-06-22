@@ -2720,13 +2720,23 @@ def _process_units_param(lyr_type, lyr_params, updated_params):
         updated_params[param] = lyr_params["units"]
 
 def _extract_dropout_params(lyr_type, lyr_params):
-    """Extract dropout parameters from RNN layers."""
+    """Extract dropout parameters from RNN layers.
+
+    TensorFlow LSTM dropout applies to inputs at each timestep.
+    PyTorch LSTM dropout parameter only works between layers (num_layers > 1).
+    For single-layer PyTorch LSTM, we need a separate Dropout layer BEFORE the LSTM.
+    """
     dropout_rate = None
     has_recurrent_dropout = False
 
     if lyr_type in rnn_layers:
+        # Extract dropout to create a separate Dropout layer before the LSTM
+        # This preserves TF behavior since PyTorch LSTM dropout doesn't work for single-layer
         if "dropout" in lyr_params and lyr_params["dropout"] > 0:
             dropout_rate = lyr_params["dropout"]
+            # Remove from LSTM params - will be replaced by separate Dropout layer
+            del lyr_params["dropout"]
+
         if "recurrent_dropout" in lyr_params and lyr_params["recurrent_dropout"] > 0:
             has_recurrent_dropout = True
 
