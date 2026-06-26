@@ -2113,8 +2113,15 @@ class ASTParserTorch(ASTParser):
         self.module_of_output[output_var] = prev_lyr_name_with_suffix
         return True, prev_lyr_name_with_suffix
 
-    def _create_standalone_activation(self, node, module_name):
-        """Create standalone activation layer."""
+    def _create_standalone_activation(self, node, module_name, input_source_module=None):
+        """Create standalone activation layer.
+
+        Args:
+            node: AST node for the activation call
+            module_name: Name of the activation module
+            input_source_module: The module that produces the input to this activation.
+                                 Must be passed in, as module_of_output may already be overwritten.
+        """
         # Use the actual module name from PyTorch to preserve layer names
         actv = self.activation_functions[module_name]
         actv_func = actv_fun_mapping.get(actv)
@@ -2127,6 +2134,11 @@ class ASTParserTorch(ASTParser):
         input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
         output_var = node.targets[0].id
 
+        # If input_source_module wasn't passed, try to get it from module_of_output
+        # (though it may already be overwritten by this point)
+        if input_source_module is None:
+            input_source_module = self.module_of_output.get(input_var)
+
         # Check if activation layer already exists (layer reuse)
         existing_actv = self._get_layer_by_name(module_name)
         if existing_actv and existing_actv in self.buml_model.modules:
@@ -2135,6 +2147,11 @@ class ASTParserTorch(ASTParser):
             reused_actv = copy.deepcopy(existing_actv)
             reused_actv.name = module_name  # Reset to base name before adding suffix
             reused_actv.is_layer_call = True
+
+            # Set name_module_input from the captured input source
+            if input_source_module:
+                reused_actv.name_module_input = input_source_module
+
             self._add_layer_with_tracking(reused_actv)
             # Store inputs_outputs with suffixed name
             self.inputs_outputs[reused_actv.name] = [input_var, output_var]
@@ -2142,6 +2159,11 @@ class ASTParserTorch(ASTParser):
         else:
             # First occurrence - create and add with tracking
             actv_lyr = mm_classes.GeneralLayer(name=module_name, actv_func=actv_func)
+
+            # Set name_module_input from the captured input source
+            if input_source_module:
+                actv_lyr.name_module_input = input_source_module
+
             self._add_layer_with_tracking(actv_lyr)
             # Store inputs_outputs with suffixed name
             self.inputs_outputs[actv_lyr.name] = [input_var, output_var]
@@ -2151,7 +2173,7 @@ class ASTParserTorch(ASTParser):
         """Handle module API activation functions with merge logic."""
         merged, _ = self._try_merge_activation(node, module_name, input_source_module)
         if not merged:
-            self._create_standalone_activation(node, module_name)
+            self._create_standalone_activation(node, module_name, input_source_module)
 
     def _handle_module_layer_reuse(self, node, module_name, module_obj, original_inputs_outputs=None):
         """
@@ -2233,7 +2255,9 @@ class ASTParserTorch(ASTParser):
 
         module_obj = self._get_layer_by_name(module_name)
         # Set name_module_input using saved input source (not overwritten value)
-        if module_obj and input_source_module:
+        # BUT: Skip activation functions - they're handled in _handle_module_activation
+        # and shouldn't be modified here (layer reuse would overwrite the first occurrence)
+        if module_obj and input_source_module and module_name not in self.activation_functions:
             module_obj.name_module_input = input_source_module
         self._detect_parallel_operations(module_obj, input_var)
         self.prev_layer_output = node.targets[0].id
