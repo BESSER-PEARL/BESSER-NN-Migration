@@ -2592,8 +2592,13 @@ class ASTParserTF(ASTParser):
 
     def _update_prev_module_reference(self, module, modules):
         """Update prev_module reference based on module's input."""
-        if module.name_module_input:
+        if isinstance(module, Layer) and module.name_module_input:
             return next((obj for obj in modules if obj.name == module.name_module_input), None)
+        elif isinstance(module, TensorOp) and module.layers_of_tensors:
+            # For TensorOp, use the first input from layers_of_tensors
+            input_name = module.layers_of_tensors[0] if isinstance(module.layers_of_tensors[0], str) else None
+            if input_name:
+                return next((obj for obj in modules if obj.name == input_name), None)
         return None
 
     def _set_input_permute(self, module, prev_cnn, prev_module, lyr_out_permuted):
@@ -2664,7 +2669,7 @@ class ASTParserTF(ASTParser):
                     next_cnn = False
         elif isinstance(module, TensorOp) and module.tns_type in ("interpolate", "pad"):
             current_cnn = True
-            if module.name_module_input:
+            if module.layers_of_tensors:
                 prev_module = self._update_prev_module_reference(module, modules)
 
         prev_cnn = self._is_cnn_module(prev_module, cnns) if prev_module else False
