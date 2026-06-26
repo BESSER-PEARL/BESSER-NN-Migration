@@ -2755,7 +2755,7 @@ class ASTParserTorch(ASTParser):
 
     def _extract_layer_call_variable(self, arg, layer_name):
         """Extract variable from layer call in concatenation."""
-        layer_obj = next((lyr for lyr in self.buml_model.layers if lyr.name == layer_name), None)
+        layer_obj = self._get_layer_by_name(layer_name)
 
         if not layer_obj:
             self.migration_warnings.append(
