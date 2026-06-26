@@ -825,8 +825,20 @@ class ASTParserTorch(ASTParser):
 
         # Use the outer output variable instead of creating a temp variable
         # For x = F.relu(self.bn(self.conv(x))), use 'x' throughout
+        # BUT for shape operations like .size(), use synthetic variable to avoid type conflicts
         outer_var = node.targets[0].id
-        temp_target = ast.Name(id=outer_var, ctx=ast.Store())
+
+        # Check if inner call is a shape operation
+        is_shape_op = (isinstance(inner_call, ast.Call) and
+                       hasattr(inner_call.func, 'attr') and
+                       inner_call.func.attr in ('size', 'shape'))
+
+        if is_shape_op:
+            # Use synthetic variable for shape operations to preserve tensor variable
+            temp_var_name = f"_shape_{self.tensor_op_counter}"
+            temp_target = ast.Name(id=temp_var_name, ctx=ast.Store())
+        else:
+            temp_target = ast.Name(id=outer_var, ctx=ast.Store())
 
         inner_node = ast.Assign(targets=[temp_target], value=inner_call)
         inner_node.lineno = node.lineno
@@ -838,7 +850,9 @@ class ASTParserTorch(ASTParser):
         self.visit_Assign(inner_node)
         self.previous_assign = inner_node
 
-        node.value.args[0] = ast.Name(id=outer_var, ctx=ast.Load())
+        # Replace the inner call with reference to the temp variable
+        replacement_var = temp_var_name if is_shape_op else outer_var
+        node.value.args[0] = ast.Name(id=replacement_var, ctx=ast.Load())
         return True
 
     def process_single_call(self, node: ast.Assign):
@@ -2374,6 +2388,12 @@ class ASTParserTorch(ASTParser):
                 tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
                 self.buml_model.add_tensor_op(tns_obj)
                 self.tensor_op_counter += 1
+
+                # Add to inputs_outputs with synthetic variable name for inline shape extraction
+                # This ensures the generator creates an intermediate variable instead of reusing 'x'
+                synthetic_var = f"_{op_name}"
+                self.inputs_outputs[op_name] = [None, synthetic_var]
+
                 return op_name
             else:
                 return self.param_value(arg)
