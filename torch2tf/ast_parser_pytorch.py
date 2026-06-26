@@ -409,7 +409,7 @@ class ASTParserTorch(ASTParser):
         """Create parameters for individual RNN layer in multi-layer stack."""
         layer_params = lyr_params.copy()
         layer_params.pop('num_layers', None)
-        layer_params['name'] = f"{module_name}_layer_{i}"
+        layer_params['name'] = f"{module_name}_layer_{i+1}"
 
         if i > 0:
             layer_params['input_size'] = lyr_params['hidden_size']
@@ -423,11 +423,15 @@ class ASTParserTorch(ASTParser):
         return layer_params
 
     def _add_rnn_layer(self, lyr_type, layer_params):
-        """Transform and add a single RNN layer to BUML model."""
+        """Transform and create a single RNN layer, store in lookup dicts."""
         try:
             buml_lyr_type, buml_params = transform_layer(lyr_type, layer_params, layer_params['name'])
             buml_layer = getattr(mm_classes, buml_lyr_type)(**buml_params)
-            self.buml_model.add_layer(buml_layer)
+            # Store in lookup dicts but DON'T add to model yet
+            # Layer will be added via _add_layer_with_tracking when processing forward()
+            layer_name = layer_params['name']
+            self.layer_by_name[layer_name] = buml_layer
+            self.module_by_name[layer_name] = buml_layer
         except ValueError as e:
             self.migration_warnings.append(f"Layer '{layer_params['name']}': {str(e)}")
 
@@ -441,18 +445,22 @@ class ASTParserTorch(ASTParser):
 
         for i in range(num_layers):
             layer_params = self._create_rnn_layer_params(lyr_params, i, num_layers, module_name, original_return_type)
-            # Remove dropout from individual layers - will be added between layers instead
+            # Remove dropout from individual layers - will be added as separate layers instead
+            # because PyTorch dropout (between layers) != TensorFlow dropout (on inputs)
             layer_params['dropout'] = 0.0
             layer_names.append(layer_params['name'])
             self._add_rnn_layer(lyr_type, layer_params)
 
-            # Add dropout layer between RNN layers (not after last layer)
+            # Create dropout layer between RNN layers (not after last layer)
             if i < num_layers - 1 and dropout_rate > 0:
+                dropout_name = f"{module_name}_dropout_{i+1}"
                 dropout_layer = getattr(mm_classes, "DropoutLayer")(
-                    name=f"{module_name}_dropout_{i}",
+                    name=dropout_name,
                     rate=dropout_rate
                 )
-                self.buml_model.add_layer(dropout_layer)
+                # Store in lookup dicts - will be inserted in forward() via expand_multi_layer_rnn_call
+                self.layer_by_name[dropout_name] = dropout_layer
+                self.module_by_name[dropout_name] = dropout_layer
 
         self.multi_layer_rnns[module_name] = layer_names
         self.rnn_num_layers[module_name] = num_layers
@@ -463,7 +471,10 @@ class ASTParserTorch(ASTParser):
         try:
             lyr_type, lyr_params = transform_layer(lyr_type, lyr_params, module_name)
             buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-            self.buml_model.add_layer(buml_layer)
+            # Store in lookup dict but DON'T add to model yet
+            # Layer will be added via _add_layer_with_tracking when processing forward()
+            self.layer_by_name[module_name] = buml_layer
+            self.module_by_name[module_name] = buml_layer
         except ValueError as e:
             self.migration_warnings.append(f"Layer '{module_name}': {str(e)}")
 
@@ -881,6 +892,17 @@ class ASTParserTorch(ASTParser):
         module_obj = self._get_layer_by_name(layer_name)
         if module_obj:
             self.buml_model.modules.append(module_obj)
+
+        # Check if there's a dropout layer after this intermediate RNN layer
+        dropout_name = f"{module_name}_dropout_{i+1}"
+        dropout_obj = self._get_layer_by_name(dropout_name)
+        if dropout_obj:
+            # Insert dropout layer between RNN layers
+            dropout_temp_var = f"{temp_var}_dropout"
+            self.inputs_outputs[dropout_name] = [temp_var, dropout_temp_var]
+            self.module_of_output[dropout_temp_var] = dropout_name
+            self.buml_model.modules.append(dropout_obj)
+            return dropout_temp_var
 
         return temp_var
 
@@ -1672,9 +1694,8 @@ class ASTParserTorch(ASTParser):
                     self.previous_assign.value.func.value.id != "self"):
                     ops_name = self.previous_assign.value.func.attr
                     if ops_name in ["permute", "transpose"]:
-                        lyrs = self.buml_model.layers
-                        lyr_obj = next((obj for obj in lyrs if
-                                        obj.name == lyr_name), None)
+                        # lyr_obj already retrieved at line 1664, use that instead of searching buml_model.layers
+                        # (which may not have the layer yet since it's added later in forward() processing)
                         lyr_obj.permute_in = True
                         # Update variable tracking when removing transpose
                         # Map transpose output variable back to transpose input's source layer
