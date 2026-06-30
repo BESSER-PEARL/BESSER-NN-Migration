@@ -140,6 +140,9 @@ class ASTParser(ast.NodeVisitor):
                         func_layer_groups[base_name] = []
                     func_layer_groups[base_name].append(module)
 
+        # Track name changes for updating TensorOp references
+        name_mapping = {}
+
         # Renumber: if only one, remove suffix; if multiple, number from 1
         for base_name, modules_list in func_layer_groups.items():
             if len(modules_list) == 1:
@@ -148,6 +151,7 @@ class ASTParser(ast.NodeVisitor):
                 old_name = module.name
                 new_name = base_name  # No suffix
                 module.name = new_name
+                name_mapping[old_name] = new_name
                 # Update references
                 if old_name in self.inputs_outputs:
                     self.inputs_outputs[new_name] = self.inputs_outputs.pop(old_name)
@@ -160,11 +164,23 @@ class ASTParser(ast.NodeVisitor):
                     old_name = module.name
                     new_name = f"{base_name}_{idx}"
                     module.name = new_name
+                    name_mapping[old_name] = new_name
                     if old_name in self.inputs_outputs:
                         self.inputs_outputs[new_name] = self.inputs_outputs.pop(old_name)
                     for var, mod_name in list(self.module_of_output.items()):
                         if mod_name == old_name:
                             self.module_of_output[var] = new_name
+
+        # Update layers_of_tensors in TensorOps to reflect renamed layers
+        for module in self.buml_model.modules:
+            if hasattr(module, 'layers_of_tensors') and module.layers_of_tensors:
+                updated_layers = []
+                for layer_ref in module.layers_of_tensors:
+                    if layer_ref in name_mapping:
+                        updated_layers.append(name_mapping[layer_ref])
+                    else:
+                        updated_layers.append(layer_ref)
+                module.layers_of_tensors = updated_layers
 
 
     def set_remaining_lyr_params(self):
