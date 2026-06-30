@@ -1883,8 +1883,8 @@ class ASTParserTorch(ASTParser):
         input_var = self._extract_tensorop_input_var(call_node, node)
 
         # Store main operation input/output (for the operation itself)
-        # The output is a tuple, so we use the first variable as representative
-        main_output = output_vars[0] if output_vars else None
+        # The output is a comma-joined tuple of all output variables
+        main_output = ", ".join(output_vars) if output_vars else None
         if input_var and main_output:
             self.inputs_outputs[op_name] = [input_var, main_output]
 
