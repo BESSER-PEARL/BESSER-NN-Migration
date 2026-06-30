@@ -412,7 +412,12 @@ class ASTParserTorch(ASTParser):
         layer_params['name'] = f"{module_name}_layer_{i+1}"
 
         if i > 0:
-            layer_params['input_size'] = lyr_params['hidden_size']
+            # For layers after the first, input_size = hidden_size of previous layer
+            # If previous layer is bidirectional, multiply by 2
+            prev_hidden_size = lyr_params['hidden_size']
+            if lyr_params.get('bidirectional', False):
+                prev_hidden_size *= 2
+            layer_params['input_size'] = prev_hidden_size
 
         if i < num_layers - 1:
             layer_params['return_type'] = 'full'
@@ -621,11 +626,19 @@ class ASTParserTorch(ASTParser):
         return chain
 
     def _process_nested_call_in_chain(self, call, node):
-        """Extract and process nested call within a chain element."""
+        """
+        Extract and process nested call within a chain element.
+        Recursively handles multiple levels of nesting like pool(act(conv(x))).
+        """
         if not (isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Call)):
             return
 
         inner_call = call.args[0]
+
+        # RECURSIVELY process nested calls within the inner call
+        # For pool(act(conv(x))), this extracts conv(x) from within act()
+        self._process_nested_call_in_chain(inner_call, node)
+
         inner_temp = self.TEMP_NESTED_IN_CHAIN.format(self.tensor_op_counter)
         self.tensor_op_counter += 1
         inner_target = ast.Name(id=inner_temp, ctx=ast.Store())
@@ -1979,6 +1992,9 @@ class ASTParserTorch(ASTParser):
             reused_actv = copy.deepcopy(existing_actv)
             reused_actv.name = base_actv_name  # Reset to base name before adding suffix
             reused_actv.is_layer_call = True
+            # Reset permute flags - reused layers shouldn't have format conversion flags
+            reused_actv.permute_in = False
+            reused_actv.permute_out = False
             self._add_layer_with_tracking(reused_actv)
             # Store inputs_outputs with suffixed name
             self.inputs_outputs[reused_actv.name] = [input_var, output_var]
@@ -2147,6 +2163,9 @@ class ASTParserTorch(ASTParser):
             reused_actv = copy.deepcopy(existing_actv)
             reused_actv.name = module_name  # Reset to base name before adding suffix
             reused_actv.is_layer_call = True
+            # Reset permute flags - reused layers shouldn't have format conversion flags
+            reused_actv.permute_in = False
+            reused_actv.permute_out = False
 
             # Set name_module_input from the captured input source
             if input_source_module:
@@ -2198,6 +2217,9 @@ class ASTParserTorch(ASTParser):
         call_layer.name = module_name
         # Mark as layer call so generator skips it in __init__
         call_layer.is_layer_call = True
+        # Reset permute flags - reused layers shouldn't have format conversion flags
+        call_layer.permute_in = False
+        call_layer.permute_out = False
 
         # Add layer with tracking (this adds suffix to name AND adds to both layers and modules)
         self._add_layer_with_tracking(call_layer)
@@ -2287,6 +2309,9 @@ class ASTParserTorch(ASTParser):
                 reused_layer = copy.deepcopy(module_obj)
                 reused_layer.name = module_name  # Reset to base name before adding
                 reused_layer.is_layer_call = True
+                # Reset permute flags - reused layers shouldn't have format conversion flags
+                reused_layer.permute_in = False
+                reused_layer.permute_out = False
                 # Add with tracking - this adds counter suffix and appends to modules
                 self._add_layer_with_tracking(reused_layer)
                 # inputs_outputs[module_name] already has current call's values from line 2112
@@ -3072,6 +3097,27 @@ class ASTParserTorch(ASTParser):
 
         if self._check_bidirectional_rnn_concat(ops_args, layers_of_tensors, node):
             return None
+
+        # Check for duplicate sources from bidirectional RNN hidden states
+        # This happens when h_f = h_n[-2]; h_b = h_n[-1]; h = torch.cat([h_f, h_b])
+        # Both h_f and h_b point to the same __hidden module
+        if (len(layers_of_tensors) == 2 and
+            layers_of_tensors[0] == layers_of_tensors[1] and
+            layers_of_tensors[0].endswith("__hidden")):
+            # Check if source is a bidirectional RNN
+            base_layer_name = layers_of_tensors[0].replace("__hidden", "")
+            source_layer = self._get_layer_by_name(base_layer_name)
+            if self._is_bidirectional_hidden_rnn(source_layer):
+                # Let the RNN template handle the concat - don't create a TensorOp
+                # But register the output variable so it can be used in later operations
+                output_var = self._extract_output_var_from_target(node.targets[0])
+                if output_var:
+                    concat_module = "bidirectional_concat_" + base_layer_name
+                    self.module_of_output[output_var] = concat_module
+                    if not hasattr(self, '_bidirectional_concat_var_names'):
+                        self._bidirectional_concat_var_names = {}
+                    self._bidirectional_concat_var_names[base_layer_name] = output_var
+                return None
 
         var_types = self._determine_rnn_var_types(layers_of_tensors, actual_vars)
 
