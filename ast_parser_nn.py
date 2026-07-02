@@ -24,10 +24,8 @@ class ASTParser(ast.NodeVisitor):
         buml_model (NN): The BUML NN model.
         previous_assign (ast.AST | None): It keeps track of the previous 
             module in the forward method.
-        data_config (dict): A dict to keep track of NN config and 
+        data_config (dict): A dict to keep track of NN config and
             data attributes.
-        inputs_outputs (dict): It keeps track of input and output variables 
-            of layers.
         module_of_output (dict): It keeps track of name of layers given their
             output var.
         tensor_op_counter (int): Counter used to assign names of tensorops.
@@ -46,7 +44,6 @@ class ASTParser(ast.NodeVisitor):
 
         self.data_config: dict = {"config": {}, "train_data": {},
                                   "test_data": {}}
-        self.inputs_outputs: dict = {}
         self.module_of_output: dict = {}
         self.tensor_op_counter: int = 1
         self.in_class: bool = False
@@ -153,8 +150,6 @@ class ASTParser(ast.NodeVisitor):
                 module.name = new_name
                 name_mapping[old_name] = new_name
                 # Update references
-                if old_name in self.inputs_outputs:
-                    self.inputs_outputs[new_name] = self.inputs_outputs.pop(old_name)
                 for var, mod_name in list(self.module_of_output.items()):
                     if mod_name == old_name:
                         self.module_of_output[var] = new_name
@@ -165,8 +160,6 @@ class ASTParser(ast.NodeVisitor):
                     new_name = f"{base_name}_{idx}"
                     module.name = new_name
                     name_mapping[old_name] = new_name
-                    if old_name in self.inputs_outputs:
-                        self.inputs_outputs[new_name] = self.inputs_outputs.pop(old_name)
                     for var, mod_name in list(self.module_of_output.items()):
                         if mod_name == old_name:
                             self.module_of_output[var] = new_name
@@ -210,8 +203,9 @@ class ASTParser(ast.NodeVisitor):
         # Third pass: set remaining params
         for i, module in enumerate(self.buml_model.modules):
             if isinstance(module, Layer) or hasattr(module, 'input_reused'):
-                set_remaining_params(module, self.inputs_outputs,
-                                   self.module_of_output,
+                #                    self.module_of_output,
+                #                    self.buml_model.modules, i)
+                set_remaining_params(module, self.module_of_output,
                                    self.buml_model.modules, i)
 
         # Handle tuple returns
@@ -223,13 +217,8 @@ class ASTParser(ast.NodeVisitor):
                     continue
                 return_vars.append(pytorch_var)
 
-            # Store in model's inputs_outputs for generator to access
             if return_vars:
-                self.inputs_outputs['__return__'] = [None, ', '.join(return_vars)]
-
-        # Store inputs_outputs in model for generator access
-        self.buml_model.inputs_outputs = self.inputs_outputs
-
+                self.buml_model.return_vars = ', '.join(return_vars)
 
 
     def add_permute_dim(self):
@@ -502,7 +491,7 @@ class ASTParser(ast.NodeVisitor):
         """
         This method:
         - retrieves the input and output variables of modules
-        and populates 'inputs_outputs' and 'module_of_output' dictionaries.
+        and populates 'module_of_output' dictionary.
         - sets the activation function as attribute of its layer (for PyTorch).
         - adds permute_in attributes to cnn layers if they are preceeded by
         permute tensorop (the permute op is sometimes used before a cnn layer

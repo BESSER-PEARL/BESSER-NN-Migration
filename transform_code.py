@@ -276,16 +276,13 @@ def set_static_params(lyr_type: str, lyr_params: dict,
         lyr_params.update(static_params[lyr_type])
 
 
-def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
-                         module_of_output: dict, modules_list: list,
-                         current_index: int):
+def set_remaining_params(lyr_obj: Layer, module_of_output: dict,
+                         modules_list: list, current_index: int):
     """
     It sets the 'input_reused' and 'name_module_input' layer parameters.
 
     Parameters:
         lyr_obj (Layer): The buml layer object.
-        inputs_outputs (dict): It stores input and output variables
-            of layers.
         module_of_output (dict): Maps output variable names to the module
             that produces them.
         modules_list (list): The list of all modules in execution order.
@@ -297,17 +294,20 @@ def set_remaining_params(lyr_obj: Layer, inputs_outputs: dict,
 
     layer_name = lyr_obj.name
 
-    # Skip if module is not in inputs_outputs
-    if layer_name not in inputs_outputs:
-        return
-
     # Skip identity tensorops: they should preserve exact variable names
     if hasattr(lyr_obj, 'tns_type') and lyr_obj.tns_type == 'identity':
         return
 
-    # Handle both single output and tuple output (list)
-    input_var = inputs_outputs[layer_name][0]
-    output_var = inputs_outputs[layer_name][1]
+    # Use object attributes for input/output variables
+    if hasattr(lyr_obj, 'input_var') and lyr_obj.input_var is not None:
+        input_var = lyr_obj.input_var
+    else:
+        return  # No input_var set, skip
+
+    if hasattr(lyr_obj, 'output_var') and lyr_obj.output_var is not None:
+        output_var = lyr_obj.output_var
+    else:
+        return  # No output_var set, skip
 
     # Check if input is different from output(s)
     # For tuple outputs (RNN): check if input is not in the output tuple

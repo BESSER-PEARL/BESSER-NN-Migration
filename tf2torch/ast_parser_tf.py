@@ -279,9 +279,8 @@ class ASTParserTF(ASTParser):
             self.buml_model.add_tensor_op(tns_obj)
             self.module_of_output[target_var] = tensorop_param["name"]
 
-            self.inputs_outputs[tensorop_param["name"]] = [
-                left_var if isinstance(left_var, str) else str(left_var), target_var
-            ]
+            tns_obj.input_var = left_var if isinstance(left_var, str) else str(left_var)
+            tns_obj.output_var = target_var
             self.prev_layer_output = target_var
 
             self._mark_residual_source_layers(tns_type, left_layer, right_layer)
@@ -375,28 +374,39 @@ class ASTParserTF(ASTParser):
 
         return False
 
-    def _handle_module_layer_reuse(self, node, module_name, module_obj):
+    def _handle_module_layer_reuse(self, node, module_name, module_obj, input_var, output_var):
         """
         Handle layer reuse by cloning the layer with is_layer_call=True.
         This marks it to skip __init__ definition but be called in forward.
+        Now receives input_var and output_var for THIS use of the reused layer.
         """
         import copy
-        # Save original inputs_outputs for first layer if needed
-        original_inputs_outputs = self.inputs_outputs.get(module_name)
+        if module_name == 'dropout':
+            print(f"DEBUG _handle_module_layer_reuse ENTRY: module_name={module_name}")
+            print(f"  input_var={input_var}, output_var={output_var}")
+            print(f"  module_obj.name={getattr(module_obj, 'name', 'NO NAME')}, input_var={getattr(module_obj, 'input_var', None)}, output_var={getattr(module_obj, 'output_var', None)}")
 
         # Clone the layer with is_layer_call=True to skip __init__ definition
+        if module_name == 'dropout':
+            print(f"DEBUG: Before deepcopy, module_obj.name={module_obj.name}, id={id(module_obj)}")
         reused_layer = copy.deepcopy(module_obj)
+        if module_name == 'dropout':
+            print(f"DEBUG: After deepcopy, reused_layer.name={reused_layer.name}, id={id(reused_layer)}")
+            print(f"DEBUG: After deepcopy, module_obj.name={module_obj.name}, id={id(module_obj)}")
         reused_layer.name = module_name  # Reset to base name before adding suffix
         reused_layer.is_layer_call = True
+        # Set the input/output vars for THIS reused instance
+        reused_layer.input_var = input_var
+        reused_layer.output_var = output_var
+        if module_name == 'dropout':
+            print(f"DEBUG: Before _add_layer_with_tracking, reused_layer.name={reused_layer.name}, input_var={reused_layer.input_var}, output_var={reused_layer.output_var}")
         # Add with tracking - this adds counter suffix and appends to modules
         self._add_layer_with_tracking(reused_layer)
-        # Copy current inputs_outputs to suffixed name
-        self.inputs_outputs[reused_layer.name] = self.inputs_outputs[module_name]
-        # Restore original for first layer if saved
-        if original_inputs_outputs and module_name in self.layer_by_name:
-            first_layer = self.layer_by_name[module_name]
-            if hasattr(first_layer, 'name') and first_layer.name.endswith('_c1'):
-                self.inputs_outputs[first_layer.name] = original_inputs_outputs
+        if module_name == 'dropout':
+            print(f"DEBUG: After _add_layer_with_tracking, reused_layer.name={reused_layer.name}")
+        # Set module input and mark split reuse
+        self._set_module_input(reused_layer, input_var)
+        self._mark_split_input_reuse(reused_layer, input_var)
         # Update module_of_output to point to new suffixed name
         self.module_of_output[node.targets[0].id] = reused_layer.name
 
@@ -766,7 +776,8 @@ class ASTParserTF(ASTParser):
 
         subscript_op = self._create_subscript_op(op_name, source_module, subscript_pattern)
         self.buml_model.modules.append(subscript_op)
-        self.inputs_outputs[op_name] = [resolved_var, output_var]
+        subscript_op.input_var = resolved_var
+        subscript_op.output_var = output_var
         self.module_of_output[output_var] = op_name
 
     def _is_rnn_subscript(self, subscripted_var):
@@ -820,7 +831,8 @@ class ASTParserTF(ASTParser):
 
         self.buml_model.modules.append(identity_op)
         self.module_of_output[target_var] = target_var  # Identity op outputs to target_var
-        self.inputs_outputs[target_var] = [source_var, target_var]  # Track input/output
+        identity_op.input_var = source_var
+        identity_op.output_var = target_var
 
         # Track that this variable has been saved for later use (residual connection)
         if not hasattr(self, '_variables_saved_for_residual'):
@@ -877,9 +889,9 @@ class ASTParserTF(ASTParser):
         rnn_out = self._determine_rnn_output_var(node)
         rnn_in = self._extract_rnn_input_arg(node)
 
-        self.inputs_outputs[module_name] = [rnn_in, rnn_out]
-        if not module_obj:
-            module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
+        if module_obj:
+            module_obj.input_var = rnn_in
+            module_obj.output_var = rnn_out
 
         self._configure_rnn_module(module_obj, module_name, rnn_in)
         self._append_rnn_module(module_obj, node, module_name)
@@ -890,6 +902,20 @@ class ASTParserTF(ASTParser):
     def _get_var_id(self, target_elt):
         """Safely extract variable ID from AST target element."""
         return target_elt.id if isinstance(target_elt, ast.Name) else None
+
+    def _track_rnn_hidden_var(self, var, module_name):
+        """Track RNN hidden state variable."""
+        if var and var != "_":
+            self.module_of_output[var] = module_name + "__hidden"
+            lyr_obj = self._get_layer_by_name(module_name)
+            if lyr_obj:
+                lyr_obj.hidden_state_var = var
+                lyr_obj.hidden_unused = False
+        elif var == "_":
+            lyr_obj = self._get_layer_by_name(module_name)
+            if lyr_obj:
+                lyr_obj.hidden_state_var = "_"
+                lyr_obj.hidden_unused = True
 
     def _track_rnn_output_var(self, var, module_name):
         """Track RNN output variable."""
@@ -902,17 +928,29 @@ class ASTParserTF(ASTParser):
         if var and var != "_":
             self.rnn_hidden_vars[module_name] = var
             self.module_of_output[var] = module_name + "__hidden"
-            self.inputs_outputs[module_name + "__hidden"] = [var, var]
+            lyr_obj = self._get_layer_by_name(module_name)
+            if lyr_obj:
+                lyr_obj.hidden_state_var = var
+                lyr_obj.hidden_unused = False
         elif var == "_":
-            self.inputs_outputs[module_name + "__hidden"] = ["_", "_"]
+            lyr_obj = self._get_layer_by_name(module_name)
+            if lyr_obj:
+                lyr_obj.hidden_state_var = "_"
+                lyr_obj.hidden_unused = True
 
     def _track_lstm_cell_var(self, var, module_name):
         """Track LSTM cell state variable."""
         if var and var != "_":
             self.module_of_output[var] = module_name + "__cell"
-            self.inputs_outputs[module_name + "__cell"] = [var, var]
+            lyr_obj = self._get_layer_by_name(module_name)
+            if lyr_obj:
+                lyr_obj.cell_state_var = var
+                lyr_obj.cell_unused = False
         elif var == "_":
-            self.inputs_outputs[module_name + "__cell"] = ["_", "_"]
+            lyr_obj = self._get_layer_by_name(module_name)
+            if lyr_obj:
+                lyr_obj.cell_state_var = "_"
+                lyr_obj.cell_unused = True
 
     def _handle_2_target_rnn(self, node, module_name):
         """Handle SimpleRNN or GRU: out, h = self.rnn(x)"""
@@ -1682,15 +1720,25 @@ class ASTParserTF(ASTParser):
         input_var = self._extract_call_input_var(node)
         output_var = node.targets[0].id
 
-        self.inputs_outputs[module_name] = [input_var, output_var]
         module_obj = self._find_module_by_name(module_name)
+
+        if module_name == 'dropout':
+            print(f"DEBUG _process_self_module_call: module_name={module_name}")
+            print(f"  input_var={input_var}, output_var={output_var}")
+            print(f"  module_obj.name={getattr(module_obj, 'name', 'NO NAME')}, input_var={getattr(module_obj, 'input_var', None)}, output_var={getattr(module_obj, 'output_var', None)}")
+            print(f"  module_obj in buml_model.modules: {module_obj in self.buml_model.modules if module_obj else False}")
 
         # Check if this is a sub_nn (Sequential) - same pattern as torch2tf
         is_subnn = False
         if module_obj and module_obj in self.buml_model.sub_nns:
             is_subnn = True
 
-        if module_obj:
+        # Check if this is layer reuse BEFORE modifying module_obj
+        is_layer_reuse = module_obj and module_obj in self.buml_model.modules and not is_subnn
+
+        if module_obj and not is_layer_reuse:
+            module_obj.input_var = input_var
+            module_obj.output_var = output_var
             self._set_module_input(module_obj, input_var)
             self._mark_split_input_reuse(module_obj, input_var)
 
@@ -1709,14 +1757,12 @@ class ASTParserTF(ASTParser):
 
         if module_name in self.activation_functions:
             self._handle_module_activation(node, module_name)
-        elif module_obj and module_obj in self.buml_model.modules and not is_subnn:
-            # Skip layer reuse for sub_nns
-            self._handle_module_layer_reuse(node, module_name, module_obj)
+        elif is_layer_reuse:
+            # Handle layer reuse - pass the current input/output vars for this use
+            self._handle_module_layer_reuse(node, module_name, module_obj, input_var, output_var)
         elif module_obj and not is_subnn:
             # Add first occurrence with suffix tracking (only for layers, not sub_nns)
             self._add_layer_with_tracking(module_obj)
-            # Update inputs_outputs to use suffixed name
-            self.inputs_outputs[module_obj.name] = self.inputs_outputs[module_name]
             # Update module_of_output to point to suffixed name
             self.module_of_output[node.targets[0].id] = module_obj.name
         elif is_subnn and module_obj not in self.buml_model.modules:
@@ -1794,7 +1840,8 @@ class ASTParserTF(ASTParser):
 
             # Track inputs/outputs
             output_var = node.targets[0].id
-            self.inputs_outputs[actv_lyr_name] = [input_var, output_var]
+            actv_lyr.input_var = input_var
+            actv_lyr.output_var = output_var
             self.module_of_output[output_var] = actv_lyr_name
         else:
             # Attach activation to previous layer
@@ -1802,8 +1849,7 @@ class ASTParserTF(ASTParser):
                 prev_lyr_obj.actv_func = tf_actv_func_mapping[func_name]
                 # Update layer output for nested calls
                 if hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer:
-                    if prev_lyr_name in self.inputs_outputs:
-                        self.inputs_outputs[prev_lyr_name][1] = node.targets[0].id
+                    prev_lyr_obj.output_var = node.targets[0].id
             # Update module_of_output
             if input_var in self.module_of_output:
                 self.module_of_output[node.targets[0].id] = self.module_of_output[input_var]
@@ -1826,7 +1872,8 @@ class ASTParserTF(ASTParser):
 
         input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
         output_var = node.targets[0].id
-        self.inputs_outputs[module_name] = [input_var, output_var]
+        actv_lyr.input_var = input_var
+        actv_lyr.output_var = output_var
         self.module_of_output[output_var] = module_name
 
     def _extract_source_variable(self, op_args, node, op_type):
@@ -2326,7 +2373,7 @@ class ASTParserTF(ASTParser):
             tensorop_param["name"] = op_name
 
             # Special handling for split: remove output_vars before creating TensorOp
-            # (output vars are tracked via inputs_outputs dict instead)
+            # (output vars are tracked via layer/tensorop attributes instead)
             output_vars = tensorop_param.pop("output_vars", None)
 
             tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
@@ -2340,7 +2387,7 @@ class ASTParserTF(ASTParser):
                     for idx, var in enumerate(output_vars):
                         self.module_of_output[var] = f"{op_name}__split_{idx}"
 
-                    # Track inputs_outputs for split: output is comma-joined tuple of actual vars
+                    # Track output for split: output is comma-joined tuple of actual vars
                     # Find input variable
                     first_layer = tensorop_param.get('layers_of_tensors', [None])[0]
                     input_var = None
@@ -2352,8 +2399,10 @@ class ASTParserTF(ASTParser):
                     if input_var is None:
                         input_var = 'x'
 
-                    # Store tuple of output variables joined by ", "
-                    self.inputs_outputs[op_name] = [input_var, ", ".join(output_vars)]
+                    # Track output for split: output is comma-joined tuple of actual vars
+                    tns_obj.input_var = input_var
+                    tns_obj.output_vars = output_vars  # Set as list, not comma-joined string
+                    # DO NOT set tns_obj.output_var for split ops
                 else:
                     # Single output: normal tracking
                     target_var = node.targets[0].id
@@ -2376,7 +2425,8 @@ class ASTParserTF(ASTParser):
                         if input_var is None:
                             input_var = 'x'
 
-                        self.inputs_outputs[op_name] = [input_var, target_var]
+                        tns_obj.input_var = input_var
+                        tns_obj.output_var = target_var
 
     def _create_dropout_layer(self, tensorop_param, node):
         """Create a Dropout layer from tf.nn.dropout."""
