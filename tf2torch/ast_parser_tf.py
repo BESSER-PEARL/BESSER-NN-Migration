@@ -381,29 +381,16 @@ class ASTParserTF(ASTParser):
         Now receives input_var and output_var for THIS use of the reused layer.
         """
         import copy
-        if module_name == 'dropout':
-            print(f"DEBUG _handle_module_layer_reuse ENTRY: module_name={module_name}")
-            print(f"  input_var={input_var}, output_var={output_var}")
-            print(f"  module_obj.name={getattr(module_obj, 'name', 'NO NAME')}, input_var={getattr(module_obj, 'input_var', None)}, output_var={getattr(module_obj, 'output_var', None)}")
 
         # Clone the layer with is_layer_call=True to skip __init__ definition
-        if module_name == 'dropout':
-            print(f"DEBUG: Before deepcopy, module_obj.name={module_obj.name}, id={id(module_obj)}")
         reused_layer = copy.deepcopy(module_obj)
-        if module_name == 'dropout':
-            print(f"DEBUG: After deepcopy, reused_layer.name={reused_layer.name}, id={id(reused_layer)}")
-            print(f"DEBUG: After deepcopy, module_obj.name={module_obj.name}, id={id(module_obj)}")
         reused_layer.name = module_name  # Reset to base name before adding suffix
         reused_layer.is_layer_call = True
         # Set the input/output vars for THIS reused instance
         reused_layer.input_var = input_var
         reused_layer.output_var = output_var
-        if module_name == 'dropout':
-            print(f"DEBUG: Before _add_layer_with_tracking, reused_layer.name={reused_layer.name}, input_var={reused_layer.input_var}, output_var={reused_layer.output_var}")
         # Add with tracking - this adds counter suffix and appends to modules
         self._add_layer_with_tracking(reused_layer)
-        if module_name == 'dropout':
-            print(f"DEBUG: After _add_layer_with_tracking, reused_layer.name={reused_layer.name}")
         # Set module input and mark split reuse
         self._set_module_input(reused_layer, input_var)
         self._mark_split_input_reuse(reused_layer, input_var)
@@ -1721,12 +1708,6 @@ class ASTParserTF(ASTParser):
         output_var = node.targets[0].id
 
         module_obj = self._find_module_by_name(module_name)
-
-        if module_name == 'dropout':
-            print(f"DEBUG _process_self_module_call: module_name={module_name}")
-            print(f"  input_var={input_var}, output_var={output_var}")
-            print(f"  module_obj.name={getattr(module_obj, 'name', 'NO NAME')}, input_var={getattr(module_obj, 'input_var', None)}, output_var={getattr(module_obj, 'output_var', None)}")
-            print(f"  module_obj in buml_model.modules: {module_obj in self.buml_model.modules if module_obj else False}")
 
         # Check if this is a sub_nn (Sequential) - same pattern as torch2tf
         is_subnn = False
