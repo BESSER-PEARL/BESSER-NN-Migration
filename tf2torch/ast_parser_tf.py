@@ -2778,10 +2778,17 @@ def _extract_dropout_params(lyr_type, lyr_params):
 
     return dropout_rate, has_recurrent_dropout
 
-def _map_param(param, value, updated_params):
+def _map_param(param, value, updated_params, lyr_type=None):
     """Map a single parameter from TF to BUML."""
     if param == "activation":
-        updated_params["actv_func"] = value
+        # LSTM and GRU have tanh hardcoded internally - skip their activation parameter
+        # to avoid creating extra activation layers
+        if lyr_type in ["LSTM", "GRU"]:
+            # Skip - internal activation, not a separate layer
+            pass
+        else:
+            # For SimpleRNN (maps to nonlinearity param) and Dense/other layers (separate activation)
+            updated_params["actv_func"] = value
     elif param in ["return_sequences", "return_state", "dropout", "recurrent_dropout", "units", "positional_params", "name"]:
         pass
     elif param == "mask_zero":
@@ -2828,7 +2835,7 @@ def process_params(lyr_type: str, lyr_params: dict):
     dropout_rate, has_recurrent_dropout = _extract_dropout_params(lyr_type, lyr_params)
 
     for param, value in lyr_params.items():
-        _map_param(param, value, updated_lyr_params)
+        _map_param(param, value, updated_lyr_params, lyr_type)
 
     _determine_rnn_return_type(lyr_type, lyr_params, updated_lyr_params)
     set_static_params(lyr_type, updated_lyr_params, static_params)
