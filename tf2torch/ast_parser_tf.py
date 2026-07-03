@@ -2461,14 +2461,49 @@ class ASTParserTF(ASTParser):
                 loss = node.value.func.attr
                 config["loss_function"] = loss_func_mapping[loss]
             elif node.value.func.attr == "image_dataset_from_directory":
-                batch_size = next(
-                    (k.value.value for k in node.value.keywords
-                     if k.arg == "batch_size"),
+                batch_size_kwarg = next(
+                    (k for k in node.value.keywords if k.arg == "batch_size"),
                     None
                 )
-                if batch_size is not None:
-                    config["batch_size"] = batch_size
+                if batch_size_kwarg is not None:
+                    # Handle both constant values and variable references
+                    if isinstance(batch_size_kwarg.value, ast.Constant):
+                        config["batch_size"] = batch_size_kwarg.value.value
+                    elif isinstance(batch_size_kwarg.value, ast.Name):
+                        # Variable reference - we'll need to track it from outer scope
+                        # For now, skip setting batch_size in config
+                        pass
 
+    def visit_Expr(self, node: ast.Expr):
+        """
+        Visit expression statements to extract epochs from train function calls.
+        TF code has: train(model, train_loader, criterion, optimizer, epochs, num_classes)
+        So epochs is at index 4 (5th parameter).
+        """
+        if (hasattr(self, 'inside_nn_class') and self.inside_nn_class) or \
+           (hasattr(self, 'inside_method') and self.inside_method):
+            self.generic_visit(node)
+            return
+
+        # Check if it's a function call to train/train_model
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+            func_name = node.value.func.id
+            if func_name in ['train', 'train_model']:
+                # Check keyword argument first (explicit epochs=N)
+                for keyword in node.value.keywords:
+                    if keyword.arg == "epochs" and isinstance(keyword.value, ast.Constant):
+                        self.data_config["config"]["epochs"] = keyword.value.value
+                        break
+
+                # If not found in keywords, check positional arguments
+                # Standard signature: train(model, train_loader, criterion, optimizer, epochs, ...)
+                # epochs is the 5th parameter (index 4)
+                if "epochs" not in self.data_config["config"] and len(node.value.args) >= 5:
+                    epochs_arg = node.value.args[4]
+                    if isinstance(epochs_arg, ast.Constant):
+                        self.data_config["config"]["epochs"] = epochs_arg.value
+
+        self.generic_visit(node)
 
     def handle_outer_assignments(self, node: ast.Assign):
         """

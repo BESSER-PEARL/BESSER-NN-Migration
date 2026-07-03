@@ -3624,6 +3624,37 @@ class ASTParserTorch(ASTParser):
         else:
             self.unprocessed_nodes.append(node)
 
+    def visit_Expr(self, node: ast.Expr):
+        """
+        Visit expression statements to extract epochs from train function calls.
+        We see train(model, train_loader, criterion, optimizer, 10) and need to extract 10.
+        The train function signature is: train(model, train_loader, criterion, optimizer, epochs)
+        So epochs is at index 4 (5th parameter).
+        """
+        if (hasattr(self, 'inside_nn_class') and self.inside_nn_class) or \
+           (hasattr(self, 'inside_method') and self.inside_method):
+            self.generic_visit(node)
+            return
+
+        # Check if it's a function call to train/train_model
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+            func_name = node.value.func.id
+            if func_name in ['train', 'train_model']:
+                # Check keyword argument first (explicit epochs=N)
+                for keyword in node.value.keywords:
+                    if keyword.arg == "epochs" and isinstance(keyword.value, ast.Constant):
+                        self.data_config["config"]["epochs"] = keyword.value.value
+                        break
+
+                # If not found in keywords, check positional arguments
+                # Standard signature: train(model, train_loader, criterion, optimizer, epochs)
+                # epochs is the 5th parameter (index 4)
+                if "epochs" not in self.data_config["config"] and len(node.value.args) >= 5:
+                    epochs_arg = node.value.args[4]
+                    if isinstance(epochs_arg, ast.Constant):
+                        self.data_config["config"]["epochs"] = epochs_arg.value
+
+        self.generic_visit(node)
 
 
 

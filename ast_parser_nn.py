@@ -261,7 +261,12 @@ class ASTParser(ast.NodeVisitor):
                     isinstance(node.iter.func, ast.Name) and
                     node.iter.func.id == "range" and
                     node.iter.args):
-                self.data_config["config"]["epochs"] = node.iter.args[0].value
+                # Handle both constant values and variable references
+                if isinstance(node.iter.args[0], ast.Constant):
+                    self.data_config["config"]["epochs"] = node.iter.args[0].value
+                elif isinstance(node.iter.args[0], ast.Name):
+                    # Variable reference - skip setting epochs in config
+                    pass
 
         else:
             self.generic_visit(node)
