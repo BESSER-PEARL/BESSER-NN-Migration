@@ -34,7 +34,8 @@ def main():
         output_dir=args.output_dir,
         generation_type=output_nn_type,
         channel_last=True,
-        strip_layer_counter_suffix=True
+        strip_layer_counter_suffix=True,
+        skip_validation=True
     )
     pytorch_model.generate()
 
