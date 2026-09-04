@@ -2,15 +2,18 @@
 It converts PyTorch code to BUML code.
 
 Argument:
-    filename (str): Path to a TensorFlow file containing 
+    filename (str): Path to a PyTorch file containing
         the code to transform.
     configfile (str, optional): Path to the configuration file that
         has the values of 'input_nn_type', 'output_nn_type', and 'only_nn'.
-    datashape (str): 
+    datashape (str, optional): The shape of the input data (optional).
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from besser.generators.nn.tf.tf_code_generator import TFGenerator
-from torch2tf.ast_parser_pytorch import (
+from ast_parser_pytorch import (
     ASTParserTorch
 )
 from transform_code import (
@@ -25,8 +28,10 @@ def main():
     buml_model, output_nn_type = transform(args, "PyTorch", ASTParserTorch)
 
     tf_model = TFGenerator(
-        model=buml_model, output_dir="output/migrated_nn",
-        generation_type=output_nn_type
+        model=buml_model,
+        output_dir=args.output_dir,
+        generation_type=output_nn_type,
+        strip_layer_counter_suffix=True
     )
     tf_model.generate()
 

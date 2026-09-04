@@ -1,5 +1,5 @@
 """
-Extracts input_shape from tensorflow conv and dense layers dynamically. 
+Extracts input_shape from tensorflow conv and dense layers dynamically.
 This is specific to conv and dense layers.
 These layer attributes are needed when transforming tensorflow
 code to pytorch code.
@@ -7,6 +7,7 @@ code to pytorch code.
 import subprocess
 import re
 import sys
+sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 import os
 import ast
 from ast import literal_eval
@@ -130,14 +131,27 @@ def get_shape(lyr_details: dict, layer: tf.keras.layers.Layer, index: int,
     """
 
     lyrs = (layers.Conv1D, layers.Conv2D, layers.Conv3D, layers.Dense,
-            layers.LSTM, layers.GRU, layers.RNN)
+            layers.LSTM, layers.GRU, layers.RNN, layers.LayerNormalization)
 
     if isinstance(layer, lyrs) or isinstance(layer, layers.Bidirectional):
         if isinstance(layer, layers.Bidirectional):
             layer = layer.layer
         cls_name = layer.__class__.__name__
-        # Record class type and shape before passing through layer
-        lyr_details[index] = [cls_name, x.shape[-1], lyr_name]
+
+        # For LayerNormalization, store full shape and axis
+        if isinstance(layer, layers.LayerNormalization):
+            # Store: [class_name, full_input_shape (excluding batch), axis, layer_name]
+            input_shape = [int(d) for d in x.shape[1:]]  # Exclude batch, convert to int
+            axis = layer.axis if hasattr(layer, 'axis') else [-1]
+            # Normalize axis to list of plain Python ints
+            if not isinstance(axis, list):
+                axis = [int(axis)]
+            else:
+                axis = [int(a) for a in axis]
+            lyr_details[index] = [cls_name, input_shape, axis, lyr_name]
+        else:
+            # Record class type and last dim shape for other layers
+            lyr_details[index] = [cls_name, x.shape[-1], lyr_name]
 
     x = layer(x)
     return x
@@ -257,6 +271,10 @@ def extract_and_modify_code(file_path: str, shape: tuple | None,
 
     for mdl_name, mdl_details in input_shape_all.items():
         if input_shape_from_call.get(mdl_details[-1], None):
+            # Skip overwrite for LayerNormalization: it has axis info in position [2]
+            # and full shape in position [1]
+            if mdl_details[0] == 'LayerNormalization':
+                continue
             if not isinstance(mdl_details[-2], dict):
                 mdl_details[1] = input_shape_from_call[mdl_details[-1]][-1][-1]
 
@@ -287,7 +305,7 @@ def extract_dict_from_output(output: str):
     Returns:
         A python dictionary or None if not found.
     """
-    # Regular expression to match the first dictionary-like structure
+    # Regular expression to match the first dictionary like structure
     # Match everything starting with `{` and ending with `}`, considering
     # nested braces
     match = re.search(r'\{.*\}', output.strip())
@@ -382,13 +400,31 @@ def update_layers_attr(lyr_input_shapes: dict, counter: int,
         mdl_type_tf = mdl_type
 
     if mdl_type_tf == lyr_input_shapes[counter][0]:
-        in_feat = lyr_input_shapes[counter][1]
-        if mdl_type_tf == "Dense":
-            module_obj.in_features = in_feat
-        elif mdl_type_tf in ["LSTM", "RNN", "GRU"]:
-            module_obj.input_size = in_feat
+        if mdl_type_tf == "LayerNormalization":
+            # For LayerNormalization: extract dimensions based on axis
+            # lyr_input_shapes[counter] = [class_name, full_shape, axis, layer_name]
+            full_shape = lyr_input_shapes[counter][1]
+            axis_list = lyr_input_shapes[counter][2]
+
+            # Normalize axis to positive indices
+            normalized_axis = []
+            for ax in axis_list:
+                if ax < 0:
+                    normalized_axis.append(len(full_shape) + ax)
+                else:
+                    normalized_axis.append(ax)
+
+            # Extract sizes of dimensions to normalize (in order)
+            normalized_shape = [full_shape[ax] for ax in sorted(normalized_axis)]
+            module_obj.normalized_shape = normalized_shape
         else:
-            module_obj.in_channels = in_feat
+            in_feat = lyr_input_shapes[counter][1]
+            if mdl_type_tf == "Dense":
+                module_obj.in_features = in_feat
+            elif mdl_type_tf in ["LSTM", "RNN", "GRU"]:
+                module_obj.input_size = in_feat
+            else:
+                module_obj.in_channels = in_feat
         counter = increment_counter(counter, lyr_input_shapes)
 
     return counter

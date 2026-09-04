@@ -4,14 +4,15 @@ written in PyTorch and transforms it to a BUML model.
 It also extracts data and model configuration attributes.
 """
 import ast
-import copy
 import sys
+sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 from besser.BUML.metamodel.nn import NN, Layer
 import besser.BUML.metamodel.nn as mm_classes
+
 from torch2tf.definitions import (
     layers_mapping, params_mapping, static_params,
     pos_params, int2list_params, lyrs_of_int2list_params,
-    actv_fun_mapping, channels_first_layers, loss_func_mapping,
+    actv_fun_mapping, cnn_layers, loss_func_mapping,
     functional_to_module_mapping
 )
 from ast_parser_nn import ASTParser
@@ -21,60 +22,6 @@ from transform_code import (
 
 
 class ASTParserTorch(ASTParser):
-    def _cleanup_temp_variables(self):
-        """
-        Replace temporary variables (_chain_temp, _nested_temp, etc.) with cleaner names.
-        This runs after all forward method processing to preserve original variable names.
-        """
-        # Collect all temp variable patterns
-        temp_patterns = [
-            self.TEMP_CHAIN.split('{')[0],      # _chain_temp_
-            self.TEMP_NESTED.split('{')[0],     # _nested_temp_
-            self.TEMP_NESTED_IN_CHAIN.split('{')[0],  # _nested_in_chain_
-        ]
-
-        temp_vars = set()
-
-        # For each temp variable, find what it should be renamed to
-        # Strategy: if a temp is only used as input to one operation that outputs to a real var,
-        # replace the temp with that real var
-        for temp_var in temp_vars:
-            # CRITICAL FIX: Don't collapse _nested_temp_* if produced by a reused layer
-            # In nested calls like r = proj(dropout(m)) where dropout is reused,
-            # we need _nested_temp_2 = dropout_use_1(m) as an intermediate assignment
-            if temp_var.startswith(self.TEMP_NESTED.split('{')[0]):
-                # Check if this temp is produced by a reused layer (contains "_use_")
-                producer = self.module_of_output.get(temp_var)
-                if producer and '_use_' in producer:
-                    # Skip this temp variable - must be preserved for layer reuse
-                    continue
-
-            # Find operations that use this temp as input
-            consumers = []
-
-            # If temp has exactly 1 consumer and that consumer outputs to a non-temp var,
-            # replace the temp with the consumer's output var
-            if len(consumers) == 1:
-                consumer_key = consumers[0]
-                consumer_out = None
-                # Check if consumer output is not a temp
-                is_consumer_out_temp = any(consumer_out.startswith(p) for p in temp_patterns) if consumer_out else False
-
-                if not is_consumer_out_temp and consumer_out:
-                    # Update module_of_output
-                    if temp_var in self.module_of_output:
-                        if consumer_out not in self.module_of_output:
-                            self.module_of_output[consumer_out] = self.module_of_output[temp_var]
-                        del self.module_of_output[temp_var]
-
-                    # CRITICAL: Also update tensorop/layer object attributes
-                    for module in self.buml_model.modules:
-                        if module.output_var is not None and module.output_var == temp_var:
-                            module.output_var = consumer_out
-                        if module.input_var is not None and module.input_var == temp_var:
-                            module.input_var = consumer_out
-
-
     """
     Class visiting and parsing PyTorch code AST.
 
@@ -141,14 +88,10 @@ class ASTParserTorch(ASTParser):
         self.variable_aliases = {}  # {alias_var: source_var}
         # Track multi-layer RNNs: {module_name: [layer_name_0, layer_name_1, ...]}
         self.multi_layer_rnns = {}
-        # Track original num_layers for multi-layer RNNs: {module_name: num_layers}
-        self.rnn_num_layers = {}
         # Track layer reuse count for creating unique reuse names
         self.layer_reuse_count = {}  # {layer_name: reuse_count}
         # Track the output variable of the immediately previous layer
         self.prev_layer_output = None  # str: variable name
-        # Counter for adding unique suffix to ALL layer names
-        self.layer_counter = 0
         # Note: migration_warnings inherited from base ASTParser class
         # Performance optimization: O(1) lookup dicts instead of O(n) searches
         self.layer_by_name = {}  # {layer_name: layer_obj}
@@ -176,36 +119,14 @@ class ASTParserTorch(ASTParser):
             "pad": lambda cn, n, args: self._extract_op_pad(cn, n, args),
             "dropout": lambda cn, n, args: self._extract_op_dropout(cn, n, args),
             "zeros_like": lambda cn, n, args: self._extract_op_zeros_like(cn, args),
-            "split": lambda cn, n, args: self._extract_op_split(cn, n, args),
-            "chunk": lambda cn, n, args: self._extract_op_chunk(cn, n, args),
         }
 
     def _add_layer_with_tracking(self, layer_obj):
-        """
-        Add layer to model with counter suffix and update lookup dict for O(1) access.
-        All layers get a suffix like _1, _2, etc. to ensure unique keys in modules_details.
-        The generator strips this suffix when creating layer syntax and uses is_layer_call
-        to skip duplicate definitions in __init__.
-        """
+        """Add layer to model and update lookup dict for O(1) access."""
+        self.buml_model.add_layer(layer_obj)
         if hasattr(layer_obj, 'name'):
-            base_name = layer_obj.name
-            # Store base name for lookups (before adding suffix)
-            if base_name not in self.layer_by_name:
-                self.layer_by_name[base_name] = layer_obj
-                self.module_by_name[base_name] = layer_obj
-
-            # Add suffix to ALL layers using _c prefix to distinguish from other _N suffixes
-            self.layer_counter += 1
-            layer_obj.name = f"{base_name}_c{self.layer_counter}"
-
-            # Store in lookup dicts using the SUFFIXED name
             self.layer_by_name[layer_obj.name] = layer_obj
             self.module_by_name[layer_obj.name] = layer_obj
-
-        try:
-            self.buml_model.add_layer(layer_obj)
-        except Exception as e:
-            self.migration_warnings.append(f"Failed to add layer '{layer_obj.name}': {str(e)}")
 
     def _add_module_with_tracking(self, module_obj):
         """Add module to model and update lookup dict for O(1) access."""
@@ -246,9 +167,6 @@ class ASTParserTorch(ASTParser):
         # Call parent's visit_ClassDef to do the actual parsing
         super().visit_ClassDef(node)
 
-        # Clean up temporary variables to preserve original names
-        self._cleanup_temp_variables()
-
         # After parsing, check for unused LSTM cell states
         if self.forward_node and self.lstm_cell_vars:
             self._mark_unused_cell_states(self.forward_node)
@@ -257,62 +175,35 @@ class ASTParserTorch(ASTParser):
         if hasattr(self, '_bidirectional_concat_var_names'):
             self.buml_model.bidirectional_concat_var_names = self._bidirectional_concat_var_names
 
-    def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> list:
+    def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
         """
-        Extract the subscript/slice pattern from an AST Subscript node as a structured list.
+        Extract the subscript/slice pattern from an AST Subscript node as a string.
 
         Parameters:
             subscript_node (ast.Subscript): The AST subscript node
 
         Returns:
-            list: List of dicts representing subscript pattern
-                  e.g., [{"type": "index", "value": -1}] for [-1]
-                  e.g., [{"type": "slice", "start": None, "stop": None, "step": None},
-                         {"type": "index", "value": -1}] for [:, -1]
+            str: String representation of the subscript pattern (e.g., "[-1]", "[:, -1, :]")
         """
-        def parse_slice_element(slice_node):
+        def slice_to_string(slice_node):
             if isinstance(slice_node, ast.Slice):
-                # Parse slice object
-                start = None
-                stop = None
-                step = None
-
-                if slice_node.lower:
-                    if isinstance(slice_node.lower, ast.Constant):
-                        start = slice_node.lower.value
-                    elif isinstance(slice_node.lower, ast.UnaryOp) and isinstance(slice_node.lower.op, ast.USub):
-                        start = -slice_node.lower.operand.value
-
-                if slice_node.upper:
-                    if isinstance(slice_node.upper, ast.Constant):
-                        stop = slice_node.upper.value
-                    elif isinstance(slice_node.upper, ast.UnaryOp) and isinstance(slice_node.upper.op, ast.USub):
-                        stop = -slice_node.upper.operand.value
-
-                if slice_node.step:
-                    if isinstance(slice_node.step, ast.Constant):
-                        step = slice_node.step.value
-                    elif isinstance(slice_node.step, ast.UnaryOp) and isinstance(slice_node.step.op, ast.USub):
-                        step = -slice_node.step.operand.value
-
-                return {"type": "slice", "start": start, "stop": stop, "step": step}
-            else:
-                # Single index
-                if isinstance(slice_node, ast.Constant):
-                    return {"type": "index", "value": slice_node.value}
-                elif isinstance(slice_node, ast.UnaryOp) and isinstance(slice_node.op, ast.USub):
-                    return {"type": "index", "value": -slice_node.operand.value}
+                lower = ast.unparse(slice_node.lower) if slice_node.lower else ""
+                upper = ast.unparse(slice_node.upper) if slice_node.upper else ""
+                step = ast.unparse(slice_node.step) if slice_node.step else ""
+                if step:
+                    return f"{lower}:{upper}:{step}"
                 else:
-                    # Fallback for complex expressions - use unparsed string as value
-                    return {"type": "index", "value": ast.unparse(slice_node)}
+                    return f"{lower}:{upper}" if lower or upper else ":"
+            elif isinstance(slice_node, ast.Tuple):
+                # Multi-dimensional slicing like [:, -1, :]
+                elements = [slice_to_string(elt) for elt in slice_node.elts]
+                return ", ".join(elements)
+            else:
+                # Single index like -1 or 0
+                return ast.unparse(slice_node)
 
-        # Handle multi-dimensional or single subscript
-        if isinstance(subscript_node.slice, ast.Tuple):
-            # Multi-dimensional like [:, -1, :]
-            return [parse_slice_element(elt) for elt in subscript_node.slice.elts]
-        else:
-            # Single dimension like [-1] or [:]
-            return [parse_slice_element(subscript_node.slice)]
+        pattern = slice_to_string(subscript_node.slice)
+        return f"[{pattern}]"
 
     def _resolve_variable_alias(self, var):
         """Resolve variable aliases to find the actual source."""
@@ -344,22 +235,24 @@ class ASTParserTorch(ASTParser):
         """
         op_name = self.TEMP_SUBSCRIPT_OP.format(self.tensor_op_counter)
         self.tensor_op_counter += 1
+
         resolved_var = self._resolve_variable_alias(source_var)
         source_module = self.module_of_output.get(resolved_var, resolved_var)
 
+        print(f"[DEBUG create_subscript_tensorop] source_var={source_var}, resolved_var={resolved_var}, source_module={source_module}, output_var={output_var}, op_name={op_name}")
 
         # Strip __hidden or __cell suffix from source_module for tensorop
-        if source_module and source_module.endswith("__hidden"):
+        if source_module.endswith("__hidden"):
             source_module = source_module[:-8]
-        elif source_module and source_module.endswith("__cell"):
+        elif source_module.endswith("__cell"):
             source_module = source_module[:-6]
 
         subscript_op = self._create_subscript_op(op_name, source_module, subscript_pattern)
         self.buml_model.modules.append(subscript_op)
-        # NEW: Also set on tensorop object
-        subscript_op.input_var = resolved_var
-        subscript_op.output_var = output_var
+        self.inputs_outputs[op_name] = [resolved_var, output_var]
         self.module_of_output[output_var] = op_name
+        print(f"[DEBUG create_subscript_tensorop] Set inputs_outputs[{op_name}] = [{resolved_var}, {output_var}]")
+        print(f"[DEBUG create_subscript_tensorop] Set module_of_output[{output_var}] = {op_name}")
         # Update prev_layer_output so next operation can detect branching
         self.prev_layer_output = output_var
 
@@ -398,46 +291,16 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but creates TensorOp or sets RNN return_type
         """
-        # If subscript value is a call (e.g., self.conv(x)[:, :, 0]), process it first
-        if isinstance(subscript_node.value, ast.Call):
-            inner_temp = self.TEMP_NESTED.format(self.tensor_op_counter)
-            self.tensor_op_counter += 1
-            inner_target = ast.Name(id=inner_temp, ctx=ast.Store())
-            inner_node = ast.Assign(targets=[inner_target], value=subscript_node.value)
-            inner_node.lineno = node.lineno
-            inner_node.col_offset = node.col_offset
-            self.process_single_call(inner_node)
-            self.previous_assign = inner_node
-
-            # CRITICAL FIX: Update the nested layer's output_var to match the final subscript output
-            # For nested subscript like self.conv(x)[:, 0, :], we want:
-            #   _subscript_temp_1 = self.conv(x)
-            #   _subscript_temp_1 = _subscript_temp_1[:, 0, :]
-            # NOT:
-            #   _nested_temp_2 = self.conv(x)
-            #   _subscript_temp_1 = _nested_temp_2[:, 0, :]
-            if inner_temp in self.module_of_output:
-                module_name = self.module_of_output[inner_temp]
-                module_obj = self._get_layer_by_name(module_name)
-                if module_obj:
-                    module_obj.output_var = temp_name
-                    self.module_of_output[temp_name] = module_name
-                    # Use the updated variable name for the subscript input
-                    subscripted_var = temp_name
-            else:
-                subscripted_var = inner_temp
-            # Update the subscript node to reference the temp variable
-            subscript_node.value = ast.Name(id=inner_temp, ctx=ast.Load())
-        else:
-            subscripted_var = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else None
-
+        subscripted_var = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else None
         subscript_assign = self._create_temp_assignment(temp_name, subscript_node, node)
 
+        print(f"[DEBUG handle_subscript] subscripted_var={subscripted_var}, temp_name={temp_name}, is_rnn={self._is_rnn_subscript(subscripted_var)}")
 
         if self._is_rnn_subscript(subscripted_var):
             self.handle_forward_slicing(subscript_assign)
         else:
             subscript_pattern = self.extract_subscript_pattern(subscript_node)
+            print(f"[DEBUG handle_subscript] Creating subscript tensorop: var={subscripted_var}, pattern={subscript_pattern}, temp={temp_name}")
             self.create_subscript_tensorop(subscripted_var, subscript_pattern, temp_name)
 
         self.previous_assign = subscript_assign
@@ -446,15 +309,10 @@ class ASTParserTorch(ASTParser):
         """Create parameters for individual RNN layer in multi-layer stack."""
         layer_params = lyr_params.copy()
         layer_params.pop('num_layers', None)
-        layer_params['name'] = f"{module_name}_layer_{i+1}"
+        layer_params['name'] = f"{module_name}_layer_{i}"
 
         if i > 0:
-            # For layers after the first, input_size = hidden_size of previous layer
-            # If previous layer is bidirectional, multiply by 2
-            prev_hidden_size = lyr_params['hidden_size']
-            if lyr_params.get('bidirectional', False):
-                prev_hidden_size *= 2
-            layer_params['input_size'] = prev_hidden_size
+            layer_params['input_size'] = lyr_params['hidden_size']
 
         if i < num_layers - 1:
             layer_params['return_type'] = 'full'
@@ -465,15 +323,11 @@ class ASTParserTorch(ASTParser):
         return layer_params
 
     def _add_rnn_layer(self, lyr_type, layer_params):
-        """Transform and create a single RNN layer, store in lookup dicts."""
+        """Transform and add a single RNN layer to BUML model."""
         try:
             buml_lyr_type, buml_params = transform_layer(lyr_type, layer_params, layer_params['name'])
             buml_layer = getattr(mm_classes, buml_lyr_type)(**buml_params)
-            # Store in lookup dicts but DON'T add to model yet
-            # Layer will be added via _add_layer_with_tracking when processing forward()
-            layer_name = layer_params['name']
-            self.layer_by_name[layer_name] = buml_layer
-            self.module_by_name[layer_name] = buml_layer
+            self.buml_model.add_layer(buml_layer)
         except ValueError as e:
             self.migration_warnings.append(f"Layer '{layer_params['name']}': {str(e)}")
 
@@ -482,30 +336,14 @@ class ASTParserTorch(ASTParser):
         process_positional_params(lyr_type, lyr_params, pos_params)
         num_layers = lyr_params.get('num_layers', 1)
         original_return_type = lyr_params.get('return_type', 'full')
-        dropout_rate = lyr_params.get('dropout', 0.0)
         layer_names = []
 
         for i in range(num_layers):
             layer_params = self._create_rnn_layer_params(lyr_params, i, num_layers, module_name, original_return_type)
-            # Remove dropout from individual layers - will be added as separate layers instead
-            # because PyTorch dropout (between layers) != TensorFlow dropout (on inputs)
-            layer_params['dropout'] = 0.0
             layer_names.append(layer_params['name'])
             self._add_rnn_layer(lyr_type, layer_params)
 
-            # Create dropout layer between RNN layers (not after last layer)
-            if i < num_layers - 1 and dropout_rate > 0:
-                dropout_name = f"{module_name}_dropout_{i+1}"
-                dropout_layer = getattr(mm_classes, "DropoutLayer")(
-                    name=dropout_name,
-                    rate=dropout_rate
-                )
-                # Store in lookup dicts - will be inserted in forward() via expand_multi_layer_rnn_call
-                self.layer_by_name[dropout_name] = dropout_layer
-                self.module_by_name[dropout_name] = dropout_layer
-
         self.multi_layer_rnns[module_name] = layer_names
-        self.rnn_num_layers[module_name] = num_layers
 
     def _create_single_layer(self, lyr_type, lyr_params, module_name):
         """Create single BUML layer."""
@@ -513,18 +351,15 @@ class ASTParserTorch(ASTParser):
         try:
             lyr_type, lyr_params = transform_layer(lyr_type, lyr_params, module_name)
             buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-            # Store in lookup dict but DON'T add to model yet
-            # Layer will be added via _add_layer_with_tracking when processing forward()
-            self.layer_by_name[module_name] = buml_layer
-            self.module_by_name[module_name] = buml_layer
-        except Exception as e:
+            self.buml_model.add_layer(buml_layer)
+        except ValueError as e:
             self.migration_warnings.append(f"Layer '{module_name}': {str(e)}")
 
     def handle_init(self, node: ast.Assign):
         """
         It retrieves the sub_nn layers, adds their activation functions
         as parameters and stores them in the 'sub_nn' dict. It also
-        retrieves the layers and their parameters and stores them in
+        retreives the layers and their parameters and stores them in
         the 'layers' dict.
 
         Parameters:
@@ -593,7 +428,7 @@ class ASTParserTorch(ASTParser):
 
         if last_lyr is not None:
             last_lyr_type = subnn.layers[-1].__class__.__name__
-            if last_lyr_type in channels_first_layers:
+            if last_lyr_type in cnn_layers:
                 subnn.layers[-1].permute_out = True
                 return False
         return True
@@ -663,19 +498,11 @@ class ASTParserTorch(ASTParser):
         return chain
 
     def _process_nested_call_in_chain(self, call, node):
-        """
-        Extract and process nested call within a chain element.
-        Recursively handles multiple levels of nesting like pool(act(conv(x))).
-        """
+        """Extract and process nested call within a chain element."""
         if not (isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Call)):
             return
 
         inner_call = call.args[0]
-
-        # RECURSIVELY process nested calls within the inner call
-        # For pool(act(conv(x))), this extracts conv(x) from within act()
-        self._process_nested_call_in_chain(inner_call, node)
-
         inner_temp = self.TEMP_NESTED_IN_CHAIN.format(self.tensor_op_counter)
         self.tensor_op_counter += 1
         inner_target = ast.Name(id=inner_temp, ctx=ast.Store())
@@ -712,7 +539,6 @@ class ASTParserTorch(ASTParser):
     def _process_chained_calls(self, node):
         """Process chained method calls by decomposing and handling each element."""
         chain = self.decompose_chained_call(node)
-        all_temp_names = []  # Track all temp variables created in this chain
 
         for i, call in enumerate(chain):
             is_last = (i == len(chain) - 1)
@@ -725,7 +551,6 @@ class ASTParserTorch(ASTParser):
                 temp_target = ast.Name(id=temp_name, ctx=ast.Store())
                 synthetic_node = ast.Assign(targets=[temp_target], value=call)
                 self._link_chain_calls(chain, i, temp_name)
-                all_temp_names.append(temp_name)
 
             # Handle nested calls within this chain element
             self._process_nested_call_in_chain(call, node)
@@ -743,28 +568,6 @@ class ASTParserTorch(ASTParser):
 
             if is_nested_activ:
                 self.is_processing_nested_outer = False
-
-        # Clean up chain temp variables to preserve original variable names
-        if len(chain) > 1 and all_temp_names:
-            target_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
-            if not target_var:
-                return
-
-            # Replace all temp variables in the chain with target_var
-            # This handles chains of any length (2+)
-            for temp_name in all_temp_names:
-                # Update module_of_output: transfer temp's module to target_var
-                if temp_name in self.module_of_output:
-                    if target_var not in self.module_of_output:
-                        self.module_of_output[target_var] = self.module_of_output[temp_name]
-                    del self.module_of_output[temp_name]
-
-                # CRITICAL: Also update module object attributes (layers AND tensorops)
-                for module in self.buml_model.modules:
-                    if module.output_var is not None and module.output_var == temp_name:
-                        module.output_var = target_var
-                    if module.input_var is not None and module.input_var == temp_name:
-                        module.input_var = target_var
 
     def handle_forward_simple_call(self, node: ast.Assign):
         """
@@ -801,13 +604,7 @@ class ASTParserTorch(ASTParser):
         self.tensor_op_counter += 1
 
         self.handle_subscript_operation(subscript_node, temp_name, node)
-
-        # Check if this created an alias (no-op subscript) and use the base variable instead
-        if temp_name in self.variable_aliases:
-            base_var = self.variable_aliases[temp_name]
-            node.value.args[0] = ast.Name(id=base_var, ctx=ast.Load())
-        else:
-            node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
+        node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
 
     def _is_noop_squeeze(self, call_node):
         """Check if a call is a no-op squeeze(0) on single-layer RNN hidden state."""
@@ -866,42 +663,24 @@ class ASTParserTorch(ASTParser):
 
         inner_call = node.value.args[0]
 
-        # Check if inner call is a no-op squeeze: if so, skip intermediate and use base var
+        # Check if inner call is a no-op squeeze - if so, skip intermediate and use base var
         if self._is_noop_squeeze(inner_call):
             base_var = inner_call.func.value.id
             node.value.args[0] = ast.Name(id=base_var, ctx=ast.Load())
             return False  # Not treated as nested since we're bypassing it
 
-        # Use the outer output variable instead of creating a temp variable
-        # For x = F.relu(self.bn(self.conv(x))), use 'x' throughout
-        # BUT for shape operations like .size(), use synthetic variable to avoid type conflicts
-        outer_var = node.targets[0].id
-
-        # Check if inner call is a shape operation
-        is_shape_op = (isinstance(inner_call, ast.Call) and
-                       hasattr(inner_call.func, 'attr') and
-                       inner_call.func.attr in ('size', 'shape'))
-
-        if is_shape_op:
-            # Use synthetic variable for shape operations to preserve tensor variable
-            temp_var_name = f"_shape_{self.tensor_op_counter}"
-            temp_target = ast.Name(id=temp_var_name, ctx=ast.Store())
-        else:
-            temp_target = ast.Name(id=outer_var, ctx=ast.Store())
+        temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
+        self.tensor_op_counter += 1
+        temp_target = ast.Name(id=temp_name, ctx=ast.Store())
 
         inner_node = ast.Assign(targets=[temp_target], value=inner_call)
         inner_node.lineno = node.lineno
         inner_node.col_offset = node.col_offset
 
-        # Handle subscript arguments in the inner call before processing
-        self._handle_subscript_argument(inner_node)
-
         self.visit_Assign(inner_node)
         self.previous_assign = inner_node
 
-        # Replace the inner call with reference to the temp variable
-        replacement_var = temp_var_name if is_shape_op else outer_var
-        node.value.args[0] = ast.Name(id=replacement_var, ctx=ast.Load())
+        node.value.args[0] = ast.Name(id=temp_name, ctx=ast.Load())
         return True
 
     def process_single_call(self, node: ast.Assign):
@@ -930,60 +709,31 @@ class ASTParserTorch(ASTParser):
         """Process last layer with tuple assignment in multi-layer RNN."""
         self._extract_tuple_target_vars(node, layer_name)
         rnn_out = self._determine_rnn_return_type(node, layer_name)
-
-        # Extract the actual sequence output variable (first element)
-        first_elem = node.targets[0].elts[0]
-        if isinstance(first_elem, ast.Name):
-            sequence_output_var = first_elem.id
-        else:
-            sequence_output_var = None
-
+        self.inputs_outputs[layer_name] = [current_input, rnn_out]
 
         lyr_obj = self._get_layer_by_name(layer_name)
         if lyr_obj:
-            # NEW: Set input/output on layer object
-            lyr_obj.input_var = current_input
-            # output_var should be the sequence output (first element), not rnn_out (main output)
-            lyr_obj.output_var = sequence_output_var
             self.buml_model.modules.append(lyr_obj)
 
     def _process_last_layer_simple(self, node, layer_name, current_input):
         """Process last layer with simple assignment in multi-layer RNN."""
         output_var = node.targets[0].id
+        self.inputs_outputs[layer_name] = [current_input, output_var]
         self.module_of_output[output_var] = layer_name
 
         lyr_obj = self._get_layer_by_name(layer_name)
         if lyr_obj:
-            # NEW: Set input/output on layer object
-            lyr_obj.input_var = current_input
-            lyr_obj.output_var = output_var
             self.buml_model.modules.append(lyr_obj)
 
     def _process_intermediate_layer(self, module_name, layer_name, current_input, i):
         """Process intermediate layer in multi-layer RNN."""
         temp_var = self.TEMP_MLRNN.format(module_name, i + 1)
+        self.inputs_outputs[layer_name] = [current_input, temp_var]
         self.module_of_output[temp_var] = layer_name
 
         module_obj = self._get_layer_by_name(layer_name)
         if module_obj:
-            # NEW: Set input/output on layer object
-            module_obj.input_var = current_input
-            module_obj.output_var = temp_var
-        if module_obj:
             self.buml_model.modules.append(module_obj)
-
-        # Check if there's a dropout layer after this intermediate RNN layer
-        dropout_name = f"{module_name}_dropout_{i+1}"
-        dropout_obj = self._get_layer_by_name(dropout_name)
-        if dropout_obj:
-            # Insert dropout layer between RNN layers
-            dropout_temp_var = f"{temp_var}_dropout"
-            # NEW: Also set on dropout layer object
-            dropout_obj.input_var = temp_var
-            dropout_obj.output_var = dropout_temp_var
-            self.module_of_output[dropout_temp_var] = dropout_name
-            self.buml_model.modules.append(dropout_obj)
-            return dropout_temp_var
 
         return temp_var
 
@@ -1033,48 +783,46 @@ class ASTParserTorch(ASTParser):
             var2 = node.targets[0].elts[1].id
             var3 = None
 
+        print(f"[DEBUG _extract_tuple_target_vars] module_name={module_name}, var1={var1}, var2={var2}, var3={var3}")
 
         if var1 and var1 != "_":
             self.rnn_output_vars[module_name] = var1
             self.module_of_output[var1] = module_name
+            print(f"[DEBUG _extract_tuple_target_vars] Set rnn_output_vars[{module_name}] = {var1}")
+        else:
+            print(f"[DEBUG _extract_tuple_target_vars] SKIPPED var1 (is underscore or None)")
 
         if var2 and var2 != "_":
             self.rnn_hidden_vars[module_name] = var2
             # Track hidden state with special suffix to distinguish from output sequence
             self.module_of_output[var2] = module_name + "__hidden"
+            # Store in inputs_outputs for generator to use original variable name
             # For RNN tuple output (out, h), store hidden state with __hidden suffix
             # Use var2 as both input and output to preserve the original unpacked variable name
-            # NEW: Set hidden state variable on layer object
-            lyr_obj = self._get_layer_by_name(module_name)
-            if lyr_obj:
-                lyr_obj.hidden_state_var = var2
-                lyr_obj.hidden_unused = False
+            self.inputs_outputs[module_name + "__hidden"] = [var2, var2]
+            print(f"[DEBUG _extract_tuple_target_vars] Set rnn_hidden_vars[{module_name}] = {var2}, inputs_outputs[{module_name}__hidden] = [{var2}, {var2}]")
         elif var2 == "_":
             # Store "_" to tell generator to use underscore instead of auto-generating a name
-            # NEW: Mark hidden state as unused on layer object
-            lyr_obj = self._get_layer_by_name(module_name)
-            if lyr_obj:
-                lyr_obj.hidden_state_var = "_"
-                lyr_obj.hidden_unused = True
+            self.inputs_outputs[module_name + "__hidden"] = ["_", "_"]
+            print(f"[DEBUG _extract_tuple_target_vars] var2 is underscore, stored inputs_outputs[{module_name}__hidden] = ['_', '_']")
+        else:
+            print(f"[DEBUG _extract_tuple_target_vars] SKIPPED var2 (is None)")
 
         if var3 and var3 != "_":
             # Track cell state for LSTM with special suffix
             self.module_of_output[var3] = module_name + "__cell"
             # Store cell state variable name to check if it's used later
             self.lstm_cell_vars[module_name] = var3
+            # Store in inputs_outputs for generator
             # Use var3 as both input and output to preserve the original unpacked variable name
-            # NEW: Set cell state variable on layer object
-            lyr_obj = self._get_layer_by_name(module_name)
-            if lyr_obj:
-                lyr_obj.cell_state_var = var3
-                lyr_obj.cell_unused = False
+            self.inputs_outputs[module_name + "__cell"] = [var3, var3]
+            print(f"[DEBUG _extract_tuple_target_vars] Set lstm_cell_vars[{module_name}] = {var3}, inputs_outputs[{module_name}__cell] = [{var3}, {var3}]")
         elif var3 == "_":
             # Store "_" to tell generator to use underscore instead of auto-generating a name
-            # NEW: Mark cell state as unused on layer object
-            lyr_obj = self._get_layer_by_name(module_name)
-            if lyr_obj:
-                lyr_obj.cell_state_var = "_"
-                lyr_obj.cell_unused = True
+            self.inputs_outputs[module_name + "__cell"] = ["_", "_"]
+            print(f"[DEBUG _extract_tuple_target_vars] var3 is underscore, stored inputs_outputs[{module_name}__cell] = ['_', '_']")
+        else:
+            print(f"[DEBUG _extract_tuple_target_vars] SKIPPED var3 (is None)")
 
     def _determine_rnn_return_type(self, node, module_name):
         """Determine RNN return type and main output variable based on underscore pattern."""
@@ -1087,6 +835,7 @@ class ASTParserTorch(ASTParser):
 
         lyr_obj = self._get_layer_by_name(module_name)
 
+        print(f"[DEBUG _determine_rnn_return_type] module={module_name}, first_is_underscore={first_is_underscore}, second_is_underscore={second_is_underscore}, num_elts={num_elts}")
 
         if first_is_underscore and not second_is_underscore:
             rnn_out = node.targets[0].elts[1].elts[0].id if isinstance(node.targets[0].elts[1], ast.Tuple) else node.targets[0].elts[1].id
@@ -1100,6 +849,7 @@ class ASTParserTorch(ASTParser):
                     lyr_obj.return_type = "both"
                 else:
                     lyr_obj.return_type = "full"
+            print(f"[DEBUG _determine_rnn_return_type] Set return_type={'both' if (num_elts == 3 or isinstance(node.targets[0].elts[1], ast.Tuple)) else 'full'}, rnn_out={rnn_out}")
         else:
             rnn_out = node.targets[0].elts[0].id
             if lyr_obj:
@@ -1136,56 +886,12 @@ class ASTParserTorch(ASTParser):
                 # LSTM case: rnn(x, (h0, c0))
                 self._current_rnn_initial_hidden = "tuple_state"
             else:
-                # Complex expression (not supported yet)
+                # Complex expression - not supported yet
                 self._current_rnn_initial_hidden = None
         else:
             self._current_rnn_initial_hidden = None
 
         return input_var
-
-    def _handle_lstm_tuple_hx(self, node, module_obj):
-        """Handle LSTM case with (h, c) tuple initial state."""
-        if len(node.value.args) <= 1 or not isinstance(node.value.args[1], ast.Tuple):
-            return
-        if not node.value.args[1].elts or not isinstance(node.value.args[1].elts[0], ast.Name):
-            return
-
-        h_var = node.value.args[1].elts[0].id
-        if h_var in self.module_of_output:
-            source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
-            module_obj.hx_source = source_module
-            source_layer = self._get_layer_by_name(source_module)
-            if source_layer:
-                source_layer.input_reused = True
-
-    def _handle_simple_hx(self, module_obj):
-        """Handle simple case with single hidden state variable."""
-        if self._current_rnn_initial_hidden not in self.module_of_output:
-            return
-
-        source_module = self.module_of_output[self._current_rnn_initial_hidden].replace("__hidden", "").replace("__cell", "")
-        module_obj.hx_source = source_module
-        source_layer = self._get_layer_by_name(source_module)
-        if source_layer:
-            source_layer.input_reused = True
-
-        if source_module.startswith('op_'):
-            for mod in self.buml_model.modules:
-                if hasattr(mod, 'name') and mod.name == source_module:
-                    mod.is_rnn_initial_state = True
-                    break
-
-    def _process_rnn_initial_hidden(self, node, module_obj):
-        """Process initial hidden state for RNN seq2seq patterns."""
-        if not (module_obj and hasattr(self, '_current_rnn_initial_hidden') and self._current_rnn_initial_hidden):
-            return
-
-        if self._current_rnn_initial_hidden == "tuple_state":
-            self._handle_lstm_tuple_hx(node, module_obj)
-        else:
-            self._handle_simple_hx(module_obj)
-
-        self._current_rnn_initial_hidden = None
 
     def handle_forward_tuple_assignment(self, node: ast.Assign):
         """
@@ -1199,57 +905,75 @@ class ASTParserTorch(ASTParser):
         Returns:
             None, but populates the BUML model.
         """
+        # Check if this is a method call (e.g., x.max(dim=1)) vs module call (e.g., self.rnn(x))
         if hasattr(node.value.func, 'value') and isinstance(node.value.func.value, ast.Name):
-            if node.value.func.value.id != "self":
+            caller_id = node.value.func.value.id
+            if caller_id != "self":
                 self.extract_tensorop(node)
                 return
 
         module_name = node.value.func.attr
 
+        # Check if this is a multi-layer RNN that needs to be expanded
         if module_name in self.multi_layer_rnns:
             self.expand_multi_layer_rnn_call(node, module_name, is_tuple=True)
             return
 
-        # Extract input BEFORE _extract_tuple_target_vars which updates module_of_output
-        rnn_in = self._extract_rnn_input_arg(node)
-
-        # Check if rnn_in is the input of an identity tensorop (e.g., inp = x)
-        # NEW: We need to update rnn_in before storing in layer.input_var
-        for module in self.buml_model.modules:
-            if (hasattr(module, 'tns_type') and module.tns_type == 'identity' and
-                hasattr(module, 'input_var') and module.input_var == rnn_in):
-                # Found identity with input_var matching rnn_in
-                # Check if rnn_in was reassigned by checking module_of_output
-                if rnn_in not in self.module_of_output:
-                    # Not reassigned yet (network input), use identity's output
-                    rnn_in = module.output_var
-                    pass
-                break
-
+        # Extract and track tuple target variables
         self._extract_tuple_target_vars(node, module_name)
+
+        # Determine return type and main output variable
         rnn_out = self._determine_rnn_return_type(node, module_name)
 
-        # Extract the actual sequence output variable (first element)
-        first_elem = node.targets[0].elts[0]
-        if isinstance(first_elem, ast.Name):
-            sequence_output_var = first_elem.id
-        else:
-            sequence_output_var = None
+        # Extract input argument
+        rnn_in = self._extract_rnn_input_arg(node)
 
+        # Update tracking structures
+        self.inputs_outputs[module_name] = [rnn_in, rnn_out]
         module_obj = self._get_layer_by_name(module_name)
         if not module_obj:
             module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
-        # NEW: Set input/output on layer object
-        if module_obj:
-            module_obj.input_var = rnn_in
-            # output_var should be the sequence output (first element), not rnn_out (main output)
-            module_obj.output_var = sequence_output_var
+        # Handle initial hidden state (hx parameter) for seq2seq patterns
+        if module_obj and hasattr(self, '_current_rnn_initial_hidden') and self._current_rnn_initial_hidden:
+            if self._current_rnn_initial_hidden == "tuple_state":
+                # LSTM case with (h, c) tuple - need to extract the source from the tuple elements
+                # For now, we'll need to track this during argument parsing
+                if len(node.value.args) > 1 and isinstance(node.value.args[1], ast.Tuple):
+                    if len(node.value.args[1].elts) > 0 and isinstance(node.value.args[1].elts[0], ast.Name):
+                        h_var = node.value.args[1].elts[0].id
+                        if h_var in self.module_of_output:
+                            source_module = self.module_of_output[h_var].replace("__hidden", "").replace("__cell", "")
+                            module_obj.hx_source = source_module
+                            # Mark source layer output as reused
+                            source_layer = self._get_layer_by_name(source_module)
+                            if source_layer:
+                                source_layer.input_reused = True
+            elif self._current_rnn_initial_hidden in self.module_of_output:
+                # Simple case with single hidden state variable
+                source_module = self.module_of_output[self._current_rnn_initial_hidden].replace("__hidden", "").replace("__cell", "")
+                module_obj.hx_source = source_module
+                # Mark source layer output as reused
+                source_layer = self._get_layer_by_name(source_module)
+                if source_layer:
+                    source_layer.input_reused = True
+                # If source is a tensorop, mark it as RNN initial state
+                # This will be used in TensorFlow generator to skip unsqueeze(0)
+                if source_module.startswith('op_'):
+                    # Find the tensorop in modules
+                    for mod in self.buml_model.modules:
+                        if hasattr(mod, 'name') and mod.name == source_module:
+                            mod.is_rnn_initial_state = True
+                            break
+            # Reset for next RNN
+            self._current_rnn_initial_hidden = None
 
-        self._process_rnn_initial_hidden(node, module_obj)
-
+        # Set name_module_input to track data input (not hidden state input)
         if module_obj and rnn_in in self.module_of_output:
             module_obj.name_module_input = self.module_of_output[rnn_in]
+        elif module_obj and rnn_in == 'x':
+            # First layer using network input - don't set name_module_input
+            pass
 
         self.buml_model.modules.append(module_obj)
         self.previous_assign = node
@@ -1277,6 +1001,7 @@ class ASTParserTorch(ASTParser):
 
         # Generate unique name for identity tensorop to avoid overwrites in modules_details
         # When same variable is assigned multiple times (e.g., r = x appears 4 times for residuals),
+        # each needs a unique tensorop name, but all should output to the same variable via inputs_outputs
         if not hasattr(self, '_identity_counter'):
             self._identity_counter = {}
         self._identity_counter[target_var] = self._identity_counter.get(target_var, 0) + 1
@@ -1290,12 +1015,10 @@ class ASTParserTorch(ASTParser):
             layers_of_tensors=[source_module]
         )
 
-        # Store input/output vars for generator: use target_var as output so all map to same variable
-        # NEW: Also set on tensorop object
-        identity_op.input_var = source_var
-        identity_op.output_var = target_var
+        # Store input/output vars for generator - use target_var as output so all map to same variable
+        self.inputs_outputs[unique_name] = [source_var, target_var]
 
-        # Track the target variable: map to the unique tensorop name
+        # Track the target variable - map to the unique tensorop name
         self.module_of_output[target_var] = unique_name
 
         # Mark source as reused (branching point for residual/wide-deep patterns)
@@ -1318,9 +1041,6 @@ class ASTParserTorch(ASTParser):
             self.handle_subscript_operation(operand, temp_name, node)
             return temp_name
         elif isinstance(operand, (ast.Constant, ast.Num)):
-            # Return numeric value as-is (int or float)
-            # For int values, Python AST already preserves them as int type
-            # For float values like 2.0, they're stored as float
             return operand.value if isinstance(operand, ast.Constant) else operand.n
         elif isinstance(operand, ast.BinOp):
             temp_name = self.TEMP_BINOP.format(self.tensor_op_counter)
@@ -1388,42 +1108,6 @@ class ASTParserTorch(ASTParser):
         # Process as regular assignment
         self.visit_Assign(assign)
 
-    def _get_binop_operation_type(self, binop, node):
-        """Map AST binop operation to BUML tensor operation type."""
-        op_map = {
-            'Add': 'binop_add',
-            'Sub': 'binop_subtract',
-            'Mult': 'binop_multiply',
-            'Div': 'binop_divide',
-            'FloorDiv': 'binop_floor_divide'
-        }
-        op_type_name = binop.op.__class__.__name__
-        tns_type = op_map.get(op_type_name)
-
-        if tns_type is None:
-            self.migration_warnings.append(
-                f"Line {node.lineno}: Unsupported binary operation '{op_type_name}'. "
-                f"Only add, subtract, multiply, divide, and floor divide are supported."
-            )
-        return tns_type
-
-    def _mark_binop_source_layers_as_reused(self, layer_names):
-        """Mark source layers in binop as input_reused to preserve intermediate variables."""
-        for layer_name in layer_names:
-            if not isinstance(layer_name, str) or isinstance(layer_name, (int, float)):
-                continue
-            if layer_name.startswith("op_"):
-                continue
-
-            base_layer_name = (layer_name.replace('__hidden', '')
-                                        .replace('__cell', '')
-                                        .replace('__forward', '')
-                                        .replace('__backward', ''))
-            layer_obj = self._get_layer_by_name(base_layer_name)
-            if layer_obj and not hasattr(layer_obj, '_input_reused_marked'):
-                layer_obj.input_reused = True
-                layer_obj._input_reused_marked = True
-
     def handle_forward_binop(self, node: ast.Assign):
         """
         It handles binary operations such as 'x = a + b' or 'x = a.squeeze(1) + b'
@@ -1438,6 +1122,7 @@ class ASTParserTorch(ASTParser):
         """
         binop = node.value
 
+        # Extract operands
         left_var = self._extract_binop_operand(binop.left, node, "left")
         if left_var is None:
             return
@@ -1446,54 +1131,73 @@ class ASTParserTorch(ASTParser):
         if right_var is None:
             return
 
-        tns_type = self._get_binop_operation_type(binop, node)
+        # Determine the operation type
+        op_map = {
+            'Add': 'binop_add',
+            'Sub': 'binop_subtract',
+            'Mult': 'binop_multiply',
+            'Div': 'binop_divide',
+            'FloorDiv': 'binop_floor_divide'
+        }
+        op_type_name = binop.op.__class__.__name__
+        tns_type = op_map.get(op_type_name)
+
         if tns_type is None:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Unsupported binary operation '{op_type_name}'. Only add, subtract, multiply, divide, and floor divide are supported."
+            )
             return
 
+        # Get the layer/module names that produced these variables
+        # For constants (float/int), we use the value directly instead of a layer name
         left_layer = left_var if isinstance(left_var, (int, float)) else self.module_of_output.get(left_var)
         right_layer = right_var if isinstance(right_var, (int, float)) else self.module_of_output.get(right_var)
 
         if left_layer is None or right_layer is None:
             self.migration_warnings.append(
-                f"Line {node.lineno}: Cannot determine source layers for binary operation. "
-                f"Make sure both operands are defined earlier."
+                f"Line {node.lineno}: Cannot determine source layers for binary operation. Make sure both operands are defined earlier."
             )
             return
 
+        # Determine if variables are output or hidden for RNNs with return_type="both"
         var_types = self._determine_binop_var_types(left_layer, right_layer, left_var, right_var)
 
-        try:
-            tensorop_param = {
-                "tns_type": tns_type,
-                "layers_of_tensors": [left_layer, right_layer],
-                "actual_vars": var_types,
-                "name": f"op_{self.tensor_op_counter}"
-            }
+        # Create TensorOp for the binary operation
+        tensorop_param = {
+            "tns_type": tns_type,
+            "layers_of_tensors": [left_layer, right_layer],
+            "actual_vars": var_types,  # Track which component (output/hidden) each refers to
+            "name": f"op_{self.tensor_op_counter}"
+        }
 
-            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-            self.buml_model.add_tensor_op(tns_obj)
-            self.tensor_op_counter += 1
+        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        self.buml_model.add_tensor_op(tns_obj)
+        self.tensor_op_counter += 1
 
-            output_var = node.targets[0].id
-            self.module_of_output[output_var] = tensorop_param["name"]
+        # Track the output variable
+        output_var = node.targets[0].id
+        self.module_of_output[output_var] = tensorop_param["name"]
 
-            # For binops with scalars, use the tensor operand as input_var
-            if isinstance(left_var, str):
-                tns_obj.input_var = left_var
-            elif isinstance(right_var, str):
-                tns_obj.input_var = right_var
-            else:
-                tns_obj.input_var = str(left_var)  # Fallback (shouldn't happen for valid ops)
+        # Store input/output variable names for TensorFlow generation
+        self.inputs_outputs[tensorop_param["name"]] = [None, output_var]
+        print(f"[DEBUG handle_forward_binop] Set inputs_outputs[{tensorop_param['name']}] = [None, {output_var}]")
 
-            tns_obj.output_var = output_var
-            self.prev_layer_output = output_var
+        # Update prev_layer_output for TensorOps
+        self.prev_layer_output = output_var
 
-            self._mark_binop_source_layers_as_reused([left_layer, right_layer])
-
-        except Exception as e:
-            self.migration_warnings.append(
-                f"Line {node.lineno}: Failed to create binary operation TensorOp: {str(e)}"
-            )
+        # Mark source layers when their output is reused in binops
+        # This ensures that intermediate transformations create new variables
+        # instead of overwriting the original layer output
+        for layer_name in [left_layer, right_layer]:
+            if isinstance(layer_name, str) and not isinstance(layer_name, (int, float)):
+                # Check if this is a layer reference (not a TensorOp like "op_3")
+                if not layer_name.startswith("op_"):
+                    # Strip __hidden or __cell suffix to get base layer name
+                    base_layer_name = layer_name.replace('__hidden', '').replace('__cell', '').replace('__forward', '').replace('__backward', '')
+                    layer_obj = self._get_layer_by_name(base_layer_name)
+                    if layer_obj and not hasattr(layer_obj, '_input_reused_marked'):
+                        layer_obj.input_reused = True
+                        layer_obj._input_reused_marked = True  # Avoid redundant marking
 
     def _extract_tuple_var_names(self, tuple_target):
         """Extract variable names from tuple unpacking target."""
@@ -1507,41 +1211,34 @@ class ASTParserTorch(ASTParser):
 
     def _create_shape_dim_tensorop(self, var_name, idx, source_module):
         """Create TensorOp for shape dimension extraction."""
-        try:
-            tensorop_param = {
-                "name": var_name,
-                "tns_type": "shape_dim",
-                "layers_of_tensors": [source_module],
-                "reduce_dim": idx
-            }
-            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-            self.buml_model.add_tensor_op(tns_obj)
-        except Exception as e:
-            self.migration_warnings.append(f"Failed to create shape_dim TensorOp '{var_name}': {str(e)}")
-            return
+        tensorop_param = {
+            "name": var_name,
+            "tns_type": "shape_dim",
+            "layers_of_tensors": [source_module],
+            "reduce_dim": idx
+        }
+        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        self.buml_model.add_tensor_op(tns_obj)
         self.module_of_output[var_name] = var_name
+        # Store in inputs_outputs to preserve variable names from original code
         # For shape_dim, we need to track what variable the shape is extracted from
         # so the TensorFlow generator can use the correct source variable
         source_var = None
         if source_module == 'INPUT':
             # For INPUT, we need to find the actual input parameter name
             # Look for the first layer's input variable or use 'x' as default
-            # for module_name in self.module_of_output.values():
-            #         break
-            # if source_var is None:
-            source_var = 'x'  # Default forward parameter name
+            for module_name in self.module_of_output.values():
+                if module_name in self.inputs_outputs:
+                    source_var = self.inputs_outputs[module_name][0]
+                    break
+            if source_var is None:
+                source_var = 'x'  # Default forward parameter name
+        elif source_module in self.inputs_outputs:
+            source_var = self.inputs_outputs[source_module][1]  # Use output of that module
         else:
-            # CRITICAL FIX: Look up the module's output_var instead of using module name
-            # For shape extraction from lstm_out.shape, source_module='lstm' but we need 'lstm_out'
-            module_obj = next((obj for obj in self.buml_model.modules if obj.name == source_module), None)
-            if module_obj and hasattr(module_obj, 'output_var') and module_obj.output_var:
-                source_var = module_obj.output_var
-            else:
-                source_var = source_module
+            source_var = source_module
 
-        # NEW: Set on tensorop object instead
-        tns_obj.input_var = source_var
-        tns_obj.output_var = var_name
+        self.inputs_outputs[var_name] = [source_var, var_name]
 
     def handle_forward_shape_unpacking(self, node: ast.Assign):
         """
@@ -1562,7 +1259,7 @@ class ASTParserTorch(ASTParser):
             attr_name = node.value.attr
 
             if attr_name == 'shape':
-                # Get source module: if not found and it's 'x', use 'INPUT'
+                # Get source module - if not found and it's 'x', use 'INPUT'
                 if source_var in self.module_of_output:
                     source_module = self.module_of_output[source_var]
                 elif source_var == 'x':
@@ -1577,7 +1274,9 @@ class ASTParserTorch(ASTParser):
     def _handle_non_rnn_slicing(self, node, subscripted_var, result_var):
         """Create subscript TensorOp for non-RNN slicing operations."""
         subscript_pattern = self.extract_subscript_pattern(node.value)
+        print(f"[DEBUG _handle_non_rnn_slicing] subscripted_var={subscripted_var}, result_var={result_var}, pattern={subscript_pattern}")
         self.create_subscript_tensorop(subscripted_var, subscript_pattern, result_var)
+        print(f"[DEBUG _handle_non_rnn_slicing] After create_subscript_tensorop, module_of_output[{result_var}] = {self.module_of_output.get(result_var, 'NOT SET')}")
         self.previous_assign = node
 
     def _update_hidden_as_output(self, lyr_obj, prev_module_name):
@@ -1585,72 +1284,8 @@ class ASTParserTorch(ASTParser):
         lyr_obj.use_hidden_as_output = True
         if prev_module_name in self.rnn_hidden_vars:
             hidden_var = self.rnn_hidden_vars[prev_module_name]
-            # CRITICAL: Also update layer object attribute
-            lyr_obj.output_var = hidden_var
-
-    def _strip_rnn_suffix(self, layer_name):
-        """Strip __hidden or __cell suffix from layer name."""
-        if layer_name.endswith("__hidden"):
-            return layer_name[:-8]
-        elif layer_name.endswith("__cell"):
-            return layer_name[:-6]
-        return layer_name
-
-    def _get_target_var_for_output(self, result_var, subscripted_var):
-        """Determine target variable: preserve user vars, collapse auto-generated temps."""
-        if result_var.startswith('_subscript_temp_'):
-            return subscripted_var
-        else:
-            return result_var
-
-    def _handle_rnn_both_outputs(self, node, lyr_obj, prev_module_name, subscripted_var, result_var):
-        """Handle RNN with both sequence output and hidden state used."""
-        lyr_obj.return_type = "both"
-
-        if prev_module_name.endswith("__hidden"):
-            # CRITICAL FIX: Map result_var to base_layer_name (not __hidden suffix)
-            # After subscript assignment (x = h[-1]), subsequent layers should use x's current value,
-            # not resolve __hidden reference which would use the tuple unpacked variable (h) instead
-            base_layer_name = prev_module_name[:-8]  # Strip __hidden suffix
-            self.module_of_output[result_var] = base_layer_name
-            self.variable_aliases[result_var] = subscripted_var
-
-            target_var = self._get_target_var_for_output(result_var, subscripted_var)
-            # NEW: Store on layer object instead
-            lyr_obj.hidden_subscript_source = subscripted_var  # The tuple unpacked variable (h1)
-            lyr_obj.hidden_subscript_target = target_var        # The subscript result variable (h1_last)
-            # DON'T update hidden_state_var here - it should remain the original unpacked variable name
-            # hidden_state_var tracks the variable name from tuple unpacking (out, h = rnn(x)),
-            # NOT the subscript result assignment (x = h[0])
-            # The subscript operation is handled separately as a follow-up assignment
-
-            self.previous_assign = node
-            return True
-        return False
-
-    def _handle_rnn_hidden_only(self, node, lyr_obj, base_layer_name, prev_module_name, subscripted_var, result_var):
-        """Handle RNN with only hidden state used."""
-        lyr_obj.return_type = "hidden"
-        self._update_hidden_as_output(lyr_obj, base_layer_name)
-
-        if hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional:
-            return False
-
-        target_var = self._get_target_var_for_output(result_var, subscripted_var)
-        # NEW: Store on layer object instead
-        lyr_obj.hidden_subscript_source = subscripted_var  # The tuple unpacked variable (h)
-        lyr_obj.hidden_subscript_target = target_var        # The subscript result variable (x)
-        # DON'T update hidden_state_var here - it should remain the original unpacked variable name
-        # hidden_state_var tracks the variable name from tuple unpacking (_ h = rnn(x)),
-        # NOT the subscript result assignment (x = h[-1])
-        # The subscript operation is handled separately as a follow-up assignment
-        # CRITICAL FIX: Map result_var to base_layer_name (not __hidden suffix)
-        # After subscript assignment (x = h[-1]), subsequent layers should use x's current value,
-        # not resolve __hidden reference which would use the tuple unpacked variable (h) instead
-        self.module_of_output[result_var] = base_layer_name
-        self.variable_aliases[result_var] = subscripted_var
-        self.previous_assign = node
-        return True
+            if prev_module_name in self.inputs_outputs:
+                self.inputs_outputs[prev_module_name][1] = hidden_var
 
     def _determine_rnn_slice_return_type(self, node, lyr_obj, prev_module_name, subscripted_var, result_var):
         """Determine RNN return type based on slicing pattern.
@@ -1658,100 +1293,85 @@ class ASTParserTorch(ASTParser):
         Args:
             prev_module_name: Module name WITH suffix (e.g., 'rnn1__hidden'), used for module_of_output tracking
         """
-        if isinstance(node.value.slice, ast.UnaryOp) or isinstance(node.value.slice, ast.Constant):
-            # Handle both negative (UnaryOp) and positive (Constant) integer indices
-            base_layer_name = self._strip_rnn_suffix(prev_module_name)
+        if isinstance(node.value.slice, ast.UnaryOp):
+            # Strip suffix for lookup in rnn_output_vars/rnn_hidden_vars (which use base layer names)
+            base_layer_name = prev_module_name
+            if base_layer_name.endswith("__hidden"):
+                base_layer_name = base_layer_name[:-8]
+            elif base_layer_name.endswith("__cell"):
+                base_layer_name = base_layer_name[:-6]
 
             has_output = base_layer_name in self.rnn_output_vars
             has_hidden = base_layer_name in self.rnn_hidden_vars
 
             if has_output and has_hidden:
-                return self._handle_rnn_both_outputs(node, lyr_obj, prev_module_name, subscripted_var, result_var)
-            else:
-                return self._handle_rnn_hidden_only(node, lyr_obj, base_layer_name, prev_module_name, subscripted_var, result_var)
+                lyr_obj.return_type = "both"
+                # Do NOT update hidden as output - when both are used, sequences remain primary output
+                # The hidden state is accessible via __hidden suffix
+                # But if we're slicing the hidden state (h1[-1]), we need to preserve that variable
+                # In TF, the hidden state is already the last layer, so h1[-1] becomes just h1
+                # We need to track this as a simple variable assignment
+                if prev_module_name.endswith("__hidden"):
+                    # Track as variable alias - result_var is just an alias for subscripted_var
+                    self.module_of_output[result_var] = prev_module_name
+                    self.variable_aliases[result_var] = subscripted_var
 
+                    # Update inputs_outputs to preserve variable name assignment
+                    # For auto-generated temp vars, use subscripted_var for both to prevent dead code
+                    # For user-defined vars, preserve the assignment (x = h) for code readability
+                    if result_var.startswith('_subscript_temp_'):
+                        # Auto-generated: don't create assignment, use source var directly
+                        target_var = subscripted_var
+                    else:
+                        # User-defined: preserve variable name with assignment
+                        target_var = result_var
+
+                    self.inputs_outputs[prev_module_name] = [subscripted_var, target_var]
+
+                    self.previous_assign = node
+                    return True
+            else:
+                lyr_obj.return_type = "hidden"
+                # Only update when hidden is the ONLY output used (use base_layer_name)
+                self._update_hidden_as_output(lyr_obj, base_layer_name)
+                # Store the result variable name for this hidden state subscript
+                # For multi-layer RNN, h[-1] extracts last layer's hidden state
+                # In TF this is already the output, but we need to preserve the variable name
+                # BUT: Don't handle bidirectional RNNs here - let the bidirectional logic handle them
+                if not (hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional):
+                    # Store in inputs_outputs with __hidden suffix
+                    # In TensorFlow, h[-1] becomes just h (no subscripting needed)
+                    # For auto-generated temp vars, use subscripted_var for both to prevent dead code
+                    # For user-defined vars, preserve the assignment for code readability
+                    if result_var.startswith('_subscript_temp_'):
+                        # Auto-generated: don't create assignment, use source var directly
+                        target_var = subscripted_var
+                    else:
+                        # User-defined: preserve variable name with assignment
+                        target_var = result_var
+
+                    self.inputs_outputs[base_layer_name + "__hidden"] = [subscripted_var, target_var]
+                    # IMPORTANT: Use prev_module_name WITH suffix to preserve __hidden in module_of_output
+                    self.module_of_output[result_var] = prev_module_name
+                    self.variable_aliases[result_var] = subscripted_var
+                    self.previous_assign = node
+                    return True  # Signal that we've handled this
         elif isinstance(node.value.slice, ast.Tuple) and len(node.value.slice.elts) == 3:
-            if lyr_obj.return_type in ("full", "both"):
+            if lyr_obj.return_type == "full":
+                self._handle_non_rnn_slicing(node, subscripted_var, result_var)
+                return True
+            # If RNN already returns both (sequence + hidden), subscripting the sequence
+            # is a post-processing operation, not a return_type change
+            if lyr_obj.return_type == "both":
                 self._handle_non_rnn_slicing(node, subscripted_var, result_var)
                 return True
             if lyr_obj.return_type != "both":
                 lyr_obj.return_type = "last"
         else:
             self.migration_warnings.append(
-                f"Line {node.lineno}: Unrecognized subscript pattern on variable '{subscripted_var}'. "
-                f"This may not migrate correctly."
+                f"Line {node.lineno}: Unrecognized subscript pattern on variable '{subscripted_var}'. This may not migrate correctly."
             )
         return False
-
-    def _get_layer_lookup_name(self, module_name):
-        """Strip __hidden or __cell suffix from module name."""
-        if module_name.endswith("__hidden"):
-            return module_name[:-8]
-        elif module_name.endswith("__cell"):
-            return module_name[:-6]
-        return module_name
-
-    def _handle_bidirectional_rnn_slice(self, node, lyr_obj, layer_lookup_name, subscripted_var, result_var):
-        """Handle bidirectional RNN h[-2]/h[-1] or h[i] subscript patterns.
-
-        For bidirectional RNNs with num_layers=N:
-        - Negative indices: h[-2] = forward, h[-1] = backward (last layer)
-        - Positive indices: h[2*N-2] = forward, h[2*N-1] = backward (last layer)
-        """
-        if not (lyr_obj and hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional):
-            return False
-
-        # Handle negative indices: h[-2] (UnaryOp) or positive indices: h[2] (Constant)
-        if isinstance(node.value.slice, ast.UnaryOp) and isinstance(node.value.slice.operand, ast.Constant):
-            # Negative index case: h[-2] or h[-1]
-            slice_idx = -node.value.slice.operand.value if isinstance(node.value.slice.op, ast.USub) else node.value.slice.operand.value
-            if slice_idx not in [-2, -1]:
-                return False
-            suffix = "__forward" if slice_idx == -2 else "__backward"
-        elif isinstance(node.value.slice, ast.Constant):
-            # Positive index case: h[2] or h[3] for 2-layer bidirectional
-            slice_idx = node.value.slice.value
-
-            # Find the base module name to get num_layers
-            # layer_lookup_name might be 'lstm_layer_1', need to find 'lstm' in rnn_num_layers
-            base_module_name = None
-            for module_name in self.rnn_num_layers:
-                if layer_lookup_name in self.multi_layer_rnns.get(module_name, []):
-                    base_module_name = module_name
-                    break
-
-            if base_module_name:
-                num_layers = self.rnn_num_layers[base_module_name]
-            else:
-                num_layers = lyr_obj.num_layers if hasattr(lyr_obj, 'num_layers') else 1
-
-            # Calculate expected indices for last layer
-            # For num_layers=N bidirectional: indices are [0,1,...,2N-2,2N-1]
-            # Last layer forward = 2*N-2, backward = 2*N-1
-            expected_forward_idx = 2 * num_layers - 2
-            expected_backward_idx = 2 * num_layers - 1
-
-            if slice_idx == expected_forward_idx:
-                suffix = "__forward"
-            elif slice_idx == expected_backward_idx:
-                suffix = "__backward"
-            else:
-                return False
-        else:
-            return False
-
-        self.module_of_output[result_var] = layer_lookup_name + suffix
-        self.variable_aliases[result_var] = subscripted_var
-
-        # CRITICAL FIX: Store the user's variable names on layer object
-        # so generator uses them instead of generating synthetic names
-        if suffix == "__forward":
-            lyr_obj.forward_output_var = result_var
-        elif suffix == "__backward":
-            lyr_obj.backward_output_var = result_var
-
-        self.previous_assign = node
-        return True
 
     def handle_forward_slicing(self, node: ast.Assign):
         """
@@ -1767,27 +1387,53 @@ class ASTParserTorch(ASTParser):
         subscripted_var = node.value.value.id
         result_var = node.targets[0].id
 
+        # Look up which module produced this variable
         if subscripted_var not in self.module_of_output:
             self._handle_non_rnn_slicing(node, subscripted_var, result_var)
             return
 
         prev_module_name = self.module_of_output[subscripted_var]
-        layer_lookup_name = self._get_layer_lookup_name(prev_module_name)
+        # Strip __hidden or __cell suffix to get actual layer name
+        layer_lookup_name = prev_module_name
+        if layer_lookup_name.endswith("__hidden"):
+            layer_lookup_name = layer_lookup_name[:-8]
+        elif layer_lookup_name.endswith("__cell"):
+            layer_lookup_name = layer_lookup_name[:-6]
         lyr_obj = self._get_layer_by_name(layer_lookup_name)
 
+        # If not an RNN layer, handle as regular subscript
         if not lyr_obj or not hasattr(lyr_obj, 'return_type'):
             self._handle_non_rnn_slicing(node, subscripted_var, result_var)
             return
 
+        # Determine RNN return type based on slice pattern (pass prev_module_name WITH suffix, not layer_lookup_name)
         if self._determine_rnn_slice_return_type(node, lyr_obj, prev_module_name, subscripted_var, result_var):
             return
 
-        if self._handle_bidirectional_rnn_slice(node, lyr_obj, layer_lookup_name, subscripted_var, result_var):
-            return
+        # Check if this is a bidirectional RNN subscript pattern (h[-2] or h[-1])
+        # For bidirectional RNNs, these represent forward and backward hidden states
+        if (lyr_obj and hasattr(lyr_obj, 'bidirectional') and lyr_obj.bidirectional and
+            isinstance(node.value.slice, ast.UnaryOp) and
+            isinstance(node.value.slice.operand, ast.Constant)):
+            slice_idx = -node.value.slice.operand.value if isinstance(node.value.slice.op, ast.USub) else node.value.slice.operand.value
+            # For bidirectional: -2 = forward (last layer, forward direction), -1 = backward (last layer, backward direction)
+            if slice_idx in [-2, -1]:
+                suffix = "__forward" if slice_idx == -2 else "__backward"
+                # Track with direction suffix so they're different
+                self.module_of_output[result_var] = layer_lookup_name + suffix
+                self.variable_aliases[result_var] = subscripted_var
 
+                # Store in inputs_outputs so generator can use original variable name
+                # Key: layer_name__forward or layer_name__backward
+                # Value: [source_var, result_var]
+                self.inputs_outputs[layer_lookup_name + suffix] = [subscripted_var, result_var]
+
+                self.previous_assign = node
+                return
+
+        # Track the result variable and alias
         self.module_of_output[result_var] = prev_module_name
         self.variable_aliases[result_var] = subscripted_var
-        # if result_var.startswith('_subscript_temp_'):
         self.previous_assign = node
 
 
@@ -1856,7 +1502,7 @@ class ASTParserTorch(ASTParser):
         if not lyr_obj:
             return
         lyr_type = lyr_obj.__class__.__name__
-        if (lyr_type in channels_first_layers and len(self.buml_model.tensor_ops)!=0):
+        if (lyr_type in cnn_layers and len(self.buml_model.tensor_ops)!=0):
 
             if (isinstance(self.previous_assign.targets[0], ast.Name) and
                 isinstance(self.previous_assign.value, ast.Call)):
@@ -1866,27 +1512,35 @@ class ASTParserTorch(ASTParser):
                     self.previous_assign.value.func.value.id != "self"):
                     ops_name = self.previous_assign.value.func.attr
                     if ops_name in ["permute", "transpose"]:
-                        # lyr_obj already retrieved at line 1664, use that instead of searching buml_model.layers
-                        # (which may not have the layer yet since it's added later in forward() processing)
+                        lyrs = self.buml_model.layers
+                        lyr_obj = next((obj for obj in lyrs if
+                                        obj.name == lyr_name), None)
                         lyr_obj.permute_in = True
                         # Update variable tracking when removing transpose
                         # Map transpose output variable back to transpose input's source layer
                         transpose_output_var = self.previous_assign.targets[0].id
                         transpose_input_var = self.previous_assign.value.func.value.id
+                        print(f"[DEBUG] Removing transpose: transpose_output_var={transpose_output_var}, transpose_input_var={transpose_input_var}")
                         if transpose_input_var in self.module_of_output:
                             transpose_input_source = self.module_of_output[transpose_input_var]
                             self.module_of_output[transpose_output_var] = transpose_input_source
+                            print(f"[DEBUG] Set module_of_output[{transpose_output_var}] = {transpose_input_source}")
 
+                            # Update the current layer's inputs_outputs and name_module_input
                             # The current layer (lyr_name) was expecting transpose output, now should use transpose input
-                            # CRITICAL: Also update layer object attribute
-                            lyr_obj.input_var = transpose_input_var
+                            if lyr_name in self.inputs_outputs and self.inputs_outputs[lyr_name][0] == transpose_output_var:
+                                self.inputs_outputs[lyr_name][0] = transpose_input_var
+                                print(f"[DEBUG] Updated inputs_outputs[{lyr_name}][0] from {transpose_output_var} to {transpose_input_var}")
 
                             # Update the layer object's name_module_input to point to the source of transpose input
                             if hasattr(lyr_obj, 'name_module_input'):
+                                print(f"[DEBUG] layer.name_module_input BEFORE = {lyr_obj.name_module_input}")
                                 lyr_obj.name_module_input = transpose_input_source
+                                print(f"[DEBUG] Updated layer.name_module_input to {transpose_input_source}")
 
                         self.buml_model.tensor_ops.pop()
                         self.buml_model.modules.pop()
+                        print(f"[DEBUG] Removed transpose tensorop and module")
 
 
     def _extract_inline_base_var(self, call_node, parent_node):
@@ -1915,22 +1569,6 @@ class ASTParserTorch(ASTParser):
                         dim_value = self.param_value(kw.value)
             return {"reduce_dim": dim_value}
 
-    def _is_noop_rnn_squeeze_unsqueeze(self, op_type, op_params, base_layer):
-        """Check if squeeze(0)/unsqueeze(0) on single-layer RNN is a no-op."""
-        if op_type not in ('squeeze', 'unsqueeze'):
-            return False
-        if op_params.get('reduce_dim') != 0:
-            return False
-        if not base_layer or not (base_layer.endswith('__hidden') or base_layer.endswith('__cell')):
-            return False
-
-        rnn_layer_name = base_layer.replace('__hidden', '').replace('__cell', '')
-        rnn_layer = self._get_layer_by_name(rnn_layer_name)
-        num_layers = getattr(rnn_layer, 'num_layers', None) if rnn_layer else None
-        return (rnn_layer and
-                rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
-                (num_layers is None or num_layers == 1))
-
     def extract_inline_tensorop(self, call_node: ast.Call, parent_node: ast.Assign):
         """
         Extracts inline tensor operations like x.unsqueeze(1) or x.squeeze(1)
@@ -1950,38 +1588,47 @@ class ASTParserTorch(ASTParser):
         base_var = self._extract_inline_base_var(call_node, parent_node)
 
         if op_type not in ['squeeze', 'unsqueeze', 'repeat']:
-            return None if base_var == 'self' else base_var
+            if base_var == 'self':
+                return None
+            return base_var
 
         base_layer = self.module_of_output.get(base_var)
         if base_layer is None:
             return base_var
 
+        # Check for no-op squeeze(0) or unsqueeze(0) on single-layer RNN hidden states before creating TensorOp
         if op_type in ('squeeze', 'unsqueeze'):
             op_params = self._extract_inline_op_params(call_node, op_type)
-            if self._is_noop_rnn_squeeze_unsqueeze(op_type, op_params, base_layer):
-                output_var = self._extract_output_var_from_target(parent_node.targets[0])
-                if output_var and base_layer:
-                    self.module_of_output[output_var] = base_layer
-                return base_var
+            if (op_params.get('reduce_dim') == 0 and
+                base_layer and
+                (base_layer.endswith('__hidden') or base_layer.endswith('__cell'))):
+                rnn_layer_name = base_layer.replace('__hidden', '').replace('__cell', '')
+                rnn_layer = self._get_layer_by_name(rnn_layer_name)
+                # num_layers can be None (defaults to 1) or explicitly 1
+                num_layers = getattr(rnn_layer, 'num_layers', None) if rnn_layer else None
+                if (rnn_layer and
+                    rnn_layer.__class__.__name__ in ('SimpleRNNLayer', 'LSTMLayer', 'GRULayer') and
+                    (num_layers is None or num_layers == 1)):
+                    # No-op: update module_of_output mapping and return base variable
+                    output_var = self._extract_output_var_from_target(parent_node.targets[0])
+                    if output_var and base_layer:
+                        self.module_of_output[output_var] = base_layer
+                    return base_var
 
         intermediate_var = self.TEMP_INLINE.format(op_type, self.tensor_op_counter)
-        try:
-            tensorop_param = {
-                "tns_type": op_type,
-                "layers_of_tensors": [base_layer],
-                "name": f"op_{self.tensor_op_counter}"
-            }
-            tensorop_param.update(self._extract_inline_op_params(call_node, op_type))
+        tensorop_param = {
+            "tns_type": op_type,
+            "layers_of_tensors": [base_layer],
+            "name": f"op_{self.tensor_op_counter}"
+        }
+        tensorop_param.update(self._extract_inline_op_params(call_node, op_type))
 
-            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-            self.buml_model.add_tensor_op(tns_obj)
-            self.tensor_op_counter += 1
-            self.module_of_output[intermediate_var] = tensorop_param["name"]
+        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        self.buml_model.add_tensor_op(tns_obj)
+        self.tensor_op_counter += 1
+        self.module_of_output[intermediate_var] = tensorop_param["name"]
 
-            return intermediate_var
-        except Exception as e:
-            self.migration_warnings.append(f"Failed to create inline TensorOp '{op_type}': {str(e)}")
-            return base_var
+        return intermediate_var
 
     def _check_and_mark_residual_input(self, tns_obj, call_node):
         """Check if tensorop's input is saved for residual connection and mark it."""
@@ -2000,52 +1647,6 @@ class ASTParserTorch(ASTParser):
             return first_elem.id if isinstance(first_elem, ast.Name) else None
         return None
 
-    def _create_and_track_split_tensorop(self, tensorop_param, call_node, node):
-        """
-        Create and track split TensorOp with tuple outputs.
-
-        For: x1, x2 = torch.split(x, 32, dim=1)
-        Tracks each output variable with __split_N suffix.
-        """
-        try:
-            op_name = f"op_{self.tensor_op_counter}"
-            tensorop_param["name"] = op_name
-            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-
-            self.buml_model.add_tensor_op(tns_obj)
-            self.tensor_op_counter += 1
-
-            # Extract output variable names from tuple target
-            output_vars = []
-        except Exception as e:
-            self.migration_warnings.append(f"Failed to create split TensorOp: {str(e)}")
-            return
-        for elt in node.targets[0].elts:
-            if isinstance(elt, ast.Name):
-                output_vars.append(elt.id)
-
-        # Track each output variable with __split_N suffix
-        for i, out_var in enumerate(output_vars):
-            split_suffix = f"__split_{i}"
-            self.module_of_output[out_var] = op_name + split_suffix
-
-        # Extract input variable for the split operation
-        input_var = self._extract_tensorop_input_var(call_node, node)
-
-        # Store main operation input/output (for the operation itself)
-        # The output is a comma-joined tuple of all output variables
-        # main_output = ", ".join(output_vars) if output_vars else None
-        # if input_var and main_output:
-
-        # NEW: Set input and output_vars (list) on tensorop object
-        tns_obj.input_var = input_var
-        tns_obj.output_vars = output_vars  # Set as list, not comma-joined string
-        # DO NOT set tns_obj.output_var for split ops - use output_vars instead
-
-        # Update prev_layer_output (use last output variable)
-        if output_vars:
-            self.prev_layer_output = output_vars[-1]
-
     def _create_and_track_tensorop(self, tensorop_param, call_node, node):
         """
         Create TensorOp object and track its output.
@@ -2062,22 +1663,18 @@ class ASTParserTorch(ASTParser):
         # when the squeezed value is later unsqueezed and used. TensorFlow will handle squeeze(0)
         # on [B,H] as a no-op automatically, so we should generate both squeeze and unsqueeze.
 
-        try:
-            op_name = f"op_{self.tensor_op_counter}"
-            tensorop_param["name"] = op_name
-            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        op_name = f"op_{self.tensor_op_counter}"
+        tensorop_param["name"] = op_name
+        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
 
-            # Note: is_rnn_initial_state flag is set later when we detect this tensorop
-            # is used as hx_source for an RNN layer (see handle_rnn_layer)
-            # Don't mark unsqueeze as skippable just because it operates on RNN hidden state
+        # Note: is_rnn_initial_state flag is set later when we detect this tensorop
+        # is used as hx_source for an RNN layer (see handle_rnn_layer)
+        # Don't mark unsqueeze as skippable just because it operates on RNN hidden state
 
-            self.buml_model.add_tensor_op(tns_obj)
-            self.tensor_op_counter += 1
+        self.buml_model.add_tensor_op(tns_obj)
+        self.tensor_op_counter += 1
 
-            self._check_and_mark_residual_input(tns_obj, call_node)
-        except Exception as e:
-            self.migration_warnings.append(f"Failed to create TensorOp: {str(e)}")
-            return
+        self._check_and_mark_residual_input(tns_obj, call_node)
 
         # Detect parallel operations for TensorOps (similar to layers)
         input_var = self._extract_tensorop_input_var(call_node, node)
@@ -2087,34 +1684,10 @@ class ASTParserTorch(ASTParser):
         output_var = self._extract_output_var_from_target(node.targets[0])
         if output_var:
             self.module_of_output[output_var] = op_name
+            # Store actual variable name in inputs_outputs for generator to use
             # This ensures h_squeezed appears in output, not just op_1
             input_var = self._extract_tensorop_input_var(call_node, node)
-
-            # Special handling for concatenate: extract original variable names (not resolved)
-            if tns_obj.tns_type == 'concatenate' and hasattr(call_node, 'args') and call_node.args:
-                # torch.cat([var1, var2, ...]) - extract vars from the list
-                if isinstance(call_node.args[0], ast.List):
-                    original_vars = []
-                    all_are_names = True
-                    for elt in call_node.args[0].elts:
-                        if isinstance(elt, ast.Name):
-                            original_vars.append(elt.id)
-                        else:
-                            # Inline call like self.dropout(x), subscript, or other expression
-                            all_are_names = False
-                            break
-                    # CRITICAL FIX: Only set input_var if ALL elements are simple names
-                    # If there are inline calls/expressions, let generator resolve from layers_of_tensors
-                    if original_vars and all_are_names and len(original_vars) == len(call_node.args[0].elts):
-                        input_var = ", ".join(original_vars)  # "last_output, last_hidden"
-                    else:
-                        # Don't set input_var - generator will resolve from layers_of_tensors
-                        input_var = None
-
-            # NEW: Also set on tensorop object
-            if input_var is not None:
-                tns_obj.input_var = input_var
-            tns_obj.output_var = output_var
+            self.inputs_outputs[op_name] = [input_var, output_var]
             # Update prev_layer_output so next operation can detect branching
             self.prev_layer_output = output_var
 
@@ -2156,84 +1729,32 @@ class ASTParserTorch(ASTParser):
         return is_tensorop, prev_lyr_obj, prev_lyr_name
 
     def _create_standalone_functional_activation(self, node, module_name, input_var):
-        """Create standalone activation layer for functional API.
+        """Create standalone activation layer for functional API."""
+        actv_lyr_name = f"activ_{module_name}_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
+        actv_lyr = mm_classes.GeneralLayer(name=actv_lyr_name, actv_func=actv_fun_mapping[module_name])
+        self.buml_model.add_layer(actv_lyr)
+        self.buml_model.modules.append(actv_lyr)
 
-        Reuses existing activation layer of same type if found, otherwise creates new one.
-        """
-        actv_func = actv_fun_mapping[module_name]
         output_var = node.targets[0].id
-
-        # Look for existing activation layer with same activation function
-        # Use lowercase activation function name as base layer name (e.g., 'relu', 'gelu')
-        base_actv_name = actv_func.lower()
-        existing_actv = self._get_layer_by_name(base_actv_name)
-
-        if existing_actv and existing_actv in self.buml_model.modules:
-            # Reuse existing activation layer
-            import copy
-            reused_actv = copy.deepcopy(existing_actv)
-            reused_actv.name = base_actv_name  # Reset to base name before adding suffix
-            reused_actv.is_layer_call = True
-            # Reset permute flags - reused layers shouldn't have format conversion flags
-            reused_actv.permute_in = False
-            reused_actv.permute_out = False
-            self._add_layer_with_tracking(reused_actv)
-            # NEW: Also set on layer object
-            reused_actv.input_var = input_var
-            reused_actv.output_var = output_var
-            self.module_of_output[output_var] = reused_actv.name
-        else:
-            # First occurrence - create new activation layer with clean name
-            actv_lyr = mm_classes.GeneralLayer(name=base_actv_name, actv_func=actv_func)
-            self._add_layer_with_tracking(actv_lyr)
-            # NEW: Also set on layer object
-            actv_lyr.input_var = input_var
-            actv_lyr.output_var = output_var
-            self.module_of_output[output_var] = actv_lyr.name
-
-    def _can_merge_activation(self, layer_obj):
-        """Check if a layer supports activation function merging."""
-        if not layer_obj:
-            return False
-
-        layer_class = layer_obj.__class__.__name__
-        parent_class = layer_obj.__class__.mro()[1].__name__ if len(layer_obj.__class__.mro()) > 1 else None
-
-        # TensorFlow doesn't support activation parameter for these layer types:
-        # - NormalizationLayer (BatchNorm, LayerNorm)
-        # - PoolingLayer
-        # - LayerModifier (Dropout)
-        # - EmbeddingLayer
-        # - FlattenLayer
-        non_mergeable_types = ['PoolingLayer', 'EmbeddingLayer', 'FlattenLayer']
-        non_mergeable_parents = ['NormalizationLayer', 'LayerModifier']
-
-        return layer_class not in non_mergeable_types and parent_class not in non_mergeable_parents
+        self.inputs_outputs[actv_lyr_name] = [input_var, output_var]
+        self.module_of_output[output_var] = actv_lyr_name
 
     def _handle_functional_activation(self, node, module_name):
         """Handle functional API activation functions."""
         input_var = self._extract_activation_input_var(node)
         is_tensorop, prev_lyr_obj, prev_lyr_name = self._check_prev_is_tensorop(input_var)
 
-        # Check if previous layer can merge activation
-        can_merge = self._can_merge_activation(prev_lyr_obj) and not is_tensorop
-
-        # If layer already has an activation, don't merge - create standalone instead
-        layer_already_has_activation = prev_lyr_obj and hasattr(prev_lyr_obj, 'actv_func') and prev_lyr_obj.actv_func is not None
-
-        if is_tensorop or not can_merge or layer_already_has_activation:
-            # Treat as standalone activation
+        if is_tensorop:
             self._create_standalone_functional_activation(node, module_name, input_var)
         else:
-            # Merge into previous layer
-            output_var = node.targets[0].id
             if prev_lyr_obj:
                 prev_lyr_obj.actv_func = actv_fun_mapping[module_name]
-                # Update the layer's output variable to preserve the activation's output variable
-                # NEW: Also update attribute on layer object
-                prev_lyr_obj.output_var = output_var
+                if hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer:
+                    if prev_lyr_name in self.inputs_outputs:
+                        self.inputs_outputs[prev_lyr_name][1] = node.targets[0].id
             if input_var in self.module_of_output:
-                self.module_of_output[output_var] = self.module_of_output[input_var]
+                self.module_of_output[node.targets[0].id] = self.module_of_output[input_var]
 
     def _handle_functional_regular_layer(self, node, module_name, synthetic_name):
         """Handle functional API regular (non-activation) layers."""
@@ -2247,59 +1768,30 @@ class ASTParserTorch(ASTParser):
         try:
             lyr_type, lyr_params = transform_layer(module_name, lyr_params, synthetic_name)
             lyr_obj = getattr(mm_classes, lyr_type)(**lyr_params)
-            self.buml_model.add_layer(lyr_obj)  # This also appends to modules
+            self.buml_model.add_layer(lyr_obj)
 
-            # NEW: Set on layer object
-            lyr_obj.input_var = node.value.args[0].id
-            lyr_obj.output_var = node.targets[0].id
+            self.inputs_outputs[synthetic_name] = [node.value.args[0].id, node.targets[0].id]
             self.module_of_output[node.targets[0].id] = synthetic_name
-            # Note: No need to append to modules here, add_layer already did it
+            self.buml_model.modules.append(lyr_obj)
         except ValueError as e:
             self.migration_warnings.append(f"Functional layer '{synthetic_name}': {str(e)}")
 
-    def _try_merge_activation(self, node, module_name, input_source_module=None):
-        """Try to merge activation into previous layer. Returns (merged, prev_lyr_name).
-
-        Args:
-            node: The AST node for the activation call
-            module_name: Name of the activation module
-            input_source_module: The module name (with suffix) that produced the input variable.
-                                This is captured before module_of_output gets overwritten.
-        """
+    def _try_merge_activation(self, node, module_name):
+        """Try to merge activation into previous layer. Returns (merged, prev_lyr_name)."""
         if hasattr(self, 'is_processing_nested_outer') and self.is_processing_nested_outer:
             return False, None
 
-        # Use input_source_module if provided (captures the layer before overwrite)
-        if input_source_module:
-            prev_lyr_name_with_suffix = input_source_module
-        else:
-            # Fallback to old logic for backward compatibility
-            if not (self.previous_assign and isinstance(self.previous_assign.value, ast.Call)):
-                return False, None
+        if not (self.previous_assign and isinstance(self.previous_assign.value, ast.Call)):
+            return False, None
 
-            if not hasattr(self.previous_assign.value.func, 'attr'):
-                return False, None
+        if not hasattr(self.previous_assign.value.func, 'attr'):
+            return False, None
 
-            # Get the output variable from previous assignment
-            prev_output_var = self.previous_assign.targets[0].id
-            # Look up the actual module name (with suffix) that produced this variable
-            prev_lyr_name_with_suffix = self.module_of_output.get(prev_output_var)
-            if not prev_lyr_name_with_suffix:
-                return False, None
-
-        # Get the module object using the suffixed name
-        prev_lyr_obj = self._get_module_by_name(prev_lyr_name_with_suffix)
+        prev_lyr_name = self.previous_assign.value.func.attr
+        prev_lyr_obj = self._get_module_by_name(prev_lyr_name)
         if not prev_lyr_obj:
             return False, None
 
-        # Check if it's a layer that can merge activation
-        if not self._can_merge_activation(prev_lyr_obj):
-            return False, None
-
-        # If layer already has activation, don't merge
-        if hasattr(prev_lyr_obj, 'actv_func') and prev_lyr_obj.actv_func is not None:
-            return False, None
-
         actv = self.activation_functions[module_name]
         actv_func = actv_fun_mapping.get(actv)
         if actv_func is None:
@@ -2308,23 +1800,16 @@ class ASTParserTorch(ASTParser):
             )
             return False, None
 
-        # Merge activation into previous layer
         prev_lyr_obj.actv_func = actv_func
         output_var = node.targets[0].id
-        # Point output to the previous layer (skip standalone activation)
-        self.module_of_output[output_var] = prev_lyr_name_with_suffix
-        return True, prev_lyr_name_with_suffix
+        self.module_of_output[output_var] = prev_lyr_name
+        return True, prev_lyr_name
 
-    def _create_standalone_activation(self, node, module_name, input_source_module=None):
-        """Create standalone activation layer.
+    def _create_standalone_activation(self, node, module_name):
+        """Create standalone activation layer."""
+        unique_name = f"{module_name}_{self.tensor_op_counter}"
+        self.tensor_op_counter += 1
 
-        Args:
-            node: AST node for the activation call
-            module_name: Name of the activation module
-            input_source_module: The module that produces the input to this activation.
-                                 Must be passed in, as module_of_output may already be overwritten.
-        """
-        # Use the actual module name from PyTorch to preserve layer names
         actv = self.activation_functions[module_name]
         actv_func = actv_fun_mapping.get(actv)
         if actv_func is None:
@@ -2332,91 +1817,57 @@ class ASTParserTorch(ASTParser):
                 f"Unsupported activation function '{actv}'. This activation will be skipped in the migration."
             )
             return
+
+        actv_lyr = mm_classes.GeneralLayer(name=unique_name, actv_func=actv_func)
+        self.buml_model.modules.append(actv_lyr)
 
         input_var = node.value.args[0].id if node.value.args and isinstance(node.value.args[0], ast.Name) else "x"
         output_var = node.targets[0].id
+        self.inputs_outputs[unique_name] = [input_var, output_var]
+        self.module_of_output[output_var] = unique_name
 
-        # If input_source_module wasn't passed, try to get it from module_of_output
-        # (though it may already be overwritten by this point)
-        if input_source_module is None:
-            input_source_module = self.module_of_output.get(input_var)
-
-        # Check if activation layer already exists (layer reuse)
-        existing_actv = self._get_layer_by_name(module_name)
-        if existing_actv and existing_actv in self.buml_model.modules:
-            # This is a reused activation - clone and add with suffix
-            import copy
-            reused_actv = copy.deepcopy(existing_actv)
-            reused_actv.name = module_name  # Reset to base name before adding suffix
-            reused_actv.is_layer_call = True
-            # Reset permute flags - reused layers shouldn't have format conversion flags
-            reused_actv.permute_in = False
-            reused_actv.permute_out = False
-
-            # Set name_module_input from the captured input source
-            if input_source_module:
-                reused_actv.name_module_input = input_source_module
-
-            self._add_layer_with_tracking(reused_actv)
-            # NEW: Also set on layer object
-            reused_actv.input_var = input_var
-            reused_actv.output_var = output_var
-            self.module_of_output[output_var] = reused_actv.name
-        else:
-            # First occurrence - create and add with tracking
-            actv_lyr = mm_classes.GeneralLayer(name=module_name, actv_func=actv_func)
-
-            # Set name_module_input from the captured input source
-            if input_source_module:
-                actv_lyr.name_module_input = input_source_module
-
-            self._add_layer_with_tracking(actv_lyr)
-            # NEW: Also set on layer object
-            actv_lyr.input_var = input_var
-            actv_lyr.output_var = output_var
-            self.module_of_output[output_var] = actv_lyr.name
-
-    def _handle_module_activation(self, node, module_name, input_source_module=None):
+    def _handle_module_activation(self, node, module_name):
         """Handle module API activation functions with merge logic."""
-        merged, _ = self._try_merge_activation(node, module_name, input_source_module)
+        merged, _ = self._try_merge_activation(node, module_name)
         if not merged:
-            self._create_standalone_activation(node, module_name, input_source_module)
+            self._create_standalone_activation(node, module_name)
 
-    def _handle_module_layer_reuse(self, node, module_name, module_obj):
-        """
-        Handle layer reuse - same layer instance called multiple times.
-        Create a new layer in BUML with is_layer_call=True.
-        The layer gets a unique suffix from _add_layer_with_tracking.
-        """
-        # Extract current call's input/output (set by _process_module_api before this)
-        # Use object attributes instead
-        current_input = module_obj.input_var if hasattr(module_obj, 'input_var') else None
-        current_output = module_obj.output_var if hasattr(module_obj, 'output_var') else None
-
-            # Restore object attributes instead
-
-        if not current_input:
-            return
-
-        # Clone the original layer and mark it as a layer call (reuse)
+    def _handle_module_layer_reuse(self, node, module_name, module_obj, original_inputs_outputs=None):
+        """Handle layer reuse by creating synthetic copy with current call's input tracking."""
         import copy
-        call_layer = copy.deepcopy(module_obj)
-        # Keep the BASE layer name (without suffix) - _add_layer_with_tracking will add suffix
-        call_layer.name = module_name
-        # Mark as layer call so generator skips it in __init__
-        call_layer.is_layer_call = True
-        # Reset permute flags - reused layers shouldn't have format conversion flags
-        call_layer.permute_in = False
-        call_layer.permute_out = False
+        # Use per-layer reuse counter for clearer naming (dropout_use_1, dropout_use_2, ...)
+        self.layer_reuse_count[module_name] = self.layer_reuse_count.get(module_name, 0) + 1
+        use_count = self.layer_reuse_count[module_name]
+        synthetic_name = f"{module_name}_use_{use_count}"
 
-        # Add layer with tracking (this adds suffix to name AND adds to both layers and modules)
-        self._add_layer_with_tracking(call_layer)
+        synthetic_module = copy.copy(module_obj)
+        synthetic_module.name = synthetic_name
 
-        # Now call_layer.name has suffix, use it for tracking
-        # NEW: Also set on layer object
-        call_layer.input_var = current_input
-        call_layer.output_var = current_output
-        self.module_of_output[current_output] = call_layer.name
+        # Extract input for current call (already done in _process_module_api before this)
+        # inputs_outputs[module_name] contains current call's input/output
+        input_var, output_var = self.inputs_outputs[module_name]
+
+        # Set inputs_outputs for synthetic layer with current call's input/output
+        self.inputs_outputs[synthetic_name] = [input_var, output_var]
+
+        # Restore original inputs_outputs for the base layer (from first use)
+        if original_inputs_outputs:
+            self.inputs_outputs[module_name] = original_inputs_outputs
+
+        # Copy name_module_input from original module (set before module_of_output overwrite)
+        # This has the correct input source
+        if hasattr(module_obj, 'name_module_input') and module_obj.name_module_input:
+            synthetic_module.name_module_input = module_obj.name_module_input
+
+        # Mark as input_reused since it's using output from another module
+        if input_var in self.module_of_output:
+            synthetic_module.input_reused = True
+
+        # Map output variable to synthetic module
+        self.module_of_output[output_var] = synthetic_name
+
+        self.buml_model.layers.append(synthetic_module)
+        self.buml_model.modules.append(synthetic_module)
 
     def _detect_parallel_operations(self, module_obj, input_var):
         """Detect and mark parallel operations and TensorOp usage."""
@@ -2458,19 +1909,17 @@ class ASTParserTorch(ASTParser):
         # Save input source BEFORE overwriting module_of_output (for layer reuse)
         input_source_module = self.module_of_output.get(input_var) if input_var in self.module_of_output else None
 
+        # Save original inputs_outputs BEFORE overwriting (for layer reuse restoration)
+        original_inputs_outputs = self.inputs_outputs.get(module_name)
+
+        print(f"[DEBUG _process_module_api] module_name={module_name}, input_var={input_var}, output_var={output_var}, input_source_module={input_source_module}")
+
+        self.inputs_outputs[module_name] = [input_var, output_var]
         self.module_of_output[output_var] = module_name
 
         module_obj = self._get_layer_by_name(module_name)
-        # NEW: Also set on module object
-        # BUT: Don't set if this is a layer reuse (module already in buml_model.modules)
-        # because we'll set it on the cloned layer later
-        if module_obj and module_obj not in self.buml_model.modules:
-            module_obj.input_var = input_var
-            module_obj.output_var = output_var
         # Set name_module_input using saved input source (not overwritten value)
-        # BUT: Skip activation functions - they're handled in _handle_module_activation
-        # and shouldn't be modified here (layer reuse would overwrite the first occurrence)
-        if module_obj and input_source_module and module_name not in self.activation_functions:
+        if module_obj and input_source_module:
             module_obj.name_module_input = input_source_module
         self._detect_parallel_operations(module_obj, input_var)
         self.prev_layer_output = node.targets[0].id
@@ -2479,60 +1928,19 @@ class ASTParserTorch(ASTParser):
         is_subnn_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
 
         if module_name in self.activation_functions:
-            self._handle_module_activation(node, module_name, input_source_module)
+            self._handle_module_activation(node, module_name)
         elif not is_subnn_obj:
             self.is_permute_before_cnn(module_name)
 
         if module_name not in self.activation_functions:
             module_obj = self._get_layer_by_name(module_name)
-            is_subnn = False
             if not module_obj:
                 module_obj = next((obj for obj in self.buml_model.sub_nns if obj.name == module_name), None)
-                is_subnn = module_obj is not None
 
-            # For layer reuse: clone the layer and add with new suffix
-            # The counter suffix ensures unique keys in modules_details
-            # Generator strips suffix to reference same layer instance
-            # NOTE: SubNNs (Sequential/ModuleList) don't get suffix tracking
-            if module_obj and module_obj in self.buml_model.modules and not is_subnn:
-                import copy
-                # Clone the layer with is_layer_call=True to skip __init__ definition
-                reused_layer = copy.deepcopy(module_obj)
-                reused_layer.name = module_name  # Reset to base name before adding
-                reused_layer.is_layer_call = True
-                # Reset permute flags - reused layers shouldn't have format conversion flags
-                reused_layer.permute_in = False
-                reused_layer.permute_out = False
-                # Add with tracking - this adds counter suffix and appends to modules
-                self._add_layer_with_tracking(reused_layer)
-                # Copy them to the new suffixed name
-                # CRITICAL: Also update reused layer object attributes (use values set at line 2401)
-                reused_layer.input_var = input_var
-                reused_layer.output_var = output_var
-                # Note: No need to restore first layer attributes here!
-                # The first layer's attributes were set correctly when it was first processed
-                # and we prevented overwriting them at line 2422 by checking if module already in buml_model.modules
-                # Update module_of_output to point to new suffixed name
-                self.module_of_output[node.targets[0].id] = reused_layer.name
-            elif module_obj and not is_subnn:
-                # Add first occurrence with suffix tracking (only for Layers, not SubNNs)
-                self._add_layer_with_tracking(module_obj)
-                # CRITICAL: Layer attributes may have been updated (e.g., by is_permute_before_cnn)
-                # AFTER they were initially set at line 2441. So we should NOT overwrite them here.
-                # The attributes were already set at line 2441, and any subsequent modifications
-                # (like transpose removal) should be preserved.
-                # NO-OP: Attributes already set correctly
-                # Update module_of_output to point to suffixed name
-                self.module_of_output[node.targets[0].id] = module_obj.name
-            elif is_subnn and module_obj not in self.buml_model.modules:
-                # SubNN (Sequential/ModuleList) called in forward - add to modules for generator
-                # No suffix tracking needed for SubNNs
-                # NEW: Set input/output vars on SubNN object
-                module_obj.input_var = input_var
-                module_obj.output_var = output_var
-                if input_source_module:
-                    module_obj.name_module_input = input_source_module
-                self._add_module_with_tracking(module_obj)
+            if module_obj and module_obj in self.buml_model.modules:
+                self._handle_module_layer_reuse(node, module_name, module_obj, original_inputs_outputs)
+            elif module_obj:
+                self.buml_model.modules.append(module_obj)
 
     def _process_functional_api(self, node):
         """Process functional API calls (F.layer, torch.layer)."""
@@ -2628,24 +2036,13 @@ class ASTParserTorch(ASTParser):
                 dim_idx = self.param_value(arg.args[0])
                 source_layers = self._extract_source_layers(arg.func.value) if hasattr(arg.func, 'value') else None
 
-                try:
-                    op_name = f"op_{self.tensor_op_counter}"
-                    shape_tensorop_param = {"tns_type": "shape_dim", "reduce_dim": dim_idx,
-                                           "layers_of_tensors": source_layers, "name": op_name}
-                    tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
-                    self.buml_model.add_tensor_op(tns_obj)
-                    self.tensor_op_counter += 1
-
-                    # This ensures the generator creates an intermediate variable instead of reusing 'x'
-                    synthetic_var = f"_{op_name}"
-                    # NEW: Also set on tensorop object
-                    tns_obj.input_var = None  # Shape extraction from constant or expression
-                    tns_obj.output_var = synthetic_var
-
-                    return op_name
-                except Exception as e:
-                    self.migration_warnings.append(f"Failed to create shape_dim TensorOp in reshape: {str(e)}")
-                    return None
+                op_name = f"op_{self.tensor_op_counter}"
+                shape_tensorop_param = {"tns_type": "shape_dim", "reduce_dim": dim_idx,
+                                       "layers_of_tensors": source_layers, "name": op_name}
+                tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+                self.buml_model.add_tensor_op(tns_obj)
+                self.tensor_op_counter += 1
+                return op_name
             else:
                 return self.param_value(arg)
         elif isinstance(arg, ast.Name) and arg.id in self.module_of_output:
@@ -2854,13 +2251,9 @@ class ASTParserTorch(ASTParser):
             "end_dim": end_dim,
             "name_module_input": name_module_input
         }
-        try:
-            flatten_layer = getattr(mm_classes, "FlattenLayer")(**flatten_params)
-            self.buml_model.add_layer(flatten_layer)
-            return flatten_layer
-        except Exception as e:
-            self.migration_warnings.append(f"Failed to add FlattenLayer: {str(e)}")
-            return None
+        flatten_layer = getattr(mm_classes, "FlattenLayer")(**flatten_params)
+        self.buml_model.add_layer(flatten_layer)
+        return flatten_layer
 
     def _extract_op_flatten(self, call_node, node, op_args):
         """Extract flatten operation and create FlattenLayer (not a TensorOp)."""
@@ -2963,18 +2356,13 @@ class ASTParserTorch(ASTParser):
             self._create_dropout_layer(tensorop_param, node)
             return
 
-        # Handle split/chunk with tuple outputs specially
-        if (tensorop_param and tensorop_param.get('tns_type') == 'split' and
-            isinstance(node.targets[0], ast.Tuple)):
-            self._create_and_track_split_tensorop(tensorop_param, call_node, node)
-            return
-
         if tensorop_param:
             self._create_and_track_tensorop(tensorop_param, call_node, node)
 
 
     def _handle_layer_reuse_in_concat(self, layer_obj, arg, layer_name):
         """Handle layer reuse in concatenation."""
+        import copy
         self.layer_reuse_count[layer_name] = self.layer_reuse_count.get(layer_name, 0) + 1
         use_count = self.layer_reuse_count[layer_name]
 
@@ -2991,8 +2379,6 @@ class ASTParserTorch(ASTParser):
         temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
         self.tensor_op_counter += 1
         self.module_of_output[temp_name] = reuse_layer.name
-        # NOTE: Don't set reuse_layer.output_var - let generator determine it from input_reused
-        reuse_layer.input_var = input_var if 'input_var' in locals() else None
         return temp_name
 
     def _handle_first_layer_use_in_concat(self, layer_obj, arg, layer_name, is_inline=False):
@@ -3009,7 +2395,7 @@ class ASTParserTorch(ASTParser):
         if is_inline:
             layer_obj.input_reused = True
 
-            # Track input for inline concat: use 'INPUT' marker if input is 'x'
+            # Track input for inline concat - use 'INPUT' marker if input is 'x'
             if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
                 input_var = arg.args[0].id
                 if input_var == 'x':
@@ -3017,7 +2403,7 @@ class ASTParserTorch(ASTParser):
                 elif input_var in self.module_of_output:
                     layer_obj.name_module_input = self.module_of_output[input_var]
         else:
-            # Regular layer call: handle normally
+            # Regular layer call - handle normally
             if len(arg.args) > 0 and isinstance(arg.args[0], ast.Name):
                 input_var = arg.args[0].id
                 if input_var in self.module_of_output:
@@ -3028,13 +2414,11 @@ class ASTParserTorch(ASTParser):
         temp_name = self.TEMP_NESTED.format(self.tensor_op_counter)
         self.tensor_op_counter += 1
         self.module_of_output[temp_name] = layer_name
-        # NOTE: Don't set layer_obj.output_var - let generator determine it from input_reused
-        layer_obj.input_var = input_var if 'input_var' in locals() else None
         return temp_name
 
     def _extract_layer_call_variable(self, arg, layer_name):
         """Extract variable from layer call in concatenation."""
-        layer_obj = self._get_layer_by_name(layer_name)
+        layer_obj = next((lyr for lyr in self.buml_model.layers if lyr.name == layer_name), None)
 
         if not layer_obj:
             self.migration_warnings.append(
@@ -3096,20 +2480,6 @@ class ASTParserTorch(ASTParser):
                                     return base_var
                 return self._extract_inline_call_variable(arg, node)
         elif isinstance(arg, ast.Subscript):
-            # CRITICAL FIX: Check if subscript is on RNN hidden state with return_type='hidden'
-            # In TF, hidden states from return_state=True are 2D tensors (no time dimension)
-            # So subscripts like h[-1] are no-ops and should be skipped
-            if isinstance(arg.value, ast.Name):
-                base_var = arg.value.id
-                if base_var in self.module_of_output:
-                    module_name = self.module_of_output[base_var]
-                    if module_name and module_name.endswith('__hidden'):
-                        rnn_layer_name = module_name.replace('__hidden', '')
-                        rnn_layer = self._get_layer_by_name(rnn_layer_name)
-                        # Check if this RNN has return_type='hidden' (only hidden state, no sequence)
-                        if rnn_layer and hasattr(rnn_layer, 'return_type') and rnn_layer.return_type == 'hidden':
-                            # Skip subscript - return base variable directly
-                            return base_var
             return self._extract_subscript_variable(arg, node)
         else:
             return None
@@ -3171,25 +2541,8 @@ class ASTParserTorch(ASTParser):
 
         if all(isinstance(arg, ast.Subscript) for arg in ops_args):
             indices = self._extract_subscript_indices(ops_args)
-            if indices:
-                # Accept negative indices (-2, -1) or positive indices for last layer
-                # For num_layers=N bidirectional: last layer is [2*N-2, 2*N-1]
-                # Find base module name to get num_layers
-                base_module_name = None
-                for module_name in self.rnn_num_layers:
-                    if source_layer_name in self.multi_layer_rnns.get(module_name, []):
-                        base_module_name = module_name
-                        break
-
-                if base_module_name:
-                    num_layers = self.rnn_num_layers[base_module_name]
-                else:
-                    num_layers = source_layer.num_layers if hasattr(source_layer, 'num_layers') else 1
-
-                expected_positive_indices = {2 * num_layers - 2, 2 * num_layers - 1}
-
-                if set(indices) == {-2, -1} or set(indices) == expected_positive_indices:
-                    return self._handle_bidirectional_concat_output(node, source_layer_name)
+            if indices and set(indices) == {-2, -1}:
+                return self._handle_bidirectional_concat_output(node, source_layer_name)
 
         # For name-based patterns (h_forward, h_backward), also skip to avoid duplicate concat
         # The template automatically generates concat for bidirectional RNN hidden states
@@ -3287,14 +2640,13 @@ class ASTParserTorch(ASTParser):
         ops_args = node.value.args[0].elts
 
         # Early check for bidirectional RNN concat to avoid creating subscript tensorops
-        is_bidir_subscript = self._is_bidirectional_rnn_subscript_concat(ops_args)
-        if is_bidir_subscript:
-            # Skip creating TensorOp: template already generates bidirectional concat
+        if self._is_bidirectional_rnn_subscript_concat(ops_args):
+            # Skip creating TensorOp - template already generates bidirectional concat
             # Track output variable to use as the concat result variable name
             output_var = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
             if output_var:
                 var_name = ops_args[0].value.id
-                source_module = self.module_of_output.get(var_name, "NOT_FOUND")
+                source_module = self.module_of_output[var_name]
                 base_module = source_module.replace("__hidden", "")
 
                 # Store the original PyTorch concat variable name so it can be used
@@ -3316,43 +2668,25 @@ class ASTParserTorch(ASTParser):
             return None
 
         actual_vars = self._resolve_concat_variables(variables)
+        print(f"[DEBUG _extract_concatenate_params] variables={variables}, actual_vars={actual_vars}")
 
         layers_of_tensors = [self.module_of_output[actual_var] for actual_var in actual_vars]
+        print(f"[DEBUG _extract_concatenate_params] layers_of_tensors={layers_of_tensors}")
+        print(f"[DEBUG _extract_concatenate_params] module_of_output keys={list(self.module_of_output.keys())}")
         cat_dim = self.param_value(node.value.keywords[0].value)
 
         if self._check_bidirectional_rnn_concat(ops_args, layers_of_tensors, node):
             return None
 
-        # Check for duplicate sources from bidirectional RNN hidden states
-        # This happens when h_f = h_n[-2]; h_b = h_n[-1]; h = torch.cat([h_f, h_b])
-        # Both h_f and h_b point to the same __hidden module
-        if (len(layers_of_tensors) == 2 and
-            layers_of_tensors[0] == layers_of_tensors[1] and
-            layers_of_tensors[0].endswith("__hidden")):
-            # Check if source is a bidirectional RNN
-            base_layer_name = layers_of_tensors[0].replace("__hidden", "")
-            source_layer = self._get_layer_by_name(base_layer_name)
-            if self._is_bidirectional_hidden_rnn(source_layer):
-                # Let the RNN template handle the concat - don't create a TensorOp
-                # But register the output variable so it can be used in later operations
-                output_var = self._extract_output_var_from_target(node.targets[0])
-                if output_var:
-                    concat_module = "bidirectional_concat_" + base_layer_name
-                    self.module_of_output[output_var] = concat_module
-                    if not hasattr(self, '_bidirectional_concat_var_names'):
-                        self._bidirectional_concat_var_names = {}
-                    self._bidirectional_concat_var_names[base_layer_name] = output_var
-                return None
-
         var_types = self._determine_rnn_var_types(layers_of_tensors, actual_vars)
+        print(f"[DEBUG _extract_concatenate_params] var_types={var_types}")
 
-        result = {
+        return {
             "tns_type": "concatenate",
             "layers_of_tensors": layers_of_tensors,
             "concatenate_dim": cat_dim,
             "actual_vars": var_types
         }
-        return result
 
 
     def _extract_permute_dimensions(self, ops_args):
@@ -3377,7 +2711,7 @@ class ASTParserTorch(ASTParser):
 
         if isinstance(prev_module, Layer):
             lyr_type = prev_module.__class__.__name__
-            if lyr_type in channels_first_layers:
+            if lyr_type in cnn_layers:
                 prev_module.permute_out = True
                 return None
 
@@ -3388,14 +2722,13 @@ class ASTParserTorch(ASTParser):
         """Extract F.interpolate operation parameters."""
         size = None
         scale_factor = None
-        mode = 'bilinear'
+        mode = 'nearest'
 
         # Extract from keywords
         for kw in call_node.keywords:
             if kw.arg == 'size':
                 if isinstance(kw.value, ast.Constant):
-                    # Wrap single int in tuple for consistency
-                    size = (kw.value.value,)
+                    size = kw.value.value
                 elif isinstance(kw.value, (ast.Tuple, ast.List)):
                     size = tuple(elt.value if isinstance(elt, ast.Constant) else None
                                for elt in kw.value.elts)
@@ -3423,12 +2756,8 @@ class ASTParserTorch(ASTParser):
         if len(ops_args) > 1:
             pad_arg = ops_args[1]
             if isinstance(pad_arg, (ast.Tuple, ast.List)):
-                # PyTorch F.pad uses flat tuple: (left, right, top, bottom, front, back, ...)
-                # Convert to nested list format: [[left, right], [top, bottom], ...]
-                flat_pad = [elt.value if isinstance(elt, ast.Constant) else 0
-                           for elt in pad_arg.elts]
-                # Group pairs: [left, right] -> [[left, right]]
-                pad = [[flat_pad[i], flat_pad[i+1]] for i in range(0, len(flat_pad), 2)]
+                pad = tuple(elt.value if isinstance(elt, ast.Constant) else 0
+                          for elt in pad_arg.elts)
 
         # Extract from keywords
         for kw in call_node.keywords:
@@ -3525,112 +2854,6 @@ class ASTParserTorch(ASTParser):
             "input_reused": True  # Force new variable name to avoid overwriting previous outputs
         }
 
-    def _extract_op_split(self, call_node, node, op_args):
-        """Extract split operation parameters.
-
-        Handles: x1, x2 = torch.split(x, split_size, dim=1)
-        or: x1, x2 = torch.split(x, [size1, size2], dim=1)
-
-        Note: torch.split(x, split_size_or_sections, dim) where:
-        - If split_size_or_sections is int: splits into chunks of that size
-        - If split_size_or_sections is list: splits into chunks with those sizes
-        """
-        source_var = None
-        split_size = None
-        split_dim = 0  # Default dimension
-        num_outputs = 1
-
-        # Extract source variable from first argument
-        if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
-            source_var = op_args[0].id
-
-        # Count number of output variables from assignment target (x1, x2 = ...)
-        if isinstance(node.targets[0], ast.Tuple):
-            num_outputs = len(node.targets[0].elts)
-
-        # Extract split size from second argument
-        if len(op_args) > 1:
-            if isinstance(op_args[1], ast.Constant):
-                # PyTorch: split_size (chunk size), but we need num_splits for TF
-                # Use num_outputs from assignment to determine this
-                split_size = num_outputs
-            elif isinstance(op_args[1], ast.List):
-                # Handle list of split sizes [size1, size2, ...]
-                split_size = [elt.value for elt in op_args[1].elts if isinstance(elt, ast.Constant)]
-
-        # Extract dim from keyword arguments or third positional argument
-        if hasattr(call_node, 'keywords'):
-            for kw in call_node.keywords:
-                if kw.arg == 'dim' and isinstance(kw.value, ast.Constant):
-                    split_dim = kw.value.value
-
-        if len(op_args) > 2 and isinstance(op_args[2], ast.Constant):
-            split_dim = op_args[2].value
-
-        # Determine source layers
-        if source_var and source_var in self.module_of_output:
-            source_layers = [self.module_of_output[source_var]]
-        elif source_var:
-            source_layers = ['INPUT']
-        else:
-            source_layers = None
-
-        return {
-            "tns_type": "split",
-            "layers_of_tensors": source_layers,
-            "split_dim": split_dim,
-            "split_sizes": split_size,
-            "input_reused": True  # Force new variable names for split outputs
-        }
-
-    def _extract_op_chunk(self, call_node, node, op_args):
-        """Extract chunk operation parameters.
-
-        Handles: x1, x2, x3 = torch.chunk(x, 3, dim=1)
-
-        Note: torch.chunk(x, chunks, dim) where:
-        - chunks: number of chunks to split into
-        - dim: dimension along which to split
-        """
-        source_var = None
-        num_chunks = None
-        split_dim = 0  # Default dimension
-
-        # Extract source variable from first argument
-        if len(op_args) > 0 and isinstance(op_args[0], ast.Name):
-            source_var = op_args[0].id
-
-        # Extract number of chunks from second argument
-        if len(op_args) > 1 and isinstance(op_args[1], ast.Constant):
-            num_chunks = op_args[1].value
-
-        # Extract dim from keyword arguments or third positional argument
-        if hasattr(call_node, 'keywords'):
-            for kw in call_node.keywords:
-                if kw.arg == 'dim' and isinstance(kw.value, ast.Constant):
-                    split_dim = kw.value.value
-
-        if len(op_args) > 2 and isinstance(op_args[2], ast.Constant):
-            split_dim = op_args[2].value
-
-        # Determine source layers
-        if source_var and source_var in self.module_of_output:
-            source_layers = [self.module_of_output[source_var]]
-        elif source_var:
-            source_layers = ['INPUT']
-        else:
-            source_layers = None
-
-        # torch.chunk(x, N, dim) splits tensor into N chunks
-        # This maps to split with num_splits = N
-        return {
-            "tns_type": "split",
-            "layers_of_tensors": source_layers,
-            "split_dim": split_dim,
-            "split_sizes": num_chunks,
-            "input_reused": True  # Force new variable names for chunk outputs
-        }
-
     def handle_outer_attribute_assignment(self, node: ast.Assign):
         """
         It visits and extracts information from assignment statements
@@ -3697,37 +2920,6 @@ class ASTParserTorch(ASTParser):
         else:
             self.unprocessed_nodes.append(node)
 
-    def visit_Expr(self, node: ast.Expr):
-        """
-        Visit expression statements to extract epochs from train function calls.
-        We see train(model, train_loader, criterion, optimizer, 10) and need to extract 10.
-        The train function signature is: train(model, train_loader, criterion, optimizer, epochs)
-        So epochs is at index 4 (5th parameter).
-        """
-        if (hasattr(self, 'inside_nn_class') and self.inside_nn_class) or \
-           (hasattr(self, 'inside_method') and self.inside_method):
-            self.generic_visit(node)
-            return
-
-        # Check if it's a function call to train/train_model
-        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
-            func_name = node.value.func.id
-            if func_name in ['train', 'train_model']:
-                # Check keyword argument first (explicit epochs=N)
-                for keyword in node.value.keywords:
-                    if keyword.arg == "epochs" and isinstance(keyword.value, ast.Constant):
-                        self.data_config["config"]["epochs"] = keyword.value.value
-                        break
-
-                # If not found in keywords, check positional arguments
-                # Standard signature: train(model, train_loader, criterion, optimizer, epochs)
-                # epochs is the 5th parameter (index 4)
-                if "epochs" not in self.data_config["config"] and len(node.value.args) >= 5:
-                    epochs_arg = node.value.args[4]
-                    if isinstance(epochs_arg, ast.Constant):
-                        self.data_config["config"]["epochs"] = epochs_arg.value
-
-        self.generic_visit(node)
 
 
 
@@ -3738,7 +2930,7 @@ def transform_layer(lyr_type: str, lyr_params: dict,
 
     Parameters:
         lyr_type (str): The type of the layer (PyTorch).
-        lyr_params (dict): A dictionary storing the layer parameters and
+        lyr_params (dict): A dictionnary storing the layer parameters and
             their values.
         lyr_name (str | None): The name of the layer.
 
@@ -3778,7 +2970,7 @@ def process_params(lyr_type: str, lyr_params: dict):
 
     Parameters:
         lyr_type (str): The type of the layer (PyTorch).
-        lyr_params (dict): A dictionary storing the layer parameters and
+        lyr_params (dict): A dictionnary storing the layer parameters and
             their values.
 
     Returns:

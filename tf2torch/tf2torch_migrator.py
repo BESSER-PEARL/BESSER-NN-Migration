@@ -2,19 +2,23 @@
 It converts TensorFlow code to BUML code.
 
 Argument:
-    filename (str): Path to a TensorFlow file containing 
+    filename (str): Path to a TensorFlow file containing
         the code to transform.
     configfile (str, optional): Path to the configuration file that
         has the values of 'input_nn_type', 'output_nn_type', and 'only_nn'.
-    datashape (str, optional): The shape of the input data (optional). 
+    datashape (str, optional): The shape of the input data (optional).
         It is needed when transforming tf code to pytorch code as it is
-        used to recover some layer attributes dynamically. If the migrated 
+        used to recover some layer attributes dynamically. If the migrated
         script defines a dataset, it can be skipped.
 """
+import sys
+import os
+sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from besser.generators.nn.pytorch.pytorch_code_generator import (
     PytorchGenerator
 )
-from tf2torch.ast_parser_tf import ASTParserTF
+from ast_parser_tf import ASTParserTF
 from transform_code import (
     parse_arguments_transform, transform
 )
@@ -26,11 +30,14 @@ def main():
     buml_model, output_nn_type = transform(args, "TF", ASTParserTF)
 
     pytorch_model = PytorchGenerator(
-        model=buml_model, output_dir="output/migrated_nn",
-        generation_type=output_nn_type, channel_last=True
+        model=buml_model,
+        output_dir=args.output_dir,
+        generation_type=output_nn_type,
+        channel_last=True,
+        strip_layer_counter_suffix=True,
+        skip_validation=True
     )
     pytorch_model.generate()
-
 
 
 if __name__ == "__main__":
