@@ -8,7 +8,6 @@ import copy
 import sys
 from besser.BUML.metamodel.nn import NN, Layer
 import besser.BUML.metamodel.nn as mm_classes
-
 from torch2tf.definitions import (
     layers_mapping, params_mapping, static_params,
     pos_params, int2list_params, lyrs_of_int2list_params,
