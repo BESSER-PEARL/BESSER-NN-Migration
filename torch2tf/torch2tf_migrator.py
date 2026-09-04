@@ -11,7 +11,6 @@ Argument:
 
 import sys
 import os
-sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from besser.generators.nn.tf.tf_code_generator import TFGenerator
 from ast_parser_pytorch import (
