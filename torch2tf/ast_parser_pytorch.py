@@ -6,7 +6,6 @@ It also extracts data and model configuration attributes.
 import ast
 import copy
 import sys
-sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 from besser.BUML.metamodel.nn import NN, Layer
 import besser.BUML.metamodel.nn as mm_classes
 
@@ -204,7 +203,10 @@ class ASTParserTorch(ASTParser):
             self.layer_by_name[layer_obj.name] = layer_obj
             self.module_by_name[layer_obj.name] = layer_obj
 
-        self.buml_model.add_layer(layer_obj)
+        try:
+            self.buml_model.add_layer(layer_obj)
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to add layer '{layer_obj.name}': {str(e)}")
 
     def _add_module_with_tracking(self, module_obj):
         """Add module to model and update lookup dict for O(1) access."""
@@ -256,35 +258,62 @@ class ASTParserTorch(ASTParser):
         if hasattr(self, '_bidirectional_concat_var_names'):
             self.buml_model.bidirectional_concat_var_names = self._bidirectional_concat_var_names
 
-    def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
+    def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> list:
         """
-        Extract the subscript/slice pattern from an AST Subscript node as a string.
+        Extract the subscript/slice pattern from an AST Subscript node as a structured list.
 
         Parameters:
             subscript_node (ast.Subscript): The AST subscript node
 
         Returns:
-            str: String representation of the subscript pattern (e.g., "[-1]", "[:, -1, :]")
+            list: List of dicts representing subscript pattern
+                  e.g., [{"type": "index", "value": -1}] for [-1]
+                  e.g., [{"type": "slice", "start": None, "stop": None, "step": None},
+                         {"type": "index", "value": -1}] for [:, -1]
         """
-        def slice_to_string(slice_node):
+        def parse_slice_element(slice_node):
             if isinstance(slice_node, ast.Slice):
-                lower = ast.unparse(slice_node.lower) if slice_node.lower else ""
-                upper = ast.unparse(slice_node.upper) if slice_node.upper else ""
-                step = ast.unparse(slice_node.step) if slice_node.step else ""
-                if step:
-                    return f"{lower}:{upper}:{step}"
-                else:
-                    return f"{lower}:{upper}" if lower or upper else ":"
-            elif isinstance(slice_node, ast.Tuple):
-                # Multi-dimensional slicing like [:, -1, :]
-                elements = [slice_to_string(elt) for elt in slice_node.elts]
-                return ", ".join(elements)
-            else:
-                # Single index like -1 or 0
-                return ast.unparse(slice_node)
+                # Parse slice object
+                start = None
+                stop = None
+                step = None
 
-        pattern = slice_to_string(subscript_node.slice)
-        return f"[{pattern}]"
+                if slice_node.lower:
+                    if isinstance(slice_node.lower, ast.Constant):
+                        start = slice_node.lower.value
+                    elif isinstance(slice_node.lower, ast.UnaryOp) and isinstance(slice_node.lower.op, ast.USub):
+                        start = -slice_node.lower.operand.value
+
+                if slice_node.upper:
+                    if isinstance(slice_node.upper, ast.Constant):
+                        stop = slice_node.upper.value
+                    elif isinstance(slice_node.upper, ast.UnaryOp) and isinstance(slice_node.upper.op, ast.USub):
+                        stop = -slice_node.upper.operand.value
+
+                if slice_node.step:
+                    if isinstance(slice_node.step, ast.Constant):
+                        step = slice_node.step.value
+                    elif isinstance(slice_node.step, ast.UnaryOp) and isinstance(slice_node.step.op, ast.USub):
+                        step = -slice_node.step.operand.value
+
+                return {"type": "slice", "start": start, "stop": stop, "step": step}
+            else:
+                # Single index
+                if isinstance(slice_node, ast.Constant):
+                    return {"type": "index", "value": slice_node.value}
+                elif isinstance(slice_node, ast.UnaryOp) and isinstance(slice_node.op, ast.USub):
+                    return {"type": "index", "value": -slice_node.operand.value}
+                else:
+                    # Fallback for complex expressions - use unparsed string as value
+                    return {"type": "index", "value": ast.unparse(slice_node)}
+
+        # Handle multi-dimensional or single subscript
+        if isinstance(subscript_node.slice, ast.Tuple):
+            # Multi-dimensional like [:, -1, :]
+            return [parse_slice_element(elt) for elt in subscript_node.slice.elts]
+        else:
+            # Single dimension like [-1] or [:]
+            return [parse_slice_element(subscript_node.slice)]
 
     def _resolve_variable_alias(self, var):
         """Resolve variable aliases to find the actual source."""
@@ -489,7 +518,7 @@ class ASTParserTorch(ASTParser):
             # Layer will be added via _add_layer_with_tracking when processing forward()
             self.layer_by_name[module_name] = buml_layer
             self.module_by_name[module_name] = buml_layer
-        except ValueError as e:
+        except Exception as e:
             self.migration_warnings.append(f"Layer '{module_name}': {str(e)}")
 
     def handle_init(self, node: ast.Assign):
@@ -1290,6 +1319,9 @@ class ASTParserTorch(ASTParser):
             self.handle_subscript_operation(operand, temp_name, node)
             return temp_name
         elif isinstance(operand, (ast.Constant, ast.Num)):
+            # Return numeric value as-is (int or float)
+            # For int values, Python AST already preserves them as int type
+            # For float values like 2.0, they're stored as float
             return operand.value if isinstance(operand, ast.Constant) else operand.n
         elif isinstance(operand, ast.BinOp):
             temp_name = self.TEMP_BINOP.format(self.tensor_op_counter)
@@ -1431,25 +1463,38 @@ class ASTParserTorch(ASTParser):
 
         var_types = self._determine_binop_var_types(left_layer, right_layer, left_var, right_var)
 
-        tensorop_param = {
-            "tns_type": tns_type,
-            "layers_of_tensors": [left_layer, right_layer],
-            "actual_vars": var_types,
-            "name": f"op_{self.tensor_op_counter}"
-        }
+        try:
+            tensorop_param = {
+                "tns_type": tns_type,
+                "layers_of_tensors": [left_layer, right_layer],
+                "actual_vars": var_types,
+                "name": f"op_{self.tensor_op_counter}"
+            }
 
-        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-        self.buml_model.add_tensor_op(tns_obj)
-        self.tensor_op_counter += 1
+            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+            self.buml_model.add_tensor_op(tns_obj)
+            self.tensor_op_counter += 1
 
-        output_var = node.targets[0].id
-        self.module_of_output[output_var] = tensorop_param["name"]
-        # NEW: Also set on tensorop object
-        tns_obj.input_var = None  # Binary ops have two inputs tracked via layers_of_tensors
-        tns_obj.output_var = output_var
-        self.prev_layer_output = output_var
+            output_var = node.targets[0].id
+            self.module_of_output[output_var] = tensorop_param["name"]
 
-        self._mark_binop_source_layers_as_reused([left_layer, right_layer])
+            # For binops with scalars, use the tensor operand as input_var
+            if isinstance(left_var, str):
+                tns_obj.input_var = left_var
+            elif isinstance(right_var, str):
+                tns_obj.input_var = right_var
+            else:
+                tns_obj.input_var = str(left_var)  # Fallback (shouldn't happen for valid ops)
+
+            tns_obj.output_var = output_var
+            self.prev_layer_output = output_var
+
+            self._mark_binop_source_layers_as_reused([left_layer, right_layer])
+
+        except Exception as e:
+            self.migration_warnings.append(
+                f"Line {node.lineno}: Failed to create binary operation TensorOp: {str(e)}"
+            )
 
     def _extract_tuple_var_names(self, tuple_target):
         """Extract variable names from tuple unpacking target."""
@@ -1463,14 +1508,18 @@ class ASTParserTorch(ASTParser):
 
     def _create_shape_dim_tensorop(self, var_name, idx, source_module):
         """Create TensorOp for shape dimension extraction."""
-        tensorop_param = {
-            "name": var_name,
-            "tns_type": "shape_dim",
-            "layers_of_tensors": [source_module],
-            "reduce_dim": idx
-        }
-        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-        self.buml_model.add_tensor_op(tns_obj)
+        try:
+            tensorop_param = {
+                "name": var_name,
+                "tns_type": "shape_dim",
+                "layers_of_tensors": [source_module],
+                "reduce_dim": idx
+            }
+            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+            self.buml_model.add_tensor_op(tns_obj)
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to create shape_dim TensorOp '{var_name}': {str(e)}")
+            return
         self.module_of_output[var_name] = var_name
         # For shape_dim, we need to track what variable the shape is extracted from
         # so the TensorFlow generator can use the correct source variable
@@ -1917,19 +1966,23 @@ class ASTParserTorch(ASTParser):
                 return base_var
 
         intermediate_var = self.TEMP_INLINE.format(op_type, self.tensor_op_counter)
-        tensorop_param = {
-            "tns_type": op_type,
-            "layers_of_tensors": [base_layer],
-            "name": f"op_{self.tensor_op_counter}"
-        }
-        tensorop_param.update(self._extract_inline_op_params(call_node, op_type))
+        try:
+            tensorop_param = {
+                "tns_type": op_type,
+                "layers_of_tensors": [base_layer],
+                "name": f"op_{self.tensor_op_counter}"
+            }
+            tensorop_param.update(self._extract_inline_op_params(call_node, op_type))
 
-        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-        self.buml_model.add_tensor_op(tns_obj)
-        self.tensor_op_counter += 1
-        self.module_of_output[intermediate_var] = tensorop_param["name"]
+            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+            self.buml_model.add_tensor_op(tns_obj)
+            self.tensor_op_counter += 1
+            self.module_of_output[intermediate_var] = tensorop_param["name"]
 
-        return intermediate_var
+            return intermediate_var
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to create inline TensorOp '{op_type}': {str(e)}")
+            return base_var
 
     def _check_and_mark_residual_input(self, tns_obj, call_node):
         """Check if tensorop's input is saved for residual connection and mark it."""
@@ -1955,15 +2008,19 @@ class ASTParserTorch(ASTParser):
         For: x1, x2 = torch.split(x, 32, dim=1)
         Tracks each output variable with __split_N suffix.
         """
-        op_name = f"op_{self.tensor_op_counter}"
-        tensorop_param["name"] = op_name
-        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        try:
+            op_name = f"op_{self.tensor_op_counter}"
+            tensorop_param["name"] = op_name
+            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
 
-        self.buml_model.add_tensor_op(tns_obj)
-        self.tensor_op_counter += 1
+            self.buml_model.add_tensor_op(tns_obj)
+            self.tensor_op_counter += 1
 
-        # Extract output variable names from tuple target
-        output_vars = []
+            # Extract output variable names from tuple target
+            output_vars = []
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to create split TensorOp: {str(e)}")
+            return
         for elt in node.targets[0].elts:
             if isinstance(elt, ast.Name):
                 output_vars.append(elt.id)
@@ -2006,18 +2063,22 @@ class ASTParserTorch(ASTParser):
         # when the squeezed value is later unsqueezed and used. TensorFlow will handle squeeze(0)
         # on [B,H] as a no-op automatically, so we should generate both squeeze and unsqueeze.
 
-        op_name = f"op_{self.tensor_op_counter}"
-        tensorop_param["name"] = op_name
-        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+        try:
+            op_name = f"op_{self.tensor_op_counter}"
+            tensorop_param["name"] = op_name
+            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
 
-        # Note: is_rnn_initial_state flag is set later when we detect this tensorop
-        # is used as hx_source for an RNN layer (see handle_rnn_layer)
-        # Don't mark unsqueeze as skippable just because it operates on RNN hidden state
+            # Note: is_rnn_initial_state flag is set later when we detect this tensorop
+            # is used as hx_source for an RNN layer (see handle_rnn_layer)
+            # Don't mark unsqueeze as skippable just because it operates on RNN hidden state
 
-        self.buml_model.add_tensor_op(tns_obj)
-        self.tensor_op_counter += 1
+            self.buml_model.add_tensor_op(tns_obj)
+            self.tensor_op_counter += 1
 
-        self._check_and_mark_residual_input(tns_obj, call_node)
+            self._check_and_mark_residual_input(tns_obj, call_node)
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to create TensorOp: {str(e)}")
+            return
 
         # Detect parallel operations for TensorOps (similar to layers)
         input_var = self._extract_tensorop_input_var(call_node, node)
@@ -2568,20 +2629,24 @@ class ASTParserTorch(ASTParser):
                 dim_idx = self.param_value(arg.args[0])
                 source_layers = self._extract_source_layers(arg.func.value) if hasattr(arg.func, 'value') else None
 
-                op_name = f"op_{self.tensor_op_counter}"
-                shape_tensorop_param = {"tns_type": "shape_dim", "reduce_dim": dim_idx,
-                                       "layers_of_tensors": source_layers, "name": op_name}
-                tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
-                self.buml_model.add_tensor_op(tns_obj)
-                self.tensor_op_counter += 1
+                try:
+                    op_name = f"op_{self.tensor_op_counter}"
+                    shape_tensorop_param = {"tns_type": "shape_dim", "reduce_dim": dim_idx,
+                                           "layers_of_tensors": source_layers, "name": op_name}
+                    tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+                    self.buml_model.add_tensor_op(tns_obj)
+                    self.tensor_op_counter += 1
 
-                # This ensures the generator creates an intermediate variable instead of reusing 'x'
-                synthetic_var = f"_{op_name}"
-                # NEW: Also set on tensorop object
-                tns_obj.input_var = None  # Shape extraction from constant or expression
-                tns_obj.output_var = synthetic_var
+                    # This ensures the generator creates an intermediate variable instead of reusing 'x'
+                    synthetic_var = f"_{op_name}"
+                    # NEW: Also set on tensorop object
+                    tns_obj.input_var = None  # Shape extraction from constant or expression
+                    tns_obj.output_var = synthetic_var
 
-                return op_name
+                    return op_name
+                except Exception as e:
+                    self.migration_warnings.append(f"Failed to create shape_dim TensorOp in reshape: {str(e)}")
+                    return None
             else:
                 return self.param_value(arg)
         elif isinstance(arg, ast.Name) and arg.id in self.module_of_output:
@@ -2790,9 +2855,13 @@ class ASTParserTorch(ASTParser):
             "end_dim": end_dim,
             "name_module_input": name_module_input
         }
-        flatten_layer = getattr(mm_classes, "FlattenLayer")(**flatten_params)
-        self.buml_model.add_layer(flatten_layer)
-        return flatten_layer
+        try:
+            flatten_layer = getattr(mm_classes, "FlattenLayer")(**flatten_params)
+            self.buml_model.add_layer(flatten_layer)
+            return flatten_layer
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to add FlattenLayer: {str(e)}")
+            return None
 
     def _extract_op_flatten(self, call_node, node, op_args):
         """Extract flatten operation and create FlattenLayer (not a TensorOp)."""
@@ -3320,13 +3389,14 @@ class ASTParserTorch(ASTParser):
         """Extract F.interpolate operation parameters."""
         size = None
         scale_factor = None
-        mode = 'nearest'
+        mode = 'bilinear'
 
         # Extract from keywords
         for kw in call_node.keywords:
             if kw.arg == 'size':
                 if isinstance(kw.value, ast.Constant):
-                    size = kw.value.value
+                    # Wrap single int in tuple for consistency
+                    size = (kw.value.value,)
                 elif isinstance(kw.value, (ast.Tuple, ast.List)):
                     size = tuple(elt.value if isinstance(elt, ast.Constant) else None
                                for elt in kw.value.elts)
@@ -3354,8 +3424,12 @@ class ASTParserTorch(ASTParser):
         if len(ops_args) > 1:
             pad_arg = ops_args[1]
             if isinstance(pad_arg, (ast.Tuple, ast.List)):
-                pad = tuple(elt.value if isinstance(elt, ast.Constant) else 0
-                          for elt in pad_arg.elts)
+                # PyTorch F.pad uses flat tuple: (left, right, top, bottom, front, back, ...)
+                # Convert to nested list format: [[left, right], [top, bottom], ...]
+                flat_pad = [elt.value if isinstance(elt, ast.Constant) else 0
+                           for elt in pad_arg.elts]
+                # Group pairs: [left, right] -> [[left, right]]
+                pad = [[flat_pad[i], flat_pad[i+1]] for i in range(0, len(flat_pad), 2)]
 
         # Extract from keywords
         for kw in call_node.keywords:
