@@ -8,7 +8,6 @@ It also extracts data and model configuration attributes.
 import ast
 import copy
 import sys
-sys.path.insert(0, r'C:\Users\daoudi\projects\BESSER')
 import besser.BUML.metamodel.nn as mm_classes
 from besser.BUML.metamodel.nn import NN, Layer, TensorOp
 from ast_parser_nn import ASTParser
@@ -169,7 +168,10 @@ class ASTParserTF(ASTParser):
             # Store in lookup dicts using the SUFFIXED name
             self.layer_by_name[layer_obj.name] = layer_obj
 
-        self.buml_model.add_layer(layer_obj)
+        try:
+            self.buml_model.add_layer(layer_obj)
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to add layer '{layer_obj.name}': {str(e)}")
 
     def _add_module_with_tracking(self, module_obj):
         """Add module (layer or sub_nn) to model and update lookup dict for O(1) access."""
@@ -279,7 +281,14 @@ class ASTParserTF(ASTParser):
             self.buml_model.add_tensor_op(tns_obj)
             self.module_of_output[target_var] = tensorop_param["name"]
 
-            tns_obj.input_var = left_var if isinstance(left_var, str) else str(left_var)
+            # For binops with scalars, use the tensor operand as input_var
+            if isinstance(left_var, str):
+                tns_obj.input_var = left_var
+            elif isinstance(right_var, str):
+                tns_obj.input_var = right_var
+            else:
+                tns_obj.input_var = str(left_var)  # Fallback (shouldn't happen for valid ops)
+
             tns_obj.output_var = target_var
             self.prev_layer_output = target_var
 
@@ -597,12 +606,16 @@ class ASTParserTF(ASTParser):
         }
         tensorop_param.update(self._extract_inline_op_params(call_node, op_type))
 
-        tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-        self.buml_model.add_tensor_op(tns_obj)
-        self.tensor_op_counter += 1
-        self.module_of_output[intermediate_var] = tensorop_param["name"]
+        try:
+            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+            self.buml_model.add_tensor_op(tns_obj)
+            self.tensor_op_counter += 1
+            self.module_of_output[intermediate_var] = tensorop_param["name"]
 
-        return intermediate_var
+            return intermediate_var
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to create inline TensorOp '{op_type}': {str(e)}")
+            return base_var
 
     def _extract_inline_base_var(self, call_node, parent_node):
         """Extract base variable from inline operation, handling chained calls."""
@@ -691,35 +704,62 @@ class ASTParserTF(ASTParser):
 
         self.previous_assign = subscript_assign
 
-    def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> str:
+    def extract_subscript_pattern(self, subscript_node: ast.Subscript) -> list:
         """
-        Extract the subscript/slice pattern from an AST Subscript node as a string.
+        Extract the subscript/slice pattern from an AST Subscript node as a structured list.
 
         Parameters:
             subscript_node (ast.Subscript): The AST subscript node
 
         Returns:
-            str: String representation of the subscript pattern (e.g., "[-1]", "[:, -1, :]")
+            list: List of dicts representing subscript pattern
+                  e.g., [{"type": "index", "value": -1}] for [-1]
+                  e.g., [{"type": "slice", "start": None, "stop": None, "step": None},
+                         {"type": "index", "value": -1}] for [:, -1]
         """
-        def slice_to_string(slice_node):
+        def parse_slice_element(slice_node):
             if isinstance(slice_node, ast.Slice):
-                lower = ast.unparse(slice_node.lower) if slice_node.lower else ""
-                upper = ast.unparse(slice_node.upper) if slice_node.upper else ""
-                step = ast.unparse(slice_node.step) if slice_node.step else ""
-                if step:
-                    return f"{lower}:{upper}:{step}"
-                else:
-                    return f"{lower}:{upper}" if lower or upper else ":"
-            elif isinstance(slice_node, ast.Tuple):
-                # Multi-dimensional slicing like [:, last_index, :]
-                elements = [slice_to_string(elt) for elt in slice_node.elts]
-                return ", ".join(elements)
-            else:
-                # Single index like last_index or 0
-                return ast.unparse(slice_node)
+                # Parse slice object
+                start = None
+                stop = None
+                step = None
 
-        pattern = slice_to_string(subscript_node.slice)
-        return f"[{pattern}]"
+                if slice_node.lower:
+                    if isinstance(slice_node.lower, ast.Constant):
+                        start = slice_node.lower.value
+                    elif isinstance(slice_node.lower, ast.UnaryOp) and isinstance(slice_node.lower.op, ast.USub):
+                        start = -slice_node.lower.operand.value
+
+                if slice_node.upper:
+                    if isinstance(slice_node.upper, ast.Constant):
+                        stop = slice_node.upper.value
+                    elif isinstance(slice_node.upper, ast.UnaryOp) and isinstance(slice_node.upper.op, ast.USub):
+                        stop = -slice_node.upper.operand.value
+
+                if slice_node.step:
+                    if isinstance(slice_node.step, ast.Constant):
+                        step = slice_node.step.value
+                    elif isinstance(slice_node.step, ast.UnaryOp) and isinstance(slice_node.step.op, ast.USub):
+                        step = -slice_node.step.operand.value
+
+                return {"type": "slice", "start": start, "stop": stop, "step": step}
+            else:
+                # Single index
+                if isinstance(slice_node, ast.Constant):
+                    return {"type": "index", "value": slice_node.value}
+                elif isinstance(slice_node, ast.UnaryOp) and isinstance(slice_node.op, ast.USub):
+                    return {"type": "index", "value": -slice_node.operand.value}
+                else:
+                    # Fallback for complex expressions - use unparsed string as value
+                    return {"type": "index", "value": ast.unparse(slice_node)}
+
+        # Handle multi-dimensional or single subscript
+        if isinstance(subscript_node.slice, ast.Tuple):
+            # Multi-dimensional like [:, -1, :]
+            return [parse_slice_element(elt) for elt in subscript_node.slice.elts]
+        else:
+            # Single dimension like [-1] or [:]
+            return [parse_slice_element(subscript_node.slice)]
 
     def _resolve_variable_alias(self, var):
         """Resolve variable aliases to find the actual source."""
@@ -818,7 +858,13 @@ class ASTParserTF(ASTParser):
 
         self.buml_model.modules.append(identity_op)
         self.module_of_output[target_var] = target_var  # Identity op outputs to target_var
-        identity_op.input_var = source_var
+
+        # Only set input_var if source_module doesn't have special suffixes
+        # that need BESSER's bidirectional RNN handling (e.g., __hidden_forward)
+        special_suffixes = ('__hidden_forward', '__hidden_backward', '__cell_forward', '__cell_backward', '__hidden')
+        if not any(source_module.endswith(suffix) for suffix in special_suffixes):
+            identity_op.input_var = source_var
+
         identity_op.output_var = target_var
 
         # Track that this variable has been saved for later use (residual connection)
@@ -1115,15 +1161,18 @@ class ASTParserTF(ASTParser):
         source_layers = [self.module_of_output[source_var]] if source_var in self.module_of_output else ['INPUT']
 
         # Create shape_dim tensorop
-        shape_tensorop_param = {
-            "tns_type": "shape_dim",
-            "reduce_dim": dim_idx,
-            "layers_of_tensors": source_layers,
-            "name": result_var
-        }
-        tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
-        self.buml_model.add_tensor_op(tns_obj)
-        self.module_of_output[result_var] = result_var
+        try:
+            shape_tensorop_param = {
+                "tns_type": "shape_dim",
+                "reduce_dim": dim_idx,
+                "layers_of_tensors": source_layers,
+                "name": result_var
+            }
+            tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+            self.buml_model.add_tensor_op(tns_obj)
+            self.module_of_output[result_var] = result_var
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to create shape_dim TensorOp '{result_var}': {str(e)}")
 
     def _is_tf_shape_slicing(self, node: ast.Assign):
         """Check if this is a tf.shape(x)[dim] pattern."""
@@ -1240,19 +1289,25 @@ class ASTParserTF(ASTParser):
     def _add_init_layer_with_params(self, lyr_type, lyr_params, module_name, dropout_rate):
         """Add layer with optional dropout and parameter inference."""
         if dropout_rate is not None:
-            dropout_layer = getattr(mm_classes, "DropoutLayer")(
-                name=f"{module_name}_dropout",
-                rate=dropout_rate
-            )
-            self.buml_model.add_layer(dropout_layer)
+            try:
+                dropout_layer = getattr(mm_classes, "DropoutLayer")(
+                    name=f"{module_name}_dropout",
+                    rate=dropout_rate
+                )
+                self.buml_model.add_layer(dropout_layer)
+            except Exception as e:
+                self.migration_warnings.append(f"Failed to add dropout layer '{module_name}_dropout': {str(e)}")
 
         if lyr_type == "BatchNormLayer":
             lyr_params.update(infer_batchnorm_params(self.buml_model))
         elif lyr_type == "LayerNormLayer":
             lyr_params.update(infer_layernorm_params(self.buml_model))
 
-        buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-        self.buml_model.add_layer(buml_layer)
+        try:
+            buml_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+            self.buml_model.add_layer(buml_layer)
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to add layer '{module_name}': {str(e)}")
 
     def handle_init(self, node: ast.Assign):
         """
@@ -1363,8 +1418,11 @@ class ASTParserTF(ASTParser):
         elif lyr_type == "LayerNormLayer":
             lyr_params.update(infer_layernorm_params(subnn))
 
-        subnn_layer = getattr(mm_classes, lyr_type)(**lyr_params)
-        subnn.add_layer(subnn_layer)
+        try:
+            subnn_layer = getattr(mm_classes, lyr_type)(**lyr_params)
+            subnn.add_layer(subnn_layer)
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to create/add sequential layer '{lyr_params['name']}': {str(e)}")
         return layer_id + 1
 
     def handle_sequential_layers(self, node: ast.Assign, seq_name: str):
@@ -1525,16 +1583,20 @@ class ASTParserTF(ASTParser):
         """Create shape_dim tensorop for reshape argument and return operation name."""
         source_layers = [self.module_of_output[source_var]] if source_var in self.module_of_output else ['INPUT']
 
-        op_name = f"op_{self.tensor_op_counter}"
-        shape_tensorop_param = {
-            "tns_type": "shape_dim",
-            "reduce_dim": dim_idx,
-            "layers_of_tensors": source_layers,
-            "name": op_name
-        }
-        tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
-        self.buml_model.add_tensor_op(tns_obj)
-        self.module_of_output[op_name] = op_name
+        try:
+            op_name = f"op_{self.tensor_op_counter}"
+            shape_tensorop_param = {
+                "tns_type": "shape_dim",
+                "reduce_dim": dim_idx,
+                "layers_of_tensors": source_layers,
+                "name": op_name
+            }
+            tns_obj = getattr(mm_classes, "TensorOp")(**shape_tensorop_param)
+            self.buml_model.add_tensor_op(tns_obj)
+            self.module_of_output[op_name] = op_name
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to create shape_dim TensorOp for reshape: {str(e)}")
+            return None
         self.tensor_op_counter += 1
         return op_name
 
@@ -1809,15 +1871,19 @@ class ASTParserTF(ASTParser):
                 prev_is_tensorop = True
 
         if prev_is_tensorop:
-            # Create standalone activation layer
-            actv_lyr_name = f"activ_{func_name}_{self.tensor_op_counter}"
-            self.tensor_op_counter += 1
-            actv_lyr = mm_classes.GeneralLayer(
-                name=actv_lyr_name,
-                actv_func=tf_actv_func_mapping[func_name]
-            )
-            self.buml_model.add_layer(actv_lyr)
-            self.buml_model.modules.append(actv_lyr)
+            try:
+                # Create standalone activation layer
+                actv_lyr_name = f"activ_{func_name}_{self.tensor_op_counter}"
+                self.tensor_op_counter += 1
+                actv_lyr = mm_classes.GeneralLayer(
+                    name=actv_lyr_name,
+                    actv_func=tf_actv_func_mapping[func_name]
+                )
+                self.buml_model.add_layer(actv_lyr)
+                self.buml_model.modules.append(actv_lyr)
+            except Exception as e:
+                self.migration_warnings.append(f"Failed to add activation layer '{actv_lyr_name}': {str(e)}")
+                return
 
             # Track inputs/outputs
             output_var = node.targets[0].id
@@ -1869,6 +1935,17 @@ class ASTParserTF(ASTParser):
                 f"Line {node.lineno}: {op_type} requires an input tensor."
             )
             return None
+
+        # Handle nested inline operations (e.g., tf.squeeze(tf.expand_dims(h, axis=1), axis=1))
+        if isinstance(op_args[0], ast.Call):
+            intermediate_var = self.extract_inline_tensorop(op_args[0], node)
+            if intermediate_var and intermediate_var in self.module_of_output:
+                return [self.module_of_output[intermediate_var]]
+            else:
+                self.migration_warnings.append(
+                    f"Line {node.lineno}: {op_type} nested operation could not be processed."
+                )
+                return None
 
         if not isinstance(op_args[0], ast.Name):
             self.migration_warnings.append(
@@ -2070,9 +2147,9 @@ class ASTParserTF(ASTParser):
         if left_var is None or right_var is None:
             return None
 
-        # Get layer names or keep scalar values
-        left_layer = left_var if isinstance(left_var, (int, float)) else self.module_of_output.get(left_var)
-        right_layer = right_var if isinstance(right_var, (int, float)) else self.module_of_output.get(right_var)
+        # Get layer names or keep scalar values (converted to float)
+        left_layer = float(left_var) if isinstance(left_var, (int, float)) else self.module_of_output.get(left_var)
+        right_layer = float(right_var) if isinstance(right_var, (int, float)) else self.module_of_output.get(right_var)
 
         if left_layer is None or right_layer is None:
             return None
@@ -2109,6 +2186,7 @@ class ASTParserTF(ASTParser):
         """Extract pad tensorop parameters."""
         pad_amount = None
         pad_mode = 'CONSTANT'
+        pad_value = None
 
         # Second argument is paddings
         if len(op_args) > 1:
@@ -2121,20 +2199,31 @@ class ASTParserTF(ASTParser):
                     else:
                         pad_amount.append(self.param_value(elt))
 
-        # Extract mode from keywords
+        # Extract mode and constant_values from keywords
         for kw in node.value.keywords:
             if kw.arg == "mode":
                 pad_mode = self.param_value(kw.value)
-                break
+            elif kw.arg == "constant_values":
+                pad_value = self.param_value(kw.value)
 
         source_layers = self._extract_source_variable(op_args, node, "pad")
         if source_layers is None:
             return None
 
+        # TensorFlow uses NHWC, PyTorch uses NCHW
+        # TF pad_amount: [N, H, W, C] -> reorder to [N, C, H, W] for PyTorch layout
+        # Then reverse for PyTorch F.pad which expects last dimension first: [W, H, C, N]
+        if pad_amount and len(pad_amount) == 4:
+            # Reorder from NHWC to NCHW
+            pad_amount_nchw = [pad_amount[0], pad_amount[3], pad_amount[1], pad_amount[2]]
+            # Reverse for F.pad API
+            pad_amount = list(reversed(pad_amount_nchw))
+
         return {
             "tns_type": "pad",
             "pad_amount": pad_amount,
-            "pad_mode": pad_mode,
+            "pad_mode": pad_mode.lower() if isinstance(pad_mode, str) else pad_mode,
+            "pad_value": pad_value,
             "layers_of_tensors": source_layers,
             "input_reused": True
         }
@@ -2162,7 +2251,7 @@ class ASTParserTF(ASTParser):
     def _extract_resize(self, node, op_args):
         """Extract resize/interpolate tensorop parameters."""
         resize_size = None
-        resize_mode = 'bilinear'
+        resize_mode = 'bilinear'  # Default matches metamodel
 
         # Second argument is size
         if len(op_args) > 1:
@@ -2170,7 +2259,9 @@ class ASTParserTF(ASTParser):
             if isinstance(size_arg, (ast.List, ast.Tuple)):
                 resize_size = tuple(self.param_value(elt) for elt in size_arg.elts)
             else:
-                resize_size = self.param_value(size_arg)
+                # Wrap single value in tuple for consistency
+                val = self.param_value(size_arg)
+                resize_size = (val,) if not isinstance(val, (list, tuple)) else tuple(val)
 
         # Extract method from keywords
         for kw in node.value.keywords:
@@ -2350,16 +2441,20 @@ class ASTParserTF(ASTParser):
             return
 
         if tensorop_param:
-            op_name = f"op_{self.tensor_op_counter}"
-            tensorop_param["name"] = op_name
+            try:
+                op_name = f"op_{self.tensor_op_counter}"
+                tensorop_param["name"] = op_name
 
-            # Special handling for split: remove output_vars before creating TensorOp
-            # (output vars are tracked via layer/tensorop attributes instead)
-            output_vars = tensorop_param.pop("output_vars", None)
+                # Special handling for split: remove output_vars before creating TensorOp
+                # (output vars are tracked via layer/tensorop attributes instead)
+                output_vars = tensorop_param.pop("output_vars", None)
 
-            tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
-            self.buml_model.add_tensor_op(tns_obj)
-            self.tensor_op_counter+=1
+                tns_obj = getattr(mm_classes, "TensorOp")(**tensorop_param)
+                self.buml_model.add_tensor_op(tns_obj)
+                self.tensor_op_counter+=1
+            except Exception as e:
+                self.migration_warnings.append(f"Line {node.lineno}: Failed to create TensorOp: {str(e)}")
+                return
 
             # Track output variable(s)
             if hasattr(node, 'targets') and len(node.targets) > 0:
@@ -2387,10 +2482,11 @@ class ASTParserTF(ASTParser):
                 else:
                     # Single output: normal tracking
                     target_var = node.targets[0].id
-                    self.module_of_output[target_var] = op_name
 
                     # Track inputs/outputs for all tensorops using actual TF variable names
                     # This preserves original code patterns (e.g., x = tf.add(x, y) → input='x', output='x')
+                    # IMPORTANT: Do the reverse lookup BEFORE updating module_of_output[target_var]
+                    # so we find the OLD mapping when target_var is reused (e.g., h_final = op1; h_final = op2)
                     if 'layers_of_tensors' in tensorop_param and tensorop_param['layers_of_tensors']:
                         # Find the variable name that the first input layer produces
                         first_layer = tensorop_param['layers_of_tensors'][0]
@@ -2407,7 +2503,10 @@ class ASTParserTF(ASTParser):
                             input_var = 'x'
 
                         tns_obj.input_var = input_var
-                        tns_obj.output_var = target_var
+
+                    # NOW update module_of_output after the reverse lookup is complete
+                    self.module_of_output[target_var] = op_name
+                    tns_obj.output_var = target_var
 
     def _create_dropout_layer(self, tensorop_param, node):
         """Create a Dropout layer from tf.nn.dropout."""
@@ -2430,13 +2529,16 @@ class ASTParserTF(ASTParser):
             layer_obj.name_module_input = name_module_input
 
         # Add layer and track output
-        self.buml_model.add_layer(layer_obj)
-        self.buml_model.modules.append(layer_obj)
+        try:
+            self.buml_model.add_layer(layer_obj)
+            self.buml_model.modules.append(layer_obj)
 
-        # Track output variable
-        if hasattr(node, 'targets') and len(node.targets) > 0:
-            output_var = node.targets[0].id
-            self.module_of_output[output_var] = dropout_name
+            # Track output variable
+            if hasattr(node, 'targets') and len(node.targets) > 0:
+                output_var = node.targets[0].id
+                self.module_of_output[output_var] = dropout_name
+        except Exception as e:
+            self.migration_warnings.append(f"Failed to add dropout layer '{dropout_name}': {str(e)}")
 
     def handle_outer_attribute_assignment(self, node: ast.Assign):
         """
@@ -2603,12 +2705,22 @@ class ASTParserTF(ASTParser):
                     module.__class__.__name__ == "PoolingLayer" and
                     hasattr(module, 'pooling_type') and
                     module.pooling_type.startswith("global")):
+                    # Get the output variable of the pooling layer
+                    pool_output_var = getattr(module, 'output_var', None)
+
                     # Create squeeze TensorOp to remove the size-1 dimension
                     squeeze_op = mm_classes.TensorOp(
                         name=f"{module.name}_squeeze",
                         tns_type='squeeze',
-                        reduce_dim=-1
+                        reduce_dim=-1,
+                        layers_of_tensors=[module.name]
                     )
+
+                    # Set input/output vars to maintain the same variable name
+                    if pool_output_var:
+                        squeeze_op.input_var = pool_output_var
+                        squeeze_op.output_var = pool_output_var
+
                     # Insert squeeze op right after the pooling layer
                     modules.insert(i + 1, squeeze_op)
                     i += 1  # Skip the newly inserted squeeze op
